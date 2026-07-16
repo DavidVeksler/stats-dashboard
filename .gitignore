@@ -5,3 +5,6 @@ dist/
 # never commit the Google service-account key
 *key*.json
 gsc-*.json
+
+# local deploy state (refresh key)
+.deploy/
