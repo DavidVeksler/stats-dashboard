@@ -13,8 +13,8 @@
 #                               #   D1:Edit scope (the analytics token can't; use the
 #                               #   Cloudflare dashboard or MCP connector instead).
 #
-# Requires: node/npm, and ~/Projects/.cloudflare.env holding CLOUDFLARE_API_TOKEN
-# (the FIRST token line — it has Workers + D1 + DNS edit scope).
+# Requires: node/npm, and ~/Projects/.cloudflare.env holding CLOUDFLARE_API_TOKEN.
+# If the file has multiple token lines, the FIRST one is used.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -76,12 +76,12 @@ if ! has_secret CF_API_TOKEN; then
   printf '%s' "$CLOUDFLARE_API_TOKEN" | wr secret put CF_API_TOKEN >/dev/null
 fi
 
-if ! has_secret REFRESH_KEY; then
+if ! has_secret REFRESH_KEY || [ ! -f "$KEY_FILE" ]; then
   mkdir -p "$(dirname "$KEY_FILE")"
   REFRESH="$(openssl rand -hex 16)"
   printf '%s' "$REFRESH" | wr secret put REFRESH_KEY >/dev/null
   echo "$REFRESH" > "$KEY_FILE"
-  echo "generated REFRESH_KEY -> $KEY_FILE"
+  echo "generated/rotated REFRESH_KEY -> $KEY_FILE"
 fi
 
 if [ -n "$GSC_KEY_PATH" ]; then

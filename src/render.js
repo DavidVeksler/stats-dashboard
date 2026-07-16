@@ -1,159 +1,254 @@
 // Renders the dashboard HTML from data read out of D1.
 
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const fmt = (n) => Number(n).toLocaleString("en-US");
-
+const fmt = (n) => Number(n || 0).toLocaleString("en-US");
+const pct = (n, digits = 0) => `${(Number(n || 0) * 100).toFixed(digits)}%`;
 const TAG_LABEL = { search: "search", direct: "direct", social: "social", ref: "referral" };
 
-function sparkline(points) {
-  const vals = points.map((p) => p.visits);
-  if (vals.length < 2) return "";
-  const w = 108, h = 30, pad = 2;
+function deltaBadge(value, compact = false) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return `<span class="delta neutral">no comparison</span>`;
+  }
+  const direction = value > 0 ? "up" : value < 0 ? "down" : "neutral";
+  const arrow = value > 0 ? "↑" : value < 0 ? "↓" : "→";
+  const label = `${arrow} ${Math.abs(value * 100).toFixed(0)}%${compact ? "" : " vs previous"}`;
+  return `<span class="delta ${direction}">${label}</span>`;
+}
+
+function sparkline(points, host) {
+  const vals = points.map((point) => Number(point.visits || 0));
+  if (vals.length < 2) return `<div class="spark-empty">Trend appears after two daily snapshots.</div>`;
+  const w = 150, h = 38, pad = 3;
   const max = Math.max(...vals, 1), min = Math.min(...vals);
   const span = max - min || 1;
   const step = (w - pad * 2) / (vals.length - 1);
-  const pts = vals.map((v, i) => {
-    const x = pad + i * step;
-    const y = h - pad - ((v - min) / span) * (h - pad * 2);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-  const last = pts[pts.length - 1].split(",");
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true">
-    <polyline points="${pts.join(" ")}" fill="none" stroke="var(--traffic)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
-    <circle cx="${last[0]}" cy="${last[1]}" r="2.2" fill="var(--traffic)"/>
+  const coords = vals.map((value, index) => ({
+    x: pad + index * step,
+    y: h - pad - ((value - min) / span) * (h - pad * 2),
+  }));
+  const line = coords.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const area = `${pad},${h - pad} ${line} ${w - pad},${h - pad}`;
+  const id = `spark-${host.replace(/[^a-z0-9]/gi, "-")}`;
+  const label = `${points.length}-day sessions for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}`;
+  const pointsWithTitles = coords.map(({ x, y }, index) =>
+    `<circle class="spark-hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4">
+      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions</title>
+    </circle>`).join("");
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(label)}">
+    <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--traffic)" stop-opacity=".22"/><stop offset="1" stop-color="var(--traffic)" stop-opacity="0"/></linearGradient></defs>
+    <polygon points="${area}" fill="url(#${id})"/>
+    <polyline points="${line}" fill="none" stroke="var(--traffic)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${pointsWithTitles}
+    <circle cx="${coords.at(-1).x.toFixed(1)}" cy="${coords.at(-1).y.toFixed(1)}" r="2.7" fill="var(--traffic)"/>
   </svg>`;
 }
 
-function siteCard(s) {
-  if (!s.visits && !s.keywords.length) {
-    return `<div class="card empty">
-      <div class="chead"><div class="host">${esc(s.host)}</div>
-        <div class="nums"><div class="big">—</div><div class="lbl">no data</div></div></div>
-      <div class="none">No Web Analytics traffic or Search Console data in this window.</div>
-    </div>`;
-  }
-  const max = Math.max(1, ...s.referrers.map((r) => r.visits));
-  const refs = s.referrers.length ? s.referrers.map((r) => {
-    const width = Math.max(6, Math.round((r.visits / max) * 100));
-    const name = r.referrer === "(direct)" ? "Direct / none" : r.referrer;
-    return `<li class="ref"><div class="bar" style="width:${width}%"></div>
-      <div class="row"><span class="name">${esc(name)}<span class="tag ${r.kind}">${TAG_LABEL[r.kind]}</span></span><span class="n">${fmt(r.visits)}</span></div></li>`;
-  }).join("") : `<li class="none">No external referrers.</li>`;
-  const kws = s.keywords.length ? s.keywords.map((k) =>
-    `<div class="kw"><span class="q">${esc(k.query)}</span><span class="c ${k.clicks === 0 ? "zero" : ""}">${k.clicks === 0 ? "0 clk" : k.clicks + " clk"}</span></div>`
-  ).join("") : `<div class="none">No search clicks in window.</div>`;
-  return `<div class="card">
-    <div class="chead">
-      <div class="hostwrap">
-        <div class="host"><a href="https://${esc(s.host)}" target="_blank" rel="noopener">${esc(s.host)}</a></div>
-        ${sparkline(s.spark)}
-      </div>
-      <div class="nums"><div class="big">${fmt(s.visits)}</div><div class="lbl">visitors 24h</div><div class="pv">${fmt(s.views)} views</div></div>
-    </div>
-    <div class="cols">
-      <div><div class="colhead"><span class="dot t"></span>Top referrers</div><ul>${refs}</ul></div>
-      <div><div class="colhead"><span class="dot s"></span>Top keywords</div>${kws}</div>
-    </div>
-  </div>`;
+function referrerList(site) {
+  if (!site.referrers.length) return `<p class="none">No referrers in this period.</p>`;
+  const total = site.referrers.reduce((sum, row) => sum + Number(row.visits || 0), 0);
+  const external = site.referrers.filter((row) => row.kind !== "direct");
+  const externalMax = Math.max(1, ...external.map((row) => Number(row.visits || 0)));
+  const rows = site.referrers.map((row) => {
+    const isDirect = row.kind === "direct";
+    const width = isDirect ? 100 : Math.max(7, Math.round((Number(row.visits || 0) / externalMax) * 100));
+    const name = row.referrer === "(direct)" ? "Direct / none" : row.referrer;
+    const share = total ? Number(row.visits || 0) / total : 0;
+    return `<li class="ref ${isDirect ? "direct-row" : ""}" title="${esc(name)}: ${fmt(row.visits)} sessions (${pct(share, 1)})">
+      <div class="bar" style="width:${width}%"></div>
+      <div class="row"><span class="name">${esc(name)}<span class="tag ${esc(row.kind)}">${TAG_LABEL[row.kind] || "referral"}</span></span><span class="n">${fmt(row.visits)}</span></div>
+    </li>`;
+  }).join("");
+  return `<ol class="ref-list">${rows}</ol>${external.length && site.referrers.some((row) => row.kind === "direct")
+    ? `<div class="scale-note">External bars use their own scale.</div>` : ""}`;
 }
 
-export function renderDashboard(d) {
-  const t = d.totals;
+function keywordList(keywords) {
+  if (!keywords.length) return `<p class="none">No search queries in the latest GSC window.</p>`;
+  return `<ol class="metric-list">${keywords.map((keyword) => {
+    const ctr = keyword.impressions ? keyword.clicks / keyword.impressions : 0;
+    const opportunity = keyword.impressions >= 5 && keyword.position >= 4 && keyword.position <= 20 && ctr < .04;
+    return `<li class="metric-row ${opportunity ? "opportunity" : ""}">
+      <div class="metric-name"><span class="truncate" title="${esc(keyword.query)}">${esc(keyword.query)}</span>${opportunity ? `<span class="opportunity-tag">opportunity</span>` : ""}</div>
+      <div class="metric-values"><strong>${fmt(keyword.clicks)} clk</strong><span>${fmt(keyword.impressions)} imp · ${pct(ctr, 1)} CTR · pos ${Number(keyword.position || 0).toFixed(1)}</span></div>
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+function pageLabel(page) {
+  try {
+    const url = new URL(page);
+    return `${url.pathname}${url.search}` || "/";
+  } catch (_) {
+    return page;
+  }
+}
+
+function pageList(pages) {
+  if (!pages.length) return `<p class="none">Landing-page data will appear after the next successful GSC pull.</p>`;
+  return `<ol class="metric-list pages-list">${pages.map((page) =>
+    `<li class="metric-row">
+      <div class="metric-name"><a class="truncate" href="${esc(page.page)}" target="_blank" rel="noopener" title="${esc(page.page)}">${esc(pageLabel(page.page))}</a></div>
+      <div class="metric-values"><strong>${fmt(page.clicks)} clk</strong><span>${fmt(page.impressions)} imp · ${pct(page.ctr, 1)} CTR · pos ${Number(page.position || 0).toFixed(1)}</span></div>
+    </li>`).join("")}</ol>`;
+}
+
+function siteCard(site, index, periodDays) {
+  const id = `site-${site.host.replace(/[^a-z0-9]/gi, "-")}`;
+  const periodLabel = periodDays === 1 ? "24h" : `${periodDays}d`;
+  const hasDetails = site.referrers.length || site.keywords.length || site.pages.length;
+  return `<section class="card ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
+    <div class="chead">
+      <div class="hostwrap">
+        <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
+        ${sparkline(site.spark, site.host)}
+      </div>
+      <div class="nums"><div class="big">${site.visits ? fmt(site.visits) : "—"}</div><div class="lbl">sessions ${periodLabel}</div>
+        ${deltaBadge(site.delta, true)}<div class="pv">${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session</div></div>
+    </div>
+    ${hasDetails ? `<details class="detail" open data-card-index="${index}">
+      <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>
+      <div class="cols">
+        <section class="panel"><h3><span class="dot traffic"></span>Top referrers</h3>${referrerList(site)}</section>
+        <section class="panel"><h3><span class="dot search"></span>Search opportunities</h3>${keywordList(site.keywords)}</section>
+      </div>
+      <section class="panel pages-panel"><h3><span class="dot good"></span>Top landing pages</h3>${pageList(site.pages)}</section>
+    </details>` : `<p class="none">No analytics data in this window.</p>`}
+  </section>`;
+}
+
+function withQuery(data, changes) {
+  const values = { period: data.periodDays, domain: data.domain || "", sort: data.sort || "traffic", ...changes };
+  const params = new URLSearchParams();
+  if (values.period !== 1) params.set("period", String(values.period));
+  if (values.domain) params.set("domain", values.domain);
+  if (values.sort && values.sort !== "traffic") params.set("sort", values.sort);
+  const query = params.toString();
+  return query ? `/?${query}` : "/";
+}
+
+function formatDate(date) {
+  if (!date) return "—";
+  return new Date(`${date}T00:00:00Z`).toLocaleDateString("en-US", {
+    month: "short", day: "numeric", year: "numeric", timeZone: "UTC",
+  });
+}
+
+function formatTimestamp(timestamp) {
+  if (!timestamp) return "not yet available";
+  return new Date(timestamp).toLocaleString("en-US", {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    timeZone: "America/Denver", timeZoneName: "short",
+  });
+}
+
+function anomalyText(item) {
+  if (item.metric === "sessions") {
+    return `${item.host} sessions ${item.value > 0 ? "rose" : "fell"} ${Math.abs(item.value * 100).toFixed(0)}%`;
+  }
+  return `${item.host} pages/session ${item.value > 0 ? "rose" : "fell"} by ${Math.abs(item.value).toFixed(1)}`;
+}
+
+export function renderDashboard(data) {
+  const totals = data.totals;
+  const periodLabel = data.periodDays === 1 ? "Last 24 hours" : `Last ${data.periodDays} days`;
+  const previousLabel = data.periodDays === 1 ? "previous day" : `previous ${data.periodDays} days`;
+  const trafficWindow = data.coverageStart && data.date && data.coverageStart !== data.date
+    ? `${formatDate(data.coverageStart)}–${formatDate(data.date)}` : formatDate(data.date);
+  const coverageNote = data.periodDays > 1 && totals.daysAvailable < data.periodDays
+    ? `${totals.daysAvailable} of ${data.periodDays} daily snapshots available` : null;
+  const gscWindow = data.sites.find((site) => site.gscWindow)?.gscWindow || "latest available";
+  const updatedAt = data.dataUpdatedAt || data.run?.run_at;
+  const stale = updatedAt ? Date.now() - Date.parse(updatedAt) > 30 * 3600 * 1000 : true;
   const stats = [
-    ["Total visitors", fmt(t.visits), `across ${t.active} active domains`],
-    ["Total pageviews", fmt(t.views), t.visits ? `${(t.views / t.visits).toFixed(1)} pages / visit` : "—"],
-    ["From search engines", fmt(t.search), "Google · Bing · DDG · Brave"],
-    ["Domains tracked", t.domains, `${t.active} with traffic today`],
+    ["Total sessions", fmt(totals.visits), `${deltaBadge(totals.delta)}<span>${coverageNote || periodLabel.toLowerCase()}</span>`],
+    ["Total pageviews", fmt(totals.views), `<span>${totals.visits ? (totals.views / totals.visits).toFixed(1) : "0.0"} pages / session</span>`],
+    ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>`],
+    [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${totals.active} with traffic</span>`],
   ];
-  const dateLabel = d.date
-    ? new Date(d.date + "T00:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric", timeZone: "UTC" })
-    : "—";
-  const kwWindow = d.sites.find((s) => s.gscWindow)?.gscWindow || "latest available";
 
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Traffic &amp; Search — Daily Brief</title>
 <style>
-:root{--paper:#f6f7f9;--card:#fff;--ink:#141922;--muted:#5b6472;--faint:#8892a0;--line:#e5e8ee;--traffic:#2f6fb0;--traffic-soft:#dbe7f3;--search:#b7791f;--search-soft:#f3e9d6;--direct:#64748b;--social:#7c5cbf;--good:#3f8f5f;--shadow:0 1px 2px rgba(20,25,34,.04),0 4px 16px rgba(20,25,34,.05);--radius:12px}
-@media (prefers-color-scheme:dark){:root{--paper:#0f1319;--card:#171d26;--ink:#e8ecf2;--muted:#97a1b0;--faint:#6b7686;--line:#262e3a;--traffic:#6aa6dc;--traffic-soft:#21354a;--search:#d6a44e;--search-soft:#3a2f1a;--direct:#8592a4;--social:#a78bdb;--good:#5fb381;--shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35)}}
-:root[data-theme=dark]{--paper:#0f1319;--card:#171d26;--ink:#e8ecf2;--muted:#97a1b0;--faint:#6b7686;--line:#262e3a;--traffic:#6aa6dc;--traffic-soft:#21354a;--search:#d6a44e;--search-soft:#3a2f1a;--direct:#8592a4;--social:#a78bdb;--good:#5fb381;--shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.35)}
-:root[data-theme=light]{--paper:#f6f7f9;--card:#fff;--ink:#141922;--muted:#5b6472;--faint:#8892a0;--line:#e5e8ee;--traffic:#2f6fb0;--traffic-soft:#dbe7f3;--search:#b7791f;--search-soft:#f3e9d6;--direct:#64748b;--social:#7c5cbf;--good:#3f8f5f;--shadow:0 1px 2px rgba(20,25,34,.04),0 4px 16px rgba(20,25,34,.05)}
-*{box-sizing:border-box}
-body{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;line-height:1.45;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
-.wrap{max-width:1120px;margin:0 auto;padding:32px 24px 64px}
-header.top{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 24px;padding-bottom:20px;border-bottom:1px solid var(--line)}
-.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:11px;font-weight:600;color:var(--faint)}
-h1{font-size:26px;margin:4px 0 0;letter-spacing:-.01em;text-wrap:balance}
-.win{font-size:13px;color:var(--muted);text-align:right}
-.win b{color:var(--ink);font-weight:600}
-.totals{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0 30px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
-.stat .k{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:600}
-.stat .v{font-size:30px;font-weight:650;letter-spacing:-.02em;margin-top:4px}
-.stat .s{font-size:12px;color:var(--muted)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:14px}
-.card.empty{opacity:.62}
-.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}
-.host{font-size:15px;font-weight:650;letter-spacing:-.01em;word-break:break-word}
-.host a{color:inherit;text-decoration:none}.host a:hover{text-decoration:underline}
-.spark{display:block}
-.nums{text-align:right;white-space:nowrap}
-.nums .big{font-size:24px;font-weight:650;letter-spacing:-.02em}
-.nums .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)}
-.nums .pv{font-size:12px;color:var(--muted);margin-top:2px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.colhead{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}
-.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.t{background:var(--traffic)}.dot.s{background:var(--search)}
-ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
-.ref{position:relative}
-.ref .bar{position:absolute;inset:0;background:var(--traffic-soft);border-radius:5px;z-index:0}
-.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 8px;font-size:12.5px}
-.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ref .n{font-weight:600;color:var(--muted)}
-.tag{font-size:9px;text-transform:uppercase;letter-spacing:.06em;padding:1px 5px;border-radius:4px;font-weight:600;margin-left:5px}
-.tag.search{background:var(--search-soft);color:var(--search)}
-.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}
-.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}
-.tag.ref{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good)}
-.kw{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;padding:3px 0;border-bottom:1px dashed var(--line)}
-.kw:last-child{border-bottom:0}
-.kw .q{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.kw .c{font-weight:650;color:var(--search);white-space:nowrap}
-.kw .c.zero{color:var(--faint);font-weight:500}
-.none{font-size:12px;color:var(--faint);font-style:italic;padding:4px 0}
-footer{margin-top:34px;padding-top:18px;border-top:1px solid var(--line);font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:6px}
-footer b{color:var(--ink);font-weight:600}
-@media (max-width:900px) and (min-width:561px){.grid{grid-template-columns:1fr}}
-@media (max-width:560px){.cols{grid-template-columns:1fr}.totals{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}}
+:root{--paper:#f5f7fa;--card:#fff;--ink:#151a23;--muted:#596474;--faint:#7d8898;--line:#e2e7ee;--traffic:#256cad;--traffic-soft:#dce9f5;--search:#aa6d13;--search-soft:#f5ead5;--direct:#64748b;--social:#7454b8;--good:#31865a;--good-soft:#dff1e8;--danger:#b84b4b;--danger-soft:#f8e4e4;--shadow:0 1px 2px rgba(20,25,34,.04),0 7px 24px rgba(20,25,34,.055);--radius:14px}
+@media (prefers-color-scheme:dark){:root{--paper:#0e131a;--card:#171e27;--ink:#e8edf4;--muted:#a0aaba;--faint:#7f8a9a;--line:#293340;--traffic:#70afe5;--traffic-soft:#20384e;--search:#e0ad54;--search-soft:#3c311d;--direct:#94a0b1;--social:#b093e8;--good:#68c58d;--good-soft:#1e3b2b;--danger:#ef8e8e;--danger-soft:#482626;--shadow:0 2px 4px rgba(0,0,0,.28),0 8px 28px rgba(0,0,0,.34)}}
+:root[data-theme=dark]{--paper:#0e131a;--card:#171e27;--ink:#e8edf4;--muted:#a0aaba;--faint:#7f8a9a;--line:#293340;--traffic:#70afe5;--traffic-soft:#20384e;--search:#e0ad54;--search-soft:#3c311d;--direct:#94a0b1;--social:#b093e8;--good:#68c58d;--good-soft:#1e3b2b;--danger:#ef8e8e;--danger-soft:#482626;--shadow:0 2px 4px rgba(0,0,0,.28),0 8px 28px rgba(0,0,0,.34)}
+:root[data-theme=light]{--paper:#f5f7fa;--card:#fff;--ink:#151a23;--muted:#596474;--faint:#7d8898;--line:#e2e7ee;--traffic:#256cad;--traffic-soft:#dce9f5;--search:#aa6d13;--search-soft:#f5ead5;--direct:#64748b;--social:#7454b8;--good:#31865a;--good-soft:#dff1e8;--danger:#b84b4b;--danger-soft:#f8e4e4;--shadow:0 1px 2px rgba(20,25,34,.04),0 7px 24px rgba(20,25,34,.055)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;line-height:1.45;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+a{color:inherit}.skip{position:fixed;left:12px;top:-60px;background:var(--ink);color:var(--paper);padding:8px 12px;border-radius:6px;z-index:10}.skip:focus{top:12px}.wrap{max-width:1180px;margin:0 auto;padding:34px 24px 64px}
+header.top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px 32px;padding-bottom:22px;border-bottom:1px solid var(--line)}.eyebrow{text-transform:uppercase;letter-spacing:.15em;font-size:11px;font-weight:700;color:var(--faint)}h1{font-size:28px;margin:4px 0 0;letter-spacing:-.025em;text-wrap:balance}.win{font-size:12.5px;color:var(--muted);text-align:right;line-height:1.65}.win b{color:var(--ink);font-weight:650}.fresh{display:inline-flex;align-items:center;gap:5px}.fresh::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--good)}.fresh.stale{color:var(--danger)}.fresh.stale::before{background:var(--danger)}
+.toolbar{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:18px 0}.periods{display:flex;gap:4px;background:color-mix(in srgb,var(--line) 62%,transparent);padding:4px;border-radius:10px}.periods a{text-decoration:none;font-size:12px;font-weight:650;color:var(--muted);padding:6px 10px;border-radius:7px}.periods a[aria-current=page]{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}.filters{display:flex;align-items:end;gap:8px}.field{display:flex;flex-direction:column;gap:3px}.field label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:700}.field select,.theme{height:34px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font:inherit;font-size:12px;padding:0 28px 0 9px}.theme{padding:0 10px;cursor:pointer}
+.totals{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:0 0 18px}.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px;box-shadow:var(--shadow)}.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.stat .v{font-size:30px;font-weight:700;letter-spacing:-.035em;margin:3px 0}.stat .s{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:7px;flex-wrap:wrap}.delta{display:inline-flex;align-items:center;font-size:10px;font-weight:700;border-radius:999px;padding:2px 6px;background:var(--line);color:var(--muted);white-space:nowrap}.delta.up{background:var(--good-soft);color:var(--good)}.delta.down{background:var(--danger-soft);color:var(--danger)}
+.signals{display:flex;gap:7px;flex-wrap:wrap;margin:0 0 20px}.signal-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;color:var(--faint);align-self:center;margin-right:2px}.signal{font-size:11.5px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 9px}.signal.up::before{content:"↑";color:var(--good);font-weight:800;margin-right:5px}.signal.down::before{content:"↓";color:var(--danger);font-weight:800;margin-right:5px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}
+.ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
+.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.opportunity{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px;min-width:0;font-size:11.5px}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
+footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:5px}footer b{color:var(--ink);font-weight:650}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media (max-width:940px){.grid{grid-template-columns:1fr}.card{max-width:760px;width:100%;margin-inline:auto}}
+@media (max-width:700px){.toolbar{align-items:stretch;flex-direction:column}.filters{display:grid;grid-template-columns:1fr 1fr auto}.field select{width:100%}.totals{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.wrap{padding:24px 15px 48px}header.top{flex-direction:column;align-items:flex-start;gap:10px;padding-bottom:16px}.win{text-align:left;width:100%}h1{font-size:26px}.toolbar{margin:14px 0}.periods{width:100%}.periods a{flex:1;text-align:center}.filters{grid-template-columns:1fr 1fr}.theme{grid-column:1/-1;width:100%}.totals{gap:8px;margin-bottom:14px}.stat{padding:13px 14px}.stat .v{font-size:27px}.signals{margin-bottom:14px}.card{padding:16px 16px 17px}.spark{width:126px}.chead{gap:9px}.host{font-size:14px}.nums .big{font-size:23px}.detail{border-top:1px solid var(--line);padding-top:10px}.detail>summary{display:flex;justify-content:space-between;gap:8px;cursor:pointer;font-size:11px;color:var(--muted);list-style:none}.detail>summary::-webkit-details-marker{display:none}.summary-action{color:var(--traffic);font-weight:700;white-space:nowrap}.detail[open]>summary{margin-bottom:14px}.cols{grid-template-columns:1fr;gap:17px}.pages-list{grid-template-columns:1fr}.pages-panel{margin-top:17px}.metric-name{font-size:12px}.metric-values strong{font-size:11.5px}.metric-values span{font-size:9px}}
 </style></head><body>
+<a class="skip" href="#main">Skip to dashboard</a>
 <div class="wrap">
   <header class="top">
-    <div>
-      <div class="eyebrow">Daily traffic &amp; search brief</div>
-      <h1>All domains — one glance</h1>
-    </div>
+    <div><div class="eyebrow">Daily traffic &amp; search brief</div><h1>${data.domain ? esc(data.domain) : "All domains — one glance"}</h1></div>
     <div class="win">
-      Traffic: <b>last 24 h</b> · ${esc(dateLabel)}<br>
-      Search: <b>${esc(kwWindow)}</b> (GSC ~2-day lag)
+      Traffic: <b>${esc(periodLabel)}</b> · ${esc(trafficWindow)}${coverageNote ? ` · ${esc(coverageNote)}` : ""}<br>
+      Search: <b>${esc(gscWindow)}</b> · freshest complete GSC window<br>
+      <span class="fresh ${stale ? "stale" : ""}">${stale ? "Data may be stale" : "Last successful pull"}: <b>${esc(formatTimestamp(updatedAt))}</b></span>
     </div>
   </header>
-  <div class="totals">
-    ${stats.map((s) => `<div class="stat"><div class="k">${s[0]}</div><div class="v">${s[1]}</div><div class="s">${s[2]}</div></div>`).join("")}
-  </div>
-  <div class="grid">
-    ${d.sites.map(siteCard).join("")}
-  </div>
+  <nav class="toolbar" aria-label="Dashboard controls">
+    <div class="periods" aria-label="Traffic reporting period">
+      ${[1, 7, 30].map((days) => `<a href="${withQuery(data, { period: days })}" ${data.periodDays === days ? `aria-current="page"` : ""}>${days === 1 ? "24h" : `${days}d`}</a>`).join("")}
+    </div>
+    <div class="filters">
+      <div class="field"><label for="domain-filter">Domain</label><select id="domain-filter" data-query="domain"><option value="">All domains</option>${data.allDomains.map((host) => `<option value="${esc(host)}" ${data.domain === host ? "selected" : ""}>${esc(host)}</option>`).join("")}</select></div>
+      <div class="field"><label for="sort-filter">Sort</label><select id="sort-filter" data-query="sort"><option value="traffic" ${data.sort === "traffic" ? "selected" : ""}>Traffic</option><option value="change" ${data.sort === "change" ? "selected" : ""}>Biggest gain</option><option value="name" ${data.sort === "name" ? "selected" : ""}>Domain name</option></select></div>
+      <button class="theme" id="theme-toggle" type="button" aria-label="Change color theme">◐ Theme</button>
+    </div>
+  </nav>
+  <main id="main">
+    <section class="totals" aria-labelledby="overview-heading"><h2 class="sr-only" id="overview-heading">Traffic overview</h2>
+      ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
+    </section>
+    ${data.anomalies.length ? `<aside class="signals" aria-label="Notable changes"><span class="signal-label">Notable</span>${data.anomalies.map((item) => `<span class="signal ${item.type}">${esc(anomalyText(item))} vs ${esc(previousLabel)}</span>`).join("")}</aside>` : ""}
+    <div class="grid">${data.sites.map((site, index) => siteCard(site, index, data.periodDays)).join("")}</div>
+  </main>
   <footer>
-    <div><b>Visitors</b> = Cloudflare Web Analytics sessions; <b>pageviews</b> beneath. Referrers ranked by sessions over the last 24 h. Sparkline = daily visitors, last 14 days.</div>
-    <div><b>Keywords</b> from Google Search Console, ranked by clicks. GSC lags ~2 days, so this is the freshest full window — not literally the last 24 h.</div>
-    <div>Updated ${esc(d.generatedAt)} · ${d.run?.ok ? "last run OK" : "see run log"} · sources: Cloudflare GraphQL Analytics · Google Search Console.</div>
+    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews and referrers use the selected traffic period. Direct traffic is shown separately so smaller external sources remain readable.</div>
+    <div><b>Search queries and landing pages</b> use the latest complete Google Search Console window. Opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
+    <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>
 </div>
 <script>
-// Respect a manual theme toggle if one is ever added; harmless otherwise.
+(function () {
+  var root = document.documentElement;
+  var button = document.getElementById("theme-toggle");
+  try { var saved = localStorage.getItem("stats-theme"); if (saved) root.dataset.theme = saved; } catch (_) {}
+  button.addEventListener("click", function () {
+    var current = root.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    var next = current === "dark" ? "light" : "dark";
+    root.dataset.theme = next;
+    try { localStorage.setItem("stats-theme", next); } catch (_) {}
+  });
+  document.querySelectorAll("select[data-query]").forEach(function (select) {
+    select.addEventListener("change", function () {
+      var url = new URL(location.href);
+      if (select.value) url.searchParams.set(select.dataset.query, select.value); else url.searchParams.delete(select.dataset.query);
+      location.assign(url.toString());
+    });
+  });
+  document.querySelectorAll("details.detail").forEach(function (detail, index) {
+    if (matchMedia("(max-width: 560px)").matches && index > 0) detail.removeAttribute("open");
+    var action = detail.querySelector(".summary-action");
+    var update = function () { action.textContent = detail.open ? "Hide details" : "Show details"; };
+    detail.addEventListener("toggle", update);
+    update();
+  });
+})();
 </script>
 </body></html>`;
 }

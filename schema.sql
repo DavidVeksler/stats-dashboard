@@ -29,6 +29,18 @@ CREATE TABLE IF NOT EXISTS daily_keywords (
   PRIMARY KEY (date, host, query)
 );
 
+CREATE TABLE IF NOT EXISTS daily_pages (
+  date        TEXT NOT NULL,         -- snapshot date (matches daily_traffic)
+  host        TEXT NOT NULL,
+  page        TEXT NOT NULL,
+  clicks      INTEGER NOT NULL DEFAULT 0,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  ctr         REAL NOT NULL DEFAULT 0,
+  position    REAL NOT NULL DEFAULT 0,
+  gsc_window  TEXT,
+  PRIMARY KEY (date, host, page)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,
@@ -39,3 +51,4 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_traffic_date ON daily_traffic(date);
 CREATE INDEX IF NOT EXISTS idx_ref_dh ON daily_referrers(date, host);
 CREATE INDEX IF NOT EXISTS idx_kw_dh  ON daily_keywords(date, host);
+CREATE INDEX IF NOT EXISTS idx_pages_dh ON daily_pages(date, host);

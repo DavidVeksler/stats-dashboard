@@ -55,11 +55,11 @@ export async function getAccessToken(sa, nowSec) {
   return (await res.json()).access_token;
 }
 
-// Top keyword queries for one property over [start, end] (YYYY-MM-DD).
+// Search Analytics rows for one property over [start, end] (YYYY-MM-DD).
 // pageFilter is an optional RE2 expression matched against the result page URL.
-export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
+async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLimit, pageFilter) {
   const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
-  const requestBody = { startDate: start, endDate: end, dimensions: ["query"], rowLimit };
+  const requestBody = { startDate: start, endDate: end, dimensions: [dimension], rowLimit };
   if (pageFilter) {
     requestBody.dimensionFilterGroups = [{
       groupType: "and",
@@ -71,12 +71,29 @@ export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, p
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
   });
-  if (!res.ok) throw new Error(`GSC query ${res.status} for ${siteUrl}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`GSC ${dimension} ${res.status} for ${siteUrl}: ${await res.text()}`);
   const body = await res.json();
-  return (body.rows ?? []).map((r) => ({
+  return body.rows ?? [];
+}
+
+export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, "query", rowLimit, pageFilter);
+  return rows.map((r) => ({
     query: r.keys[0],
     clicks: r.clicks ?? 0,
     impressions: r.impressions ?? 0,
+    ctr: r.ctr ?? 0,
+    position: r.position ?? 0,
+  }));
+}
+
+export async function queryPages(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, "page", rowLimit, pageFilter);
+  return rows.map((r) => ({
+    page: r.keys[0],
+    clicks: r.clicks ?? 0,
+    impressions: r.impressions ?? 0,
+    ctr: r.ctr ?? 0,
     position: r.position ?? 0,
   }));
 }

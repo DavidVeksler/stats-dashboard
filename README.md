@@ -4,10 +4,10 @@ Daily traffic + search dashboard for all my domains, at **https://stats.davidvek
 
 ![stats-dashboard screenshot](docs/dashboard.png)
 
-- **Traffic + referrers** (last 24 h) — Cloudflare Web Analytics (RUM) via the GraphQL Analytics API.
-- **Search keywords** — Google Search Console. GSC data lags ~2 days, so the card shows the freshest full 3-day window, not literally the last 24 h.
+- **Traffic + referrers** (24 h, 7 d, or 30 d) — Cloudflare Web Analytics (RUM) via the GraphQL Analytics API, with previous-period comparisons and anomaly callouts.
+- **Search queries + landing pages** — Google Search Console clicks, impressions, CTR, and average position. GSC data lags ~2 days, so cards show the freshest full 3-day window.
 - A **Cron Trigger** pulls both every night at **13:00 UTC (~6 am Pacific)**, writes one snapshot per domain into **D1**, and sends an **ntfy** push (topic `david-stats-cf-serp`).
-- The dashboard renders from stored D1 snapshots, so it loads instantly and builds **14-day sparklines** over time.
+- The dashboard renders from stored D1 snapshots, so it loads instantly and builds **14-day sparklines** over time. Domain filters, traffic/change sorting, mobile disclosure, and light/dark themes are built in.
 
 ## Architecture
 
@@ -15,12 +15,12 @@ Daily traffic + search dashboard for all my domains, at **https://stats.davidvek
 Cron 13:00 UTC ─┐
                 ├─> Worker (src/index.js runDaily)
  /run?key=…  ───┘        ├─ pullTraffic()  → Cloudflare GraphQL (all 4 accounts)
-                         ├─ queryKeywords()→ Google Search Console (per property)
-                         ├─ write snapshot → D1 (daily_traffic, daily_referrers, daily_keywords)
+                         ├─ queryKeywords()/queryPages() → Google Search Console
+                         ├─ write snapshot → D1 (traffic, referrers, queries, pages)
                          └─ sendNtfy()     → ntfy.sh/david-stats-cf-serp
 
 GET /            → loadDashboard() reads D1 → renderDashboard() HTML
-GET /api/json    → same data as JSON
+GET /api/json    → same data as JSON (`period`, `domain`, and `sort` query params)
 GET /health      → "ok"
 GET /run?key=…   → manual re-pull (needs REFRESH_KEY secret)
 ```
@@ -49,7 +49,7 @@ repeat these steps and run `./deploy.sh --gsc-key path/to/key.json`.
 4. In **Search Console** (https://search.google.com/search-console), for **each** property
    → Settings → **Users and permissions → Add user** → paste the service account's
    `client_email` (looks like `name@project.iam.gserviceaccount.com`) → **Restricted** (read) is enough.
-   Do this for all 7 properties.
+   Do this for every configured property.
 5. Store the whole JSON key as the Worker secret (one line):
    ```sh
    export CLOUDFLARE_API_TOKEN=<your-cf-token>
@@ -86,8 +86,9 @@ Secrets (set once via `wrangler secret put`, or auto-provisioned by `deploy.sh`)
 - `GSC_SA_KEY` — Google service-account JSON. ✅ set
 
 > Note: the analytics token deploys the Worker and binds D1 at runtime, but is **not** scoped
-> for the D1 management API — so `d1 execute --remote` / `--schema` fail with `code 10000`.
-> The schema is a one-time bootstrap (already applied); change it via the D1 console or MCP.
+> for D1 management writes, so `d1 execute --remote` / `--schema` can fail with codes `10000`
+> or `7500`. Additive dashboard migrations are also applied idempotently through the Worker's
+> runtime D1 binding before a data pull.
 
 Vars (in `wrangler.jsonc`): `NTFY_TOPIC = david-stats-cf-serp`.
 
@@ -100,10 +101,8 @@ Vars (in `wrangler.jsonc`): `NTFY_TOPIC = david-stats-cf-serp`.
 
 ## Notes / limitations
 
-- **Visitors = sessions**, not unique people — Cloudflare's free RUM tier doesn't expose uniques.
+- **Sessions are not unique people** — Cloudflare's free RUM tier doesn't expose uniques.
   Referrer ranks use sessions; internal navigation is excluded.
-- **`2020.theobjectivestandard.com`** shows no data — no Web Analytics beacon and no GSC clicks.
-  Remove it from `SITES` if it stays dormant.
 - The `davidveksler.com` GSC property is a broad `sc-domain:` property, but its dashboard query
   filters the page dimension to root-domain URLs. This keeps its keywords separate from
   `cheatsheets.davidveksler.com` without requiring another GSC property.

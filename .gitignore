@@ -1,6 +1,7 @@
 node_modules/
 .wrangler/
 dist/
+.preview/
 *.log
 # never commit the Google service-account key
 *key*.json

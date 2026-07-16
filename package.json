@@ -5,6 +5,9 @@
   "description": "Daily traffic (Cloudflare Web Analytics) + search (Google Search Console) dashboard for David's domains",
   "type": "module",
   "scripts": {
+    "check": "node --check src/index.js && node --check src/render.js && node --check src/gsc.js && node --check scripts/rotate-refresh-key.mjs && node scripts/render-check.mjs",
+    "preview": "node scripts/render-check.mjs --write",
+    "rotate:refresh": "node scripts/rotate-refresh-key.mjs",
     "dev": "wrangler dev",
     "release": "./deploy.sh",
     "deploy": "wrangler deploy",
