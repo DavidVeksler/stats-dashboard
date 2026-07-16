@@ -2,6 +2,8 @@
 
 Daily traffic + search dashboard for all my domains, at **https://stats.davidveksler.com**.
 
+![stats-dashboard screenshot](docs/dashboard.png)
+
 - **Traffic + referrers** (last 24 h) — Cloudflare Web Analytics (RUM) via the GraphQL Analytics API.
 - **Search keywords** — Google Search Console. GSC data lags ~2 days, so the card shows the freshest full 3-day window, not literally the last 24 h.
 - A **Cron Trigger** pulls both every night at **13:00 UTC (~6 am Pacific)**, writes one snapshot per domain into **D1**, and sends an **ntfy** push (topic `david-stats-cf-serp`).
@@ -31,11 +33,12 @@ Files: `src/config.js` (domains + accounts), `src/cloudflare.js` (RUM pull),
 Edit `SITES` in `src/config.js`. `host` = the Cloudflare Web Analytics requestHost;
 `gsc` = the exact Search Console property string (`sc-domain:…` or a URL prefix).
 
-## The one remaining setup step — Google Search Console auth
+## Google Search Console auth (done — kept for reference)
 
-The nightly job runs headless, so it can't use an interactive Google login. It needs a
-**service account**. Until `GSC_SA_KEY` is set, traffic/referrers work fully and keywords
-are simply skipped (the ntfy push notes it).
+The nightly job runs headless, so it can't use an interactive Google login. It uses a
+**service account** (`GSC_SA_KEY`, now set). If `GSC_SA_KEY` is ever missing, traffic/referrers
+still work fully and keywords are simply skipped (the ntfy push notes it). To rotate the key,
+repeat these steps and run `./deploy.sh --gsc-key path/to/key.json`.
 
 1. Google Cloud Console → create (or pick) a project → **APIs & Services → Enable APIs** →
    enable **Google Search Console API**.
@@ -58,18 +61,31 @@ are simply skipped (the ntfy push notes it).
 
 ## Deploy / operate
 
+Use the deploy script — idempotent, parses the CF token from `~/Projects/.cloudflare.env`,
+ensures secrets, deploys, and smoke-tests:
+
 ```sh
-npm install
-export CLOUDFLARE_API_TOKEN=<cf-token-with-workers+d1+dns edit>   # first token in ~/Projects/.cloudflare.env
-npm run deploy           # wrangler deploy
-npm run tail             # live logs
-wrangler d1 execute stats-dashboard --remote --command "SELECT * FROM runs ORDER BY run_at DESC LIMIT 5"
+./deploy.sh                     # install, ensure secrets, deploy, verify /health
+./deploy.sh --refresh           # ...then trigger a live pull (/run) and print the result
+./deploy.sh --gsc-key key.json  # also (re)set the GSC service-account secret
+./deploy.sh --schema            # also (re)apply schema.sql — needs a D1:Edit-scoped token
 ```
 
-Secrets (set once via `wrangler secret put`):
+Manual bits:
+```sh
+export CLOUDFLARE_API_TOKEN=<first token in ~/Projects/.cloudflare.env>
+npm run deploy    # raw wrangler deploy
+npm run tail      # live logs
+```
+
+Secrets (set once via `wrangler secret put`, or auto-provisioned by `deploy.sh`):
 - `CF_API_TOKEN` — Cloudflare token with **Account Analytics: Read** (the Worker's GraphQL calls). ✅ set
-- `REFRESH_KEY` — protects `GET /run`. ✅ set (value saved locally when created)
-- `GSC_SA_KEY` — Google service-account JSON. ⬜ pending (see above)
+- `REFRESH_KEY` — protects `GET /run`. ✅ set (saved locally in `.deploy/refresh_key.txt`, gitignored)
+- `GSC_SA_KEY` — Google service-account JSON. ✅ set
+
+> Note: the analytics token deploys the Worker and binds D1 at runtime, but is **not** scoped
+> for the D1 management API — so `d1 execute --remote` / `--schema` fail with `code 10000`.
+> The schema is a one-time bootstrap (already applied); change it via the D1 console or MCP.
 
 Vars (in `wrangler.jsonc`): `NTFY_TOPIC = david-stats-cf-serp`.
 
