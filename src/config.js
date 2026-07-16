@@ -1,13 +1,21 @@
 // The domains to track. `host` is the Cloudflare Web Analytics requestHost;
 // `gsc` is the exact Search Console property string (sc-domain: or URL-prefix).
 export const SITES = [
-  { host: "forum.objectivismonline.com",   gsc: "https://forum.objectivismonline.com/" },
-  { host: "cheatsheets.davidveksler.com",  gsc: "https://cheatsheets.davidveksler.com/" },
-  { host: "coloradofirearmswatch.org",     gsc: "sc-domain:coloradofirearmswatch.org" },
-  { host: "davidveksler.com",              gsc: "sc-domain:davidveksler.com" },
-  { host: "walletrecovery.info",           gsc: "sc-domain:walletrecovery.info" },
-  { host: "freecapitalists.org",           gsc: "https://freecapitalists.org/" },
-  { host: "2020.theobjectivestandard.com", gsc: "https://2020.theobjectivestandard.com/" },
+  {
+    host: "forum.objectivismonline.com",
+    gsc: "https://forum.objectivismonline.com/",
+  },
+  {
+    host: "cheatsheets.davidveksler.com",
+    gsc: "https://cheatsheets.davidveksler.com/",
+  },
+  {
+    host: "coloradofirearmswatch.org",
+    gsc: "sc-domain:coloradofirearmswatch.org",
+  },
+  { host: "davidveksler.com", gsc: "sc-domain:davidveksler.com" },
+  { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
+  { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
 ];
 
 export const TARGET_HOSTS = new Set(SITES.map((s) => s.host));
