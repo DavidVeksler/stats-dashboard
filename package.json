@@ -1,0 +1,16 @@
+{
+  "name": "stats-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daily traffic (Cloudflare Web Analytics) + search (Google Search Console) dashboard for David's domains",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "schema": "wrangler d1 execute stats-dashboard --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

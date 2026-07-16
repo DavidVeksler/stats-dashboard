@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stats-dashboard",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-01",
+  "account_id": "556c237bf8cb62edb8f7b401499bb7a9",
+
+  // D1: daily snapshots of traffic, referrers, and keywords
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stats-dashboard",
+      "database_id": "2f5ea431-472e-462f-94a4-b396576c1a5b"
+    }
+  ],
+
+  // Nightly pull at 13:00 UTC (~6am Pacific)
+  "triggers": {
+    "crons": ["0 13 * * *"]
+  },
+
+  // Serve the dashboard from the custom domain.
+  // If your API token lacks Workers-Routes/DNS edit, remove this block, deploy
+  // to *.workers.dev, then add the custom domain in the Cloudflare dashboard.
+  "routes": [
+    { "pattern": "stats.davidveksler.com", "custom_domain": true }
+  ],
+
+  "observability": { "enabled": true },
+
+  "vars": {
+    "NTFY_TOPIC": "david-stats-cf-serp"
+  }
+
+  // Secrets (set via `wrangler secret put`, NOT here):
+  //   CF_API_TOKEN  — Cloudflare token with Account Analytics Read (GraphQL)
+  //   GSC_SA_KEY    — Google service-account JSON key (whole file, one line)
+}
