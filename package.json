@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "release": "./deploy.sh",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "schema": "wrangler d1 execute stats-dashboard --remote --file=./schema.sql"
