@@ -36,7 +36,8 @@ The Worker has two entry points in `src/index.js`:
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics
-`requestHost`) to its exact GSC property string (`sc-domain:…` or a URL prefix).
+`requestHost`) to its exact GSC property string (`sc-domain:…` or a URL prefix). An optional
+`gscPageFilter` RE2 expression narrows a broad GSC property by result page URL.
 
 ## Non-obvious gotchas (these will bite you)
 

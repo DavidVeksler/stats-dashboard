@@ -56,12 +56,20 @@ export async function getAccessToken(sa, nowSec) {
 }
 
 // Top keyword queries for one property over [start, end] (YYYY-MM-DD).
-export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25) {
+// pageFilter is an optional RE2 expression matched against the result page URL.
+export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
   const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+  const requestBody = { startDate: start, endDate: end, dimensions: ["query"], rowLimit };
+  if (pageFilter) {
+    requestBody.dimensionFilterGroups = [{
+      groupType: "and",
+      filters: [{ dimension: "page", operator: "includingRegex", expression: pageFilter }],
+    }];
+  }
   const res = await fetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ startDate: start, endDate: end, dimensions: ["query"], rowLimit }),
+    body: JSON.stringify(requestBody),
   });
   if (!res.ok) throw new Error(`GSC query ${res.status} for ${siteUrl}: ${await res.text()}`);
   const body = await res.json();

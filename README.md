@@ -32,6 +32,8 @@ Files: `src/config.js` (domains + accounts), `src/cloudflare.js` (RUM pull),
 
 Edit `SITES` in `src/config.js`. `host` = the Cloudflare Web Analytics requestHost;
 `gsc` = the exact Search Console property string (`sc-domain:…` or a URL prefix).
+Set `gscPageFilter` to an RE2 expression when a broad property needs to be limited to
+specific page URLs. The `davidveksler.com` card uses this to exclude subdomains.
 
 ## Google Search Console auth (done — kept for reference)
 
@@ -102,6 +104,7 @@ Vars (in `wrangler.jsonc`): `NTFY_TOPIC = david-stats-cf-serp`.
   Referrer ranks use sessions; internal navigation is excluded.
 - **`2020.theobjectivestandard.com`** shows no data — no Web Analytics beacon and no GSC clicks.
   Remove it from `SITES` if it stays dormant.
-- The `davidveksler.com` GSC property is a `sc-domain:` property, so its keywords overlap with
-  the `cheatsheets.davidveksler.com` subdomain. Expected.
+- The `davidveksler.com` GSC property is a broad `sc-domain:` property, but its dashboard query
+  filters the page dimension to root-domain URLs. This keeps its keywords separate from
+  `cheatsheets.davidveksler.com` without requiring another GSC property.
 - D1 grows ~a few KB/day; no pruning needed for years. Add a retention `DELETE` if desired.

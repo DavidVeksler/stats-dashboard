@@ -47,11 +47,11 @@ async function runDaily(env, now = new Date()) {
       const gStart = addDays(date, -4);
       const gEnd = addDays(date, -2);
       const gscWindow = `${gStart}–${gEnd}`;
-      for (const { host, gsc } of SITES) {
+      for (const { host, gsc, gscPageFilter } of SITES) {
         stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
         let rows = [];
         try {
-          rows = await queryKeywords(token, gsc, gStart, gEnd, 25);
+          rows = await queryKeywords(token, gsc, gStart, gEnd, 25, gscPageFilter);
         } catch (e) {
           notes.push(`gsc ${host}: ${e.message}`.slice(0, 120));
         }

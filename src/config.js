@@ -1,5 +1,6 @@
 // The domains to track. `host` is the Cloudflare Web Analytics requestHost;
 // `gsc` is the exact Search Console property string (sc-domain: or URL-prefix).
+// `gscPageFilter`, when present, limits a broader property to matching page URLs.
 export const SITES = [
   {
     host: "forum.objectivismonline.com",
@@ -13,7 +14,11 @@ export const SITES = [
     host: "coloradofirearmswatch.org",
     gsc: "sc-domain:coloradofirearmswatch.org",
   },
-  { host: "davidveksler.com", gsc: "sc-domain:davidveksler.com" },
+  {
+    host: "davidveksler.com",
+    gsc: "sc-domain:davidveksler.com",
+    gscPageFilter: "^https?://(?:www\\.)?davidveksler\\.com/",
+  },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
   { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
 ];
