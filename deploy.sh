@@ -27,18 +27,42 @@ UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, l
 
 DO_REFRESH=0
 DO_SCHEMA=0
+ASSUME_YES=0
 GSC_KEY_PATH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --refresh) DO_REFRESH=1; shift ;;
     --schema)  DO_SCHEMA=1; shift ;;
+    --yes|-y)  ASSUME_YES=1; shift ;;
     --gsc-key) GSC_KEY_PATH="${2:?--gsc-key needs a path}"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 wr() { npx --no-install wrangler "$@"; }
-log() { printf '\n\033[1;34m▸ %s\033[0m\n' "$*"; }
+step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+ok() { printf '  \033[1;32mOK\033[0m   %s\n' "$*"; }
+die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+DEPLOY_OK=0
+on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$DEPLOY_OK" -ne 1 ]; then
+    printf '\n\033[1;31mERROR: Stats Dashboard deployment failed (exit %s).\033[0m\n' "$rc" >&2
+  fi
+}
+trap on_exit EXIT
+
+step "Preflight"
+[ -z "$(git status --porcelain)" ] || die "Working tree is not clean. Commit or stash changes before deploying."
+DEPLOY_COMMIT="$(git rev-parse --short HEAD)"
+ok "working tree is clean at $DEPLOY_COMMIT"
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  step "Deployment plan"
+  printf '  Site:   Stats Dashboard\n  Target: %s\n  Method: Cloudflare Workers\n  Commit: %s\n' "$URL" "$DEPLOY_COMMIT"
+  read -r -p "Deploy this production plan? [y/N] " reply
+  [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]] || { echo "Cancelled. Nothing was deployed."; exit 0; }
+fi
 
 # --- 1. Auth: take ONLY the first CLOUDFLARE_API_TOKEN line -------------------
 # (the env file intentionally holds two; concatenating them makes an invalid header)
@@ -49,7 +73,7 @@ export CLOUDFLARE_API_TOKEN
 
 # --- 2. Dependencies ---------------------------------------------------------
 if [ ! -d node_modules/wrangler ]; then
-  log "Installing dependencies"
+  step "Installing dependencies"
   npm install
 fi
 
@@ -57,7 +81,7 @@ fi
 # (CREATE TABLE IF NOT EXISTS is idempotent, but `d1 execute --remote` hits the
 #  D1 management API, which the analytics token isn't scoped for. Best-effort.)
 if [ "$DO_SCHEMA" = "1" ]; then
-  log "Applying D1 schema"
+  step "Applying D1 schema"
   if wr d1 execute "$WORKER" --remote --file=./schema.sql --yes >/dev/null 2>&1; then
     echo "schema ok"
   else
@@ -67,7 +91,7 @@ if [ "$DO_SCHEMA" = "1" ]; then
 fi
 
 # --- 4. Secrets — set only the ones not already present ----------------------
-log "Checking Worker secrets"
+step "Checking Worker secrets"
 EXISTING="$(wr secret list 2>/dev/null | grep -oE '"name": "[A-Z_]+"' | grep -oE '[A-Z_]+' || true)"
 has_secret() { echo "$EXISTING" | grep -qx "$1"; }
 
@@ -93,18 +117,18 @@ elif ! has_secret GSC_SA_KEY; then
 fi
 
 # --- 5. Deploy ---------------------------------------------------------------
-log "Deploying Worker"
+step "Deploy"
 wr deploy
 
 # --- 6. Smoke test -----------------------------------------------------------
-log "Verifying"
+step "Verify live"
 sleep 3
 HEALTH="$(curl -fsS -A "$UA" "$URL/health" || echo FAIL)"
 echo "GET /health -> $HEALTH"
 [ "$HEALTH" = "ok" ] || { echo "health check failed" >&2; exit 1; }
 
 if [ "$DO_REFRESH" = "1" ]; then
-  log "Triggering live pull (/run)"
+  step "Triggering live pull (/run)"
   if [ -f "$KEY_FILE" ]; then
     RK="$(tr -d '\n' < "$KEY_FILE")"
     curl -fsS -A "$UA" "$URL/run?key=$RK" | sed 's/^/  /'
@@ -114,4 +138,5 @@ if [ "$DO_REFRESH" = "1" ]; then
   fi
 fi
 
-log "Done → $URL"
+DEPLOY_OK=1
+step "Deployment complete and verified. $URL"

@@ -2,10 +2,16 @@
 param(
   [switch]$Refresh,
   [switch]$Schema,
-  [string]$GscKey
+  [string]$GscKey,
+  [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+trap {
+  Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+  exit 1
+}
 
 # Prefer Git Bash. The Windows `bash.exe` command points to WSL on this machine,
 # whose Node runtime may be older than Wrangler supports.
@@ -34,6 +40,7 @@ if ($LASTEXITCODE -ne 0 -or [version]$nodeVersion -lt [version]"22.0.0") {
 $deployArgs = @("./deploy.sh")
 if ($Refresh) { $deployArgs += "--refresh" }
 if ($Schema) { $deployArgs += "--schema" }
+if ($Yes) { $deployArgs += "--yes" }
 if ($GscKey) {
   $keyPath = (Resolve-Path -LiteralPath $GscKey).Path -replace "\\", "/"
   $deployArgs += @("--gsc-key", $keyPath)
