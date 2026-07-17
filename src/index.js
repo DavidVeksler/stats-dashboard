@@ -1,6 +1,6 @@
 import { SITES } from "./config.js";
 import { pullTraffic, topReferrers } from "./cloudflare.js";
-import { getAccessToken, queryKeywords, queryPages } from "./gsc.js";
+import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
 import { renderDashboard } from "./render.js";
 
 const utcDate = (d) => d.toISOString().slice(0, 10);
@@ -26,6 +26,17 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, page)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_pages_dh ON daily_pages(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_search_summary (
+      date TEXT NOT NULL,
+      host TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      impressions INTEGER NOT NULL DEFAULT 0,
+      ctr REAL NOT NULL DEFAULT 0,
+      position REAL NOT NULL DEFAULT 0,
+      gsc_window TEXT,
+      PRIMARY KEY (date, host)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host)`),
   ]);
 }
 
@@ -49,7 +60,9 @@ async function runDaily(env, now = new Date()) {
       ).bind(date, host, rec.visits, rec.views),
       env.DB.prepare(`DELETE FROM daily_referrers WHERE date=? AND host=?`).bind(date, host),
     );
-    for (const r of topReferrers(rec.referrers, 8)) {
+    // Keep enough rows for accurate source-mix totals; the dashboard still
+    // renders only the top eight referrers per domain.
+    for (const r of topReferrers(rec.referrers, 50)) {
       stmts.push(
         env.DB.prepare(
           `INSERT INTO daily_referrers (date,host,referrer,kind,visits) VALUES (?,?,?,?,?)`
@@ -70,7 +83,8 @@ async function runDaily(env, now = new Date()) {
       for (const { host, gsc, gscPageFilter } of SITES) {
         stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
-        let rows = [], pages = [];
+        stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
+        let rows = [], pages = [], summary = null;
         try {
           rows = await queryKeywords(token, gsc, gStart, gEnd, 25, gscPageFilter);
         } catch (e) {
@@ -80,6 +94,11 @@ async function runDaily(env, now = new Date()) {
           pages = await queryPages(token, gsc, gStart, gEnd, 15, gscPageFilter);
         } catch (e) {
           notes.push(`gsc pages ${host}: ${e.message}`.slice(0, 140));
+        }
+        try {
+          summary = await querySearchSummary(token, gsc, gStart, gEnd, gscPageFilter);
+        } catch (e) {
+          notes.push(`gsc summary ${host}: ${e.message}`.slice(0, 140));
         }
         for (const k of rows) {
           stmts.push(
@@ -93,6 +112,13 @@ async function runDaily(env, now = new Date()) {
             env.DB.prepare(
               `INSERT INTO daily_pages (date,host,page,clicks,impressions,ctr,position,gsc_window) VALUES (?,?,?,?,?,?,?,?)`
             ).bind(date, host, p.page, p.clicks, p.impressions, p.ctr, p.position, gscWindow),
+          );
+        }
+        if (summary) {
+          stmts.push(
+            env.DB.prepare(
+              `INSERT INTO daily_search_summary (date,host,clicks,impressions,ctr,position,gsc_window) VALUES (?,?,?,?,?,?,?)`
+            ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.position, gscWindow),
           );
         }
       }
@@ -147,9 +173,13 @@ async function loadDashboard(env, options = {}) {
     return { date: null, coverageStart: null, generatedAt: new Date().toISOString(), dataUpdatedAt: null, run: null,
       periodDays, domain, sort, allDomains: SITES.map((site) => site.host), anomalies: [],
       totals: { visits: 0, views: 0, search: 0, domains: selectedSites.length, active: 0,
-        previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0 },
+        previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
+        sourceMix: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
+        gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
+        opportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
-        delta: null, referrers: [], keywords: [], pages: [], spark: [] })) };
+        delta: null, referrers: [], keywords: [], pages: [], searchSummary: null,
+        sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
   const previousEnd = addDays(start, -1);
@@ -157,7 +187,10 @@ async function loadDashboard(env, options = {}) {
   const pagesQuery = env.DB.prepare(
     `SELECT host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date=? ORDER BY clicks DESC, impressions DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, hist, run] = await Promise.all([
+  const searchSummaryQuery = env.DB.prepare(
+    `SELECT host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date=?`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, hist, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -166,6 +199,7 @@ async function loadDashboard(env, options = {}) {
     ).bind(start, date).all(),
     env.DB.prepare(`SELECT host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
+    searchSummaryQuery,
     env.DB.prepare(`SELECT date,host,visits FROM daily_traffic WHERE date >= date(?, '-29 days') ORDER BY date ASC`).bind(date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
   ]);
@@ -177,11 +211,23 @@ async function loadDashboard(env, options = {}) {
     visits: acc.visits + Number(row.visits || 0),
     views: acc.views + Number(row.views || 0),
   }), { visits: 0, views: 0 });
+  const summarizeSources = (rows, visits) => {
+    const result = { direct: 0, search: 0, social: 0, referral: 0, other: 0 };
+    for (const row of rows) {
+      const key = row.kind === "ref" ? "referral" : row.kind;
+      if (key in result && key !== "other") result[key] += Number(row.visits || 0);
+    }
+    const attributed = result.direct + result.search + result.social + result.referral;
+    result.other = Math.max(0, visits - attributed);
+    return result;
+  };
   let sites = selectedSites.map((s) => {
     const t = sumTraffic(byHost(tr, s.host));
     const previous = sumTraffic(byHost(previousTr, s.host));
     const kwRows = byHost(kws, s.host);
     const pageRows = byHost(pages, s.host);
+    const refRows = byHost(refs, s.host);
+    const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
     const currentRate = t.visits ? t.views / t.visits : 0;
     const previousRate = previous.visits ? previous.views / previous.visits : 0;
     return {
@@ -192,12 +238,17 @@ async function loadDashboard(env, options = {}) {
       pagesPerSession: currentRate,
       previousPagesPerSession: previousRate,
       pagesPerSessionDelta: previous.visits ? currentRate - previousRate : null,
-      referrers: byHost(refs, s.host).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
+      referrers: refRows.slice(0, 8).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
+      sources: summarizeSources(refRows, t.visits),
       keywords: kwRows.slice(0, 12).map((k) => ({ query: k.query, clicks: k.clicks,
         impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position })),
       pages: pageRows.slice(0, 8).map((p) => ({ page: p.page, clicks: p.clicks,
         impressions: p.impressions, ctr: p.ctr ?? (p.impressions ? p.clicks / p.impressions : 0), position: p.position })),
-      gscWindow: kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
+      searchSummary: summaryRow ? { clicks: Number(summaryRow.clicks || 0), impressions: Number(summaryRow.impressions || 0),
+        ctr: Number(summaryRow.ctr || 0), position: Number(summaryRow.position || 0) } : null,
+      opportunityCount: kwRows.filter((k) => Number(k.impressions) >= 5 && Number(k.position) >= 4 &&
+        Number(k.position) <= 20 && Number(k.clicks) / Number(k.impressions) < .04).length,
+      gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
       spark: byHost(hist, s.host).slice(-14).map((r) => ({ date: r.date, visits: r.visits })),
     };
   });
@@ -206,19 +257,31 @@ async function loadDashboard(env, options = {}) {
   else if (sort === "change") sites.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
   else sites.sort((a, b) => b.visits - a.visits);
 
+  const sourceMix = sites.reduce((acc, site) => {
+    for (const key of Object.keys(acc)) acc[key] += site.sources[key];
+    return acc;
+  }, { direct: 0, search: 0, social: 0, referral: 0, other: 0 });
+  const searchSites = sites.filter((site) => site.searchSummary);
   const totals = {
     visits: sites.reduce((a, s) => a + s.visits, 0),
     views: sites.reduce((a, s) => a + s.views, 0),
-    search: refs.results.filter((r) => r.kind === "search" && selectedSites.some((site) => site.host === r.host))
-      .reduce((a, r) => a + Number(r.visits || 0), 0),
+    search: sourceMix.search,
+    sourceMix,
     domains: sites.length,
     active: sites.filter((s) => s.visits > 0).length,
     previousVisits: sites.reduce((a, s) => a + s.previousVisits, 0),
     daysAvailable: availableDates.length,
     previousDaysAvailable: previousAvailableDates.length,
+    gscClicks: searchSites.reduce((sum, site) => sum + site.searchSummary.clicks, 0),
+    gscImpressions: searchSites.reduce((sum, site) => sum + site.searchSummary.impressions, 0),
+    searchDataDomains: searchSites.length,
+    opportunities: sites.reduce((sum, site) => sum + site.opportunityCount, 0),
   };
   totals.delta = totals.previousVisits ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
   totals.searchShare = totals.visits ? totals.search / totals.visits : 0;
+  totals.gscCtr = totals.gscImpressions ? totals.gscClicks / totals.gscImpressions : 0;
+  totals.gscPosition = totals.gscImpressions ? searchSites.reduce((sum, site) =>
+    sum + site.searchSummary.position * site.searchSummary.impressions, 0) / totals.gscImpressions : 0;
 
   const anomalies = sites.flatMap((site) => {
     const items = [];

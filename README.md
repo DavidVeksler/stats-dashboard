@@ -5,7 +5,8 @@ Daily traffic + search dashboard for all my domains, at **https://stats.davidvek
 ![stats-dashboard screenshot](docs/dashboard.png)
 
 - **Traffic + referrers** (24 h, 7 d, or 30 d) — Cloudflare Web Analytics (RUM) via the GraphQL Analytics API, with previous-period comparisons and anomaly callouts.
-- **Search queries + landing pages** — Google Search Console clicks, impressions, CTR, and average position. GSC data lags ~2 days, so cards show the freshest full 3-day window.
+- **Search performance + queries + landing pages** — aggregate Google Search Console clicks, impressions, CTR, and average position, plus ranked query and page detail. GSC data lags ~2 days, so cards show the freshest full 3-day window.
+- **Traffic source mix** — direct, search, social, referral, and unlisted sessions for the selected traffic period.
 - A **Cron Trigger** pulls both every night at **13:00 UTC (~6 am Pacific)**, writes one snapshot per domain into **D1**, and sends an **ntfy** push (topic `david-stats-cf-serp`).
 - The dashboard renders from stored D1 snapshots, so it loads instantly and builds **14-day sparklines** over time. Domain filters, traffic/change sorting, mobile disclosure, and light/dark themes are built in.
 
@@ -15,7 +16,7 @@ Daily traffic + search dashboard for all my domains, at **https://stats.davidvek
 Cron 13:00 UTC ─┐
                 ├─> Worker (src/index.js runDaily)
  /run?key=…  ───┘        ├─ pullTraffic()  → Cloudflare GraphQL (all 4 accounts)
-                         ├─ queryKeywords()/queryPages() → Google Search Console
+                         ├─ querySearchSummary()/queryKeywords()/queryPages() → Google Search Console
                          ├─ write snapshot → D1 (traffic, referrers, queries, pages)
                          └─ sendNtfy()     → ntfy.sh/david-stats-cf-serp
 

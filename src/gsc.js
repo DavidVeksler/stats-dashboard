@@ -59,7 +59,9 @@ export async function getAccessToken(sa, nowSec) {
 // pageFilter is an optional RE2 expression matched against the result page URL.
 async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLimit, pageFilter) {
   const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
-  const requestBody = { startDate: start, endDate: end, dimensions: [dimension], rowLimit };
+  const requestBody = { startDate: start, endDate: end };
+  if (dimension) requestBody.dimensions = [dimension];
+  if (rowLimit) requestBody.rowLimit = rowLimit;
   if (pageFilter) {
     requestBody.dimensionFilterGroups = [{
       groupType: "and",
@@ -74,6 +76,19 @@ async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLi
   if (!res.ok) throw new Error(`GSC ${dimension} ${res.status} for ${siteUrl}: ${await res.text()}`);
   const body = await res.json();
   return body.rows ?? [];
+}
+
+// Aggregate totals for the window. Keeping this separate from ranked
+// query/page rows avoids under-counting when Search Console truncates those lists.
+export async function querySearchSummary(token, siteUrl, start, end, pageFilter = null) {
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, null, 1, pageFilter);
+  const row = rows[0] ?? {};
+  return {
+    clicks: row.clicks ?? 0,
+    impressions: row.impressions ?? 0,
+    ctr: row.ctr ?? 0,
+    position: row.position ?? 0,
+  };
 }
 
 export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {

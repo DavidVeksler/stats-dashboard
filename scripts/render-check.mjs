@@ -16,11 +16,14 @@ const fixture = {
   sort: "traffic",
   allDomains: ["example.com", "small.example.com"],
   anomalies: [{ type: "up", host: "example.com", metric: "sessions", value: .31 }],
-  totals: { visits: 1300, views: 1770, search: 260, domains: 2, active: 2, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7 },
+  totals: { visits: 1300, views: 1770, search: 260, domains: 2, active: 2, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
+    sourceMix: { direct: 700, search: 260, social: 80, referral: 60, other: 200 },
+    gscClicks: 46, gscImpressions: 2200, gscCtr: .0209, gscPosition: 7.8, searchDataDomains: 2, opportunities: 1 },
   sites: [
     {
       host: "example.com", visits: 1100, views: 1500, previousVisits: 800, delta: .375,
       pagesPerSession: 1.36, previousPagesPerSession: 1.2, pagesPerSessionDelta: .16,
+      searchSummary: { clicks: 40, impressions: 1900, ctr: .0211, position: 7.5 },
       gscWindow: "2026-07-12–2026-07-14",
       referrers: [
         { referrer: "(direct)", kind: "direct", visits: 700 },
@@ -39,6 +42,7 @@ const fixture = {
     {
       host: "small.example.com", visits: 200, views: 270, previousVisits: 200, delta: 0,
       pagesPerSession: 1.35, previousPagesPerSession: 1.3, pagesPerSessionDelta: .05,
+      searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
       gscWindow: null, referrers: [], keywords: [], pages: [],
       spark: [{ date: "2026-07-15", visits: 25 }, { date: "2026-07-16", visits: 30 }],
     },
@@ -49,6 +53,7 @@ const html = renderDashboard(fixture);
 const required = [
   "Total sessions", "Search opportunities", "Top landing pages", "data-query=\"domain\"",
   "aria-label=\"Notable changes\"", "high impression opportunity", "Last successful pull",
+  "Google clicks", "Search impressions", "Traffic sources", "Avg search position",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
