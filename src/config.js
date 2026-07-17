@@ -21,6 +21,9 @@ export const SITES = [
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
   { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
+  { host: "davidveksler.freecapitalists.org", gsc: "https://davidveksler.freecapitalists.org/" },
+  { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
+
 ];
 
 export const TARGET_HOSTS = new Set(SITES.map((s) => s.host));

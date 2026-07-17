@@ -73,6 +73,16 @@ ensures secrets, deploys, and smoke-tests:
 ./deploy.sh --schema            # also (re)apply schema.sql — needs a D1:Edit-scoped token
 ```
 
+From Windows PowerShell, use the Git Bash wrapper. It avoids accidentally selecting WSL's
+older Node runtime and forwards the same options:
+
+```powershell
+.\deploy.ps1
+.\deploy.ps1 -Refresh
+.\deploy.ps1 -Schema
+.\deploy.ps1 -GscKey C:\path\to\key.json
+```
+
 Manual bits:
 ```sh
 export CLOUDFLARE_API_TOKEN=<first token in ~/Projects/.cloudflare.env>
