@@ -14,7 +14,7 @@ const fixture = {
   periodDays: 7,
   domain: null,
   sort: "traffic",
-  allDomains: ["example.com", "small.example.com"],
+  allDomains: ["example.com", "davidveksler.freecapitalists.org"],
   anomalies: [{ type: "up", host: "example.com", metric: "sessions", value: .31 }],
   totals: { visits: 1300, views: 1770, search: 260, domains: 2, active: 2, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
     sourceMix: { direct: 700, search: 260, social: 80, referral: 60, other: 200 },
@@ -40,7 +40,7 @@ const fixture = {
       spark: Array.from({ length: 14 }, (_, index) => ({ date: `2026-07-${String(index + 3).padStart(2, "0")}`, visits: 90 + index * 4 })),
     },
     {
-      host: "small.example.com", visits: 200, views: 270, previousVisits: 200, delta: 0,
+      host: "davidveksler.freecapitalists.org", visits: 200, views: 270, previousVisits: 200, delta: 0,
       pagesPerSession: 1.35, previousPagesPerSession: 1.3, pagesPerSessionDelta: .05,
       searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
       gscWindow: null, referrers: [], keywords: [], pages: [],
@@ -54,6 +54,8 @@ const required = [
   "Total sessions", "Search opportunities", "Top landing pages", "data-query=\"domain\"",
   "aria-label=\"Notable changes\"", "high impression opportunity", "Last successful pull",
   "Google clicks", "Search impressions", "Traffic sources", "Avg search position",
+  "min-height:44px", "Use \" + target + \" color theme",
+  "if (matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
