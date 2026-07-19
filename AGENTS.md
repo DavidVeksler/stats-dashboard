@@ -16,6 +16,7 @@ bundling. Plain ES modules under `src/`.
 ./deploy.sh --refresh           # deploy, then trigger a live pull (/run) and print JSON result
 ./deploy.sh --gsc-key key.json  # also (re)set the GSC_SA_KEY secret
 ./deploy.sh --schema            # also (re)apply schema.sql (best-effort; see D1 gotcha below)
+npm run refresh                 # trigger /run without deploying; reads .deploy/refresh_key.txt
 npm run tail                    # live Worker logs (npx wrangler tail)
 ```
 

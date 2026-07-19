@@ -74,6 +74,21 @@ ensures secrets, deploys, and smoke-tests:
 ./deploy.sh --schema            # also (re)apply schema.sql — needs a D1:Edit-scoped token
 ```
 
+Refresh the stored stats without deploying. The command reads the gitignored
+`.deploy/refresh_key.txt`, sends a browser user-agent to avoid WAF rule 1010, prints the
+JSON result, and exits nonzero when the request or GSC portion fails:
+
+```sh
+npm run refresh
+./scripts/refresh-stats.sh
+```
+
+```powershell
+.\scripts\refresh-stats.ps1
+```
+
+Use `npm run refresh -- --help` for endpoint, key-file, timeout, and environment overrides.
+
 From Windows PowerShell, use the Git Bash wrapper. It avoids accidentally selecting WSL's
 older Node runtime and forwards the same options:
 
