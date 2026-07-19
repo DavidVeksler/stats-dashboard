@@ -2,6 +2,18 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## Doc routing — read the smallest path
+
+| Task | Read |
+| --- | --- |
+| What this is / architecture / data flow | this file |
+| Commands | this file (`## Commands`) |
+| Secrets / env | this file (`## Secrets`) |
+| Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
+| Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `runs`), not docs |
+| Everything else | this file |
+
 ## What this is
 
 A single Cloudflare Worker that powers **https://stats.davidveksler.com** — a daily
