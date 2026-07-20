@@ -10,6 +10,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Commands | this file (`## Commands`) |
 | Secrets / env | this file (`## Secrets`) |
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
+| Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
 | Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `runs`), not docs |
 | Everything else | this file |
@@ -20,6 +21,12 @@ A single Cloudflare Worker that powers **https://stats.davidveksler.com** — a 
 per-domain dashboard of traffic + referrers (Cloudflare Web Analytics) and search
 keywords (Google Search Console). No framework, no build step beyond wrangler's esbuild
 bundling. Plain ES modules under `src/`.
+
+`public/` holds static "Add to Home Screen" assets (favicons, apple-touch-icons, manifest
+icons, Apple splash screens) served directly by Workers Static Assets (`wrangler.jsonc`
+`assets.directory`) — these never touch `src/index.js`. Every file in `public/` is generated
+by `scripts/generate-icons.mjs`; re-run `npm run icons` after changing the brand mark or
+colors, never hand-edit files under `public/` or `src/appleSplashLinks.js`.
 
 ## Commands
 

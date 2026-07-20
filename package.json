@@ -9,6 +9,7 @@
     "preview": "node scripts/render-check.mjs --write",
     "rotate:refresh": "node scripts/rotate-refresh-key.mjs",
     "refresh": "node scripts/refresh-stats.mjs",
+    "icons": "node scripts/generate-icons.mjs",
     "dev": "wrangler dev",
     "release": "./deploy.sh",
     "deploy": "wrangler deploy",
@@ -16,6 +17,7 @@
     "schema": "wrangler d1 execute stats-dashboard --remote --file=./schema.sql"
   },
   "devDependencies": {
+    "sharp": "^0.34.5",
     "wrangler": "^4"
   }
 }
