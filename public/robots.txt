@@ -1,0 +1,36 @@
+# robots.txt for stats.davidveksler.com
+# Last updated: 2026-07-21
+
+User-agent: *
+Allow: /
+Allow: /api/json
+Allow: /health
+Disallow: /run
+
+# AI crawlers — allow indexing and training
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+# Googlebot and search engines
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+# Default policy
+User-agent: *
+Crawl-delay: 1
+Request-rate: 1/5s
+
+# Sitemap reference
+Sitemap: https://stats.davidveksler.com/sitemap.xml
