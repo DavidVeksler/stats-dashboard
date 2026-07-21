@@ -300,6 +300,15 @@ async function loadDashboard(env, options = {}) {
     allDomains: SITES.map((site) => site.host), anomalies, totals, sites };
 }
 
+// Internal, WAF-gated dashboard: tell compliant crawlers and AI agents to stay
+// out. The WAF already blocks bot user-agents; this is the explicit signal.
+const ROBOTS = `# stats.davidveksler.com - internal, WAF-gated analytics dashboard.
+# Not a public content surface: no indexing, no AI input, no model training.
+User-agent: *
+Content-Signal: search=no, ai-input=no, ai-train=no
+Disallow: /
+`;
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runDaily(env));
@@ -310,6 +319,12 @@ export default {
 
     if (url.pathname === "/health") {
       return new Response("ok", { headers: { "content-type": "text/plain" } });
+    }
+
+    if (url.pathname === "/robots.txt") {
+      return new Response(ROBOTS, {
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=86400" },
+      });
     }
 
     // Manual re-pull: /run?key=<REFRESH_KEY>  (requires the REFRESH_KEY secret)
@@ -329,6 +344,17 @@ export default {
 
     if (url.pathname === "/api/json") {
       return Response.json(await loadDashboard(env, dashboardOptions));
+    }
+
+    // The dashboard lives only at "/". Anything else is a real 404 — no
+    // soft-404 fallback that renders the dashboard for every path, which
+    // previously made /robots.txt, /llms.txt, and /.well-known/* falsely
+    // return 200 and misled agent-readiness scanners.
+    if (url.pathname !== "/") {
+      return new Response("Not found", {
+        status: 404,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
 
     const data = await loadDashboard(env, dashboardOptions);
