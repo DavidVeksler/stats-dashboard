@@ -9,6 +9,9 @@ export const SITES = [
   {
     host: "cheatsheets.davidveksler.com",
     gsc: "https://cheatsheets.davidveksler.com/",
+    // /history.php is hit almost entirely by bots crawling revision links, not
+    // real users; drop it from traffic so sessions/views reflect actual readers.
+    excludePaths: ["/history.php"],
   },
   {
     host: "coloradofirearmswatch.org",
@@ -27,6 +30,11 @@ export const SITES = [
 ];
 
 export const TARGET_HOSTS = new Set(SITES.map((s) => s.host));
+
+// Map<host, Set<path>> of request paths to drop from RUM traffic (bot noise).
+export const EXCLUDE_PATHS = new Map(
+  SITES.filter((s) => s.excludePaths?.length).map((s) => [s.host, new Set(s.excludePaths)]),
+);
 
 // Web Analytics RUM data is account-scoped; a host may live on any of these.
 // We query all and merge by requestHost.

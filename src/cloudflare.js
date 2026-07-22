@@ -1,4 +1,4 @@
-import { CF_ACCOUNTS, TARGET_HOSTS, classifyReferrer } from "./config.js";
+import { CF_ACCOUNTS, TARGET_HOSTS, EXCLUDE_PATHS, classifyReferrer } from "./config.js";
 
 const GQL = "https://api.cloudflare.com/client/v4/graphql";
 
@@ -12,7 +12,7 @@ const QUERY = `query Rum($account: String!, $start: String!, $end: String!) {
       ) {
         count
         sum { visits }
-        dimensions { refererHost requestHost }
+        dimensions { refererHost requestHost requestPath }
       }
     }
   }
@@ -41,6 +41,8 @@ export async function pullTraffic(env, startISO, endISO) {
     for (const g of rows) {
       const host = g.dimensions.requestHost;
       if (!TARGET_HOSTS.has(host)) continue;
+      // Drop bot-heavy paths (e.g. /history.php) so totals reflect real readers.
+      if (EXCLUDE_PATHS.get(host)?.has(g.dimensions.requestPath)) continue;
       const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map() };
       rec.views += g.count;
       rec.visits += g.sum.visits;
