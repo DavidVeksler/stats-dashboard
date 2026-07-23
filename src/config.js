@@ -24,6 +24,7 @@ export const SITES = [
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
   { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
+  { host: "wiki.freecapitalists.org", gsc: "https://wiki.freecapitalists.org/" },
   { host: "davidveksler.freecapitalists.org", gsc: "https://davidveksler.freecapitalists.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
 
