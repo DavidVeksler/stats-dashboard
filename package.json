@@ -17,7 +17,7 @@
     "schema": "wrangler d1 execute stats-dashboard --remote --file=./schema.sql"
   },
   "devDependencies": {
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "wrangler": "^4"
   }
 }
