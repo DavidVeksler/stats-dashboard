@@ -221,6 +221,27 @@ async function loadDashboard(env, options = {}) {
     result.other = Math.max(0, visits - attributed);
     return result;
   };
+  // Flag traffic that looks synthetic rather than human. The signature comes from
+  // the Aug 2026 forum.objectivismonline.com flood: a residential-proxy botnet ran
+  // headless Chrome against one path, so the RUM beacon fired and the numbers looked
+  // real — but every "session" was a single pageview with no referrer. Any one of
+  // these alone is normal (a viral link is direct and spiky); together they are not.
+  // Volume is measured against the median of the trailing history rather than
+  // against yesterday: a sustained flood makes the day-over-day delta flatten (or
+  // go negative as it recedes) while the traffic is still entirely fake, so a
+  // delta-based test goes quiet exactly when the problem is worst.
+  const detectAnomaly = (site) => {
+    if (site.visits < 500) return null; // too small to distinguish from noise
+    const directShare = site.visits ? site.sources.direct / site.visits : 0;
+    const flat = site.pagesPerSession > 0 && site.pagesPerSession <= 1.15;
+    if (!flat || directShare < 0.9) return null;
+    const prior = site.spark.slice(0, -1).map((p) => Number(p.visits || 0)).sort((a, b) => a - b);
+    if (prior.length < 5) return null; // not enough history to know what normal is
+    const baseline = prior[Math.floor(prior.length / 2)];
+    if (!baseline || site.visits < baseline * 3) return null;
+    return `${Math.round(directShare * 100)}% direct, ${site.pagesPerSession.toFixed(1)} pages/session, ` +
+      `${Math.round(site.visits / baseline)}x the ${prior.length}-day median`;
+  };
   let sites = selectedSites.map((s) => {
     const t = sumTraffic(byHost(tr, s.host));
     const previous = sumTraffic(byHost(previousTr, s.host));
@@ -252,6 +273,8 @@ async function loadDashboard(env, options = {}) {
       spark: byHost(hist, s.host).slice(-14).map((r) => ({ date: r.date, visits: r.visits })),
     };
   });
+
+  for (const site of sites) site.anomaly = detectAnomaly(site);
 
   if (sort === "name") sites.sort((a, b) => a.host.localeCompare(b.host));
   else if (sort === "change") sites.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
