@@ -1,5 +1,5 @@
 import { SITES } from "./config.js";
-import { pullTraffic, topReferrers } from "./cloudflare.js";
+import { pullTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
 import { renderDashboard } from "./render.js";
 
@@ -37,6 +37,15 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_cf_pages (
+      date TEXT NOT NULL,
+      host TEXT NOT NULL,
+      page TEXT NOT NULL,
+      visits INTEGER NOT NULL DEFAULT 0,
+      views INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, page)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host)`),
   ]);
 }
 
@@ -59,6 +68,7 @@ async function runDaily(env, now = new Date()) {
          ON CONFLICT(date,host) DO UPDATE SET visits=excluded.visits, views=excluded.views`
       ).bind(date, host, rec.visits, rec.views),
       env.DB.prepare(`DELETE FROM daily_referrers WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_cf_pages WHERE date=? AND host=?`).bind(date, host),
     );
     // Keep enough rows for accurate source-mix totals; the dashboard still
     // renders only the top eight referrers per domain.
@@ -67,6 +77,13 @@ async function runDaily(env, now = new Date()) {
         env.DB.prepare(
           `INSERT INTO daily_referrers (date,host,referrer,kind,visits) VALUES (?,?,?,?,?)`
         ).bind(date, host, r.referrer, r.kind, r.visits),
+      );
+    }
+    for (const p of topPages(rec.pages, 50)) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
+        ).bind(date, host, p.page, p.visits, p.views),
       );
     }
   }
@@ -178,7 +195,7 @@ async function loadDashboard(env, options = {}) {
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
         opportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
-        delta: null, referrers: [], keywords: [], pages: [], searchSummary: null,
+        delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
@@ -190,7 +207,11 @@ async function loadDashboard(env, options = {}) {
   const searchSummaryQuery = env.DB.prepare(
     `SELECT host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date=?`
   ).bind(date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, hist, run] = await Promise.all([
+  const cfPagesQuery = env.DB.prepare(
+    `SELECT host,page,SUM(visits) AS visits,SUM(views) AS views FROM daily_cf_pages
+     WHERE date BETWEEN ? AND ? GROUP BY host,page ORDER BY visits DESC`
+  ).bind(start, date).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, hist, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -200,6 +221,7 @@ async function loadDashboard(env, options = {}) {
     env.DB.prepare(`SELECT host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
     searchSummaryQuery,
+    cfPagesQuery,
     env.DB.prepare(`SELECT date,host,visits FROM daily_traffic WHERE date >= date(?, '-29 days') ORDER BY date ASC`).bind(date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
   ]);
@@ -247,6 +269,7 @@ async function loadDashboard(env, options = {}) {
     const previous = sumTraffic(byHost(previousTr, s.host));
     const kwRows = byHost(kws, s.host);
     const pageRows = byHost(pages, s.host);
+    const cfPageRows = byHost(cfPages, s.host);
     const refRows = byHost(refs, s.host);
     const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
     const currentRate = t.visits ? t.views / t.visits : 0;
@@ -265,6 +288,7 @@ async function loadDashboard(env, options = {}) {
         impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position })),
       pages: pageRows.slice(0, 8).map((p) => ({ page: p.page, clicks: p.clicks,
         impressions: p.impressions, ctr: p.ctr ?? (p.impressions ? p.clicks / p.impressions : 0), position: p.position })),
+      cfPages: cfPageRows.slice(0, 8).map((p) => ({ page: p.page, visits: Number(p.visits || 0), views: Number(p.views || 0) })),
       searchSummary: summaryRow ? { clicks: Number(summaryRow.clicks || 0), impressions: Number(summaryRow.impressions || 0),
         ctr: Number(summaryRow.ctr || 0), position: Number(summaryRow.position || 0) } : null,
       opportunityCount: kwRows.filter((k) => Number(k.impressions) >= 5 && Number(k.position) >= 4 &&

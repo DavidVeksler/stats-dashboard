@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS daily_pages (
   PRIMARY KEY (date, host, page)
 );
 
+-- Landing pages from Cloudflare Web Analytics (RUM), covering every referrer
+-- (search, social, direct, etc.), unlike daily_pages which is Search-Console-only.
+CREATE TABLE IF NOT EXISTS daily_cf_pages (
+  date   TEXT NOT NULL,              -- UTC date the 24h window ended (matches daily_traffic)
+  host   TEXT NOT NULL,
+  page   TEXT NOT NULL,              -- requestPath, e.g. "/foo"
+  visits INTEGER NOT NULL DEFAULT 0, -- sessions that entered on this path
+  views  INTEGER NOT NULL DEFAULT 0, -- pageviews of this path
+  PRIMARY KEY (date, host, page)
+);
+
 CREATE TABLE IF NOT EXISTS daily_search_summary (
   date        TEXT NOT NULL,         -- snapshot date (matches daily_traffic)
   host        TEXT NOT NULL,
@@ -63,4 +74,5 @@ CREATE INDEX IF NOT EXISTS idx_traffic_date ON daily_traffic(date);
 CREATE INDEX IF NOT EXISTS idx_ref_dh ON daily_referrers(date, host);
 CREATE INDEX IF NOT EXISTS idx_kw_dh  ON daily_keywords(date, host);
 CREATE INDEX IF NOT EXISTS idx_pages_dh ON daily_pages(date, host);
+CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host);

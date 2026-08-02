@@ -94,6 +94,17 @@ function pageList(pages) {
     </li>`).join("")}</ol>`;
 }
 
+function cfPageList(pages, host) {
+  if (!pages.length) return `<p class="none">No landing pages in this period.</p>`;
+  return `<ol class="metric-list pages-list">${pages.map((page) => {
+    const href = `https://${host}${page.page}`;
+    return `<li class="metric-row">
+      <div class="metric-name"><a class="truncate" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(page.page)}">${esc(page.page)}</a></div>
+      <div class="metric-values"><strong>${fmt(page.visits)} ent</strong><span>${fmt(page.views)} views</span></div>
+    </li>`;
+  }).join("")}</ol>`;
+}
+
 function searchSummary(summary) {
   if (!summary) return "";
   return `<div class="search-summary" aria-label="Google Search performance">
@@ -122,7 +133,7 @@ function sourceMix(mix, total) {
 function siteCard(site, index, periodDays) {
   const id = `site-${site.host.replace(/[^a-z0-9]/gi, "-")}`;
   const periodLabel = periodDays === 1 ? "24h" : `${periodDays}d`;
-  const hasDetails = site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length;
+  const hasDetails = site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length || site.cfPages.length;
   return `<section class="card ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
     <div class="chead">
       <div class="hostwrap">
@@ -140,7 +151,8 @@ function siteCard(site, index, periodDays) {
         <section class="panel"><h3><span class="dot traffic"></span>Top referrers</h3>${referrerList(site)}</section>
         <section class="panel"><h3><span class="dot search"></span>Search opportunities</h3>${keywordList(site.keywords)}</section>
       </div>
-      <section class="panel pages-panel"><h3><span class="dot good"></span>Top landing pages</h3>${pageList(site.pages)}</section>
+      <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top landing pages (all traffic)</h3>${cfPageList(site.cfPages, site.host)}</section>
+      <section class="panel pages-panel"><h3><span class="dot good"></span>Top landing pages (Google Search)</h3>${pageList(site.pages)}</section>
     </details>` : `<p class="none">No analytics data in this window.</p>`}
   </section>`;
 }
@@ -280,8 +292,8 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div class="grid">${data.sites.map((site, index) => siteCard(site, index, data.periodDays)).join("")}</div>
   </main>
   <footer>
-    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews and referrers use the selected traffic period. Direct traffic is shown separately so smaller external sources remain readable.</div>
-    <div><b>Search performance, queries, and landing pages</b> use the latest complete Google Search Console window. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
+    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable.</div>
+    <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>
 </div>

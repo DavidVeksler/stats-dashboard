@@ -19,7 +19,7 @@ const QUERY = `query Rum($account: String!, $start: String!, $end: String!) {
 }`;
 
 // Pull the last-24h RUM rows from every account and merge by requestHost.
-// Returns Map<host, { views, visits, referrers: Map<refHost, visits> }>.
+// Returns Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>.
 export async function pullTraffic(env, startISO, endISO) {
   const hosts = new Map();
 
@@ -43,7 +43,7 @@ export async function pullTraffic(env, startISO, endISO) {
       if (!TARGET_HOSTS.has(host)) continue;
       // Drop bot-heavy paths (e.g. /history.php) so totals reflect real readers.
       if (EXCLUDE_PATHS.get(host)?.has(g.dimensions.requestPath)) continue;
-      const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map() };
+      const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
       rec.views += g.count;
       rec.visits += g.sum.visits;
       // A session ("visit") is only counted on its first pageview, so internal
@@ -52,6 +52,14 @@ export async function pullTraffic(env, startISO, endISO) {
       if (g.sum.visits > 0 && ref !== host) {
         rec.referrers.set(ref, (rec.referrers.get(ref) ?? 0) + g.sum.visits);
       }
+      // Landing pages: summing visits (session-starts) by requestPath tells us
+      // which page each session actually entered on, since visits only counts
+      // on a session's first pageview.
+      const path = g.dimensions.requestPath || "/";
+      const pageRec = rec.pages.get(path) ?? { views: 0, visits: 0 };
+      pageRec.views += g.count;
+      pageRec.visits += g.sum.visits;
+      rec.pages.set(path, pageRec);
       hosts.set(host, rec);
     }
   }
@@ -65,4 +73,12 @@ export function topReferrers(referrers, n = 8) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, n)
     .map(([referrer, visits]) => ({ referrer, visits, kind: classifyReferrer(referrer === "(direct)" ? "" : referrer) }));
+}
+
+// Flatten a pages Map into a sorted, top-N array, ranked by landing sessions.
+export function topPages(pages, n = 8) {
+  return [...pages.entries()]
+    .sort((a, b) => b[1].visits - a[1].visits)
+    .slice(0, n)
+    .map(([page, rec]) => ({ page, visits: rec.visits, views: rec.views }));
 }

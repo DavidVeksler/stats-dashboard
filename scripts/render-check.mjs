@@ -37,13 +37,17 @@ const fixture = {
       pages: [
         { page: "https://example.com/guides/analytics", clicks: 14, impressions: 180, ctr: .078, position: 5.4 },
       ],
+      cfPages: [
+        { page: "/guides/analytics", visits: 260, views: 340 },
+        { page: "/", visits: 190, views: 210 },
+      ],
       spark: Array.from({ length: 14 }, (_, index) => ({ date: `2026-07-${String(index + 3).padStart(2, "0")}`, visits: 90 + index * 4 })),
     },
     {
       host: "davidveksler.freecapitalists.org", visits: 200, views: 270, previousVisits: 200, delta: 0,
       pagesPerSession: 1.35, previousPagesPerSession: 1.3, pagesPerSessionDelta: .05,
       searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
-      gscWindow: null, referrers: [], keywords: [], pages: [],
+      gscWindow: null, referrers: [], keywords: [], pages: [], cfPages: [],
       spark: [{ date: "2026-07-15", visits: 25 }, { date: "2026-07-16", visits: 30 }],
     },
   ],
@@ -51,7 +55,7 @@ const fixture = {
 
 const html = renderDashboard(fixture);
 const required = [
-  "Total sessions", "Search opportunities", "Top landing pages", "data-query=\"domain\"",
+  "Total sessions", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
   "aria-label=\"Notable changes\"", "high impression opportunity", "Last successful pull",
   "Google clicks", "Search impressions", "Traffic sources", "Avg search position",
   "min-height:44px", "Use \" + target + \" color theme",
