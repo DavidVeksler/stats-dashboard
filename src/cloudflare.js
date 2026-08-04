@@ -1,4 +1,4 @@
-import { CF_ACCOUNTS, TARGET_HOSTS, EXCLUDE_PATHS, classifyReferrer } from "./config.js";
+import { CF_ACCOUNTS, HOST_ALIASES, EXCLUDE_PATHS, classifyReferrer } from "./config.js";
 
 const GQL = "https://api.cloudflare.com/client/v4/graphql";
 
@@ -39,8 +39,9 @@ export async function pullTraffic(env, startISO, endISO) {
     const accts = body.data?.viewer?.accounts ?? [];
     const rows = accts[0]?.rumPageloadEventsAdaptiveGroups ?? [];
     for (const g of rows) {
-      const host = g.dimensions.requestHost;
-      if (!TARGET_HOSTS.has(host)) continue;
+      // Aliases (e.g. an apex landing page) roll up into the site's primary host.
+      const host = HOST_ALIASES.get(g.dimensions.requestHost);
+      if (!host) continue;
       // Drop bot-heavy paths (e.g. /history.php) so totals reflect real readers.
       if (EXCLUDE_PATHS.get(host)?.has(g.dimensions.requestPath)) continue;
       const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
@@ -49,7 +50,9 @@ export async function pullTraffic(env, startISO, endISO) {
       // A session ("visit") is only counted on its first pageview, so internal
       // navigation (refererHost === host) carries visits: 0 and drops out here.
       const ref = g.dimensions.refererHost || "(direct)";
-      if (g.sum.visits > 0 && ref !== host) {
+      // Compare through the alias map so a hop between a site's own hostnames
+      // (landing page -> forum) counts as internal, not as a referral to itself.
+      if (g.sum.visits > 0 && HOST_ALIASES.get(ref) !== host) {
         rec.referrers.set(ref, (rec.referrers.get(ref) ?? 0) + g.sum.visits);
       }
       // Landing pages: summing visits (session-starts) by requestPath tells us

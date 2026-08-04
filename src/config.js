@@ -3,8 +3,15 @@
 // `gscPageFilter`, when present, limits a broader property to matching page URLs.
 export const SITES = [
   {
+    // objectivismonline.com (and its www alias) is just a landing page in front
+    // of the forum, so both roll up into this one row. The GSC property is the
+    // domain-level one because it already covers the apex *and* the forum —
+    // adding the forum's URL-prefix property on top would double-count it. The
+    // page filter keeps wiki.objectivismonline.com, a separate site, out.
     host: "forum.objectivismonline.com",
-    gsc: "https://forum.objectivismonline.com/",
+    alsoHosts: ["objectivismonline.com", "www.objectivismonline.com"],
+    gsc: "sc-domain:objectivismonline.com",
+    gscPageFilter: "^https?://(?:www\\.|forum\\.)?objectivismonline\\.com/",
   },
   {
     host: "cheatsheets.davidveksler.com",
@@ -27,10 +34,19 @@ export const SITES = [
   { host: "wiki.freecapitalists.org", gsc: "https://wiki.freecapitalists.org/" },
   { host: "davidveksler.freecapitalists.org", gsc: "https://davidveksler.freecapitalists.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
-
+  { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
+  { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
 ];
 
-export const TARGET_HOSTS = new Set(SITES.map((s) => s.host));
+// Map<anyHost, primaryHost>. A site can span several hostnames (an apex landing
+// page in front of a forum, a www alias); every alias rolls up into the site's
+// primary `host` so the dashboard shows one row per site and D1 stays keyed on
+// that one host.
+export const HOST_ALIASES = new Map(
+  SITES.flatMap((s) => [s.host, ...(s.alsoHosts ?? [])].map((h) => [h, s.host])),
+);
+
+export const TARGET_HOSTS = new Set(HOST_ALIASES.keys());
 
 // Map<host, Set<path>> of request paths to drop from RUM traffic (bot noise).
 export const EXCLUDE_PATHS = new Map(
