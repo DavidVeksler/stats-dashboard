@@ -32,7 +32,10 @@ export const SITES = [
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
   { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
   { host: "wiki.freecapitalists.org", gsc: "https://wiki.freecapitalists.org/" },
-  { host: "davidveksler.freecapitalists.org", gsc: "https://davidveksler.freecapitalists.org/" },
+  // http://, not https:// — the Search Console property was registered on the
+  // http prefix, and URL-prefix properties are protocol-exact. Querying the
+  // https form 403s, which silently zeroed this site's search data every run.
+  { host: "davidveksler.freecapitalists.org", gsc: "http://davidveksler.freecapitalists.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
   { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
   { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
