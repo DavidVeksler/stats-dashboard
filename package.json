@@ -5,7 +5,7 @@
   "description": "Daily traffic (Cloudflare Web Analytics) + search (Google Search Console) dashboard for David's domains",
   "type": "module",
   "scripts": {
-    "check": "node --check src/index.js && node --check src/render.js && node --check src/gsc.js && node --check src/config.js && node --check src/cloudflare.js && node --check scripts/refresh-stats.mjs && node --check scripts/rotate-refresh-key.mjs && node scripts/render-check.mjs",
+    "check": "node --check src/index.js && node --check src/render.js && node --check src/gsc.js && node --check src/config.js && node --check src/cloudflare.js && node --check src/bots.js && node --check scripts/refresh-stats.mjs && node --check scripts/rotate-refresh-key.mjs && node scripts/bots-check.mjs && node scripts/render-check.mjs",
     "preview": "node scripts/render-check.mjs --write",
     "check:gsc": "node scripts/check-gsc-access.mjs",
     "rotate:refresh": "node scripts/rotate-refresh-key.mjs",

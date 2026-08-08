@@ -31,17 +31,25 @@ function sparkline(points, host) {
   const line = coords.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   const area = `${pad},${h - pad} ${line} ${w - pad},${h - pad}`;
   const id = `spark-${host.replace(/[^a-z0-9]/gi, "-")}`;
-  const label = `${points.length}-day sessions for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}`;
+  const floodCount = points.filter((point) => point.flood).length;
+  // The line plots every measured day, crawler floods included — a flood is a
+  // real event worth seeing — but the flooded points are marked so the spike
+  // never reads as an audience the site does not have.
+  const label = `${points.length}-day sessions for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}` +
+    (floodCount ? `; ${floodCount} day${floodCount === 1 ? "" : "s"} crawler-flooded` : "");
   const pointsWithTitles = coords.map(({ x, y }, index) =>
     `<circle class="spark-hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4">
-      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions</title>
+      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions${points[index].flood ? " — crawler flood, excluded from totals" : ""}</title>
     </circle>`).join("");
+  const floodMarks = coords.map(({ x, y }, index) => points[index].flood
+    ? `<circle class="spark-flood" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4"/>` : "").join("");
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(label)}">
     <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--traffic)" stop-opacity=".22"/><stop offset="1" stop-color="var(--traffic)" stop-opacity="0"/></linearGradient></defs>
     <polygon points="${area}" fill="url(#${id})"/>
     <polyline points="${line}" fill="none" stroke="var(--traffic)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
     ${pointsWithTitles}
     <circle cx="${coords.at(-1).x.toFixed(1)}" cy="${coords.at(-1).y.toFixed(1)}" r="2.7" fill="var(--traffic)"/>
+    ${floodMarks}
   </svg>`;
 }
 
@@ -130,6 +138,24 @@ function sourceMix(mix, total) {
   </section>`;
 }
 
+// Crawlers are welcome here (the sites opt into AI training) — they just are not
+// an audience. This banner keeps the excluded volume visible and named, so the
+// headline drop from "13,870 sessions" to a few hundred is explained, not silent.
+function crawlerNote(totals, sites) {
+  if (!totals.botVisits) return "";
+  const named = sites.filter((site) => site.botVisits > 0)
+    .sort((a, b) => b.botVisits - a.botVisits)
+    .map((site) => `${esc(site.host)} (${fmt(site.botVisits)})`)
+    .join(", ");
+  const days = totals.floodedSiteDays;
+  return `<aside class="crawler" role="note">
+    <strong>${fmt(totals.botVisits)} crawler sessions excluded</strong> — ${pct(totals.botShare, 0)} of everything measured
+    in this period, across ${days} flooded site-day${days === 1 ? "" : "s"}: ${named}.
+    Nothing is blocked; these days are set aside because a crawler's sessions are indistinguishable
+    from a person's within the same day, so the human count for those days reads as zero rather than a guess.
+  </aside>`;
+}
+
 function siteCard(site, index, periodDays) {
   const id = `site-${site.host.replace(/[^a-z0-9]/gi, "-")}`;
   const periodLabel = periodDays === 1 ? "24h" : `${periodDays}d`;
@@ -140,10 +166,10 @@ function siteCard(site, index, periodDays) {
         <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
         ${sparkline(site.spark, site.host)}
       </div>
-      <div class="nums"><div class="big">${site.visits ? fmt(site.visits) : "—"}</div><div class="lbl">sessions ${periodLabel}</div>
+      <div class="nums"><div class="big">${site.visits ? fmt(site.visits) : "—"}</div><div class="lbl">human sessions ${periodLabel}</div>
         ${deltaBadge(site.delta, true)}<div class="pv">${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session</div></div>
     </div>
-    ${site.anomaly ? `<p class="anomaly" role="status"><strong>Likely bot traffic.</strong> ${esc(site.anomaly)} — treat this spike as unreal until confirmed.</p>` : ""}
+    ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${site.cleanDays ? `Human figures above cover the ${site.cleanDays} clean day${site.cleanDays === 1 ? "" : "s"}.` : `No clean day in this period, so there is no human figure to report.`}</p>` : ""}
     ${searchSummary(site.searchSummary)}
     ${hasDetails ? `<details class="detail" open data-card-index="${index}">
       <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>
@@ -201,7 +227,7 @@ export function renderDashboard(data) {
   const updatedAt = data.dataUpdatedAt || data.run?.run_at;
   const stale = updatedAt ? Date.now() - Date.parse(updatedAt) > 30 * 3600 * 1000 : true;
   const stats = [
-    ["Total sessions", fmt(totals.visits), `${deltaBadge(totals.delta)}<span>${coverageNote || periodLabel.toLowerCase()}</span>`],
+    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta)}<span>${coverageNote || periodLabel.toLowerCase()}</span>`],
     ["Total pageviews", fmt(totals.views), `<span>${totals.visits ? (totals.views / totals.visits).toFixed(1) : "0.0"} pages / session</span>`],
     ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>`],
     [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${totals.active} with traffic</span>`],
@@ -251,6 +277,9 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .toolbar{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:18px 0}.periods{display:flex;gap:4px;background:color-mix(in srgb,var(--line) 62%,transparent);padding:4px;border-radius:10px}.periods a{text-decoration:none;font-size:12px;font-weight:650;color:var(--muted);padding:6px 10px;border-radius:7px}.periods a[aria-current=page]{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}.filters{display:flex;align-items:end;gap:8px}.field{display:flex;flex-direction:column;gap:3px}.field label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:700}.field select,.theme{height:34px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font:inherit;font-size:12px;padding:0 28px 0 9px}.theme{padding:0 10px;cursor:pointer}
 .totals{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:0 0 18px}.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px;box-shadow:var(--shadow)}.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.stat .v{font-size:30px;font-weight:700;letter-spacing:-.035em;margin:3px 0}.stat .s{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:7px;flex-wrap:wrap}.delta{display:inline-flex;align-items:center;font-size:10px;font-weight:700;border-radius:999px;padding:2px 6px;background:var(--line);color:var(--muted);white-space:nowrap}.delta.up{background:var(--good-soft);color:var(--good)}.delta.down{background:var(--danger-soft);color:var(--danger)}
 .anomaly{margin:0 0 14px;padding:9px 12px;border-radius:9px;background:var(--danger-soft);color:var(--danger);font-size:12px;line-height:1.45;border:1px solid color-mix(in srgb,var(--danger) 28%,transparent)}.anomaly strong{font-weight:700}
+.crawler{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--social);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.crawler strong{color:var(--ink);font-weight:700}
+.crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
+.spark-flood{fill:var(--paper);stroke:var(--social);stroke-width:1.6}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.other,.source-legend i.other{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.signals{display:flex;gap:7px;flex-wrap:wrap;margin:0 0 20px}.signal-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;color:var(--faint);align-self:center;margin-right:2px}.signal{font-size:11.5px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 9px}.signal.up::before{content:"↑";color:var(--good);font-weight:800;margin-right:5px}.signal.down::before{content:"↓";color:var(--danger);font-weight:800;margin-right:5px}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}
 .ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
@@ -287,12 +316,14 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <section class="totals" aria-labelledby="overview-heading"><h2 class="sr-only" id="overview-heading">Traffic overview</h2>
       ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
     </section>
+    ${crawlerNote(totals, data.sites)}
     ${sourceMix(totals.sourceMix, totals.visits)}
     ${data.anomalies.length ? `<aside class="signals" aria-label="Notable changes"><span class="signal-label">Notable</span>${data.anomalies.map((item) => `<span class="signal ${item.type}">${esc(anomalyText(item))} vs ${esc(previousLabel)}</span>`).join("")}</aside>` : ""}
     <div class="grid">${data.sites.map((site, index) => siteCard(site, index, data.periodDays)).join("")}</div>
   </main>
   <footer>
     <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable.</div>
+    <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥90% direct, ≤1.15 pages/session, at least 500 sessions, and at least 3× a normal day for that site. Flooded days are excluded whole — from sessions, referrers, and landing pages alike — and counted separately; they are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
     <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>

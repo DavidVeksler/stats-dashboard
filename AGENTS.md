@@ -39,8 +39,11 @@ npm run refresh                 # trigger /run without deploying; reads .deploy/
 npm run tail                    # live Worker logs (npx wrangler tail)
 ```
 
-There are no unit tests. Verification is end-to-end: hit `/run` and read the returned
-`{gscOk, totalVisits, notes}`, or inspect the `runs` table in D1. `npm run dev` runs
+`npm run check` covers syntax, the crawler classifier (`scripts/bots-check.mjs`, real Aug 2026
+traffic shapes — the one piece of pure logic worth unit-testing, since a false positive deletes
+real traffic from the dashboard), and a render smoke test. Beyond that, verification is
+end-to-end: hit `/run` and read the returned `{gscOk, totalVisits, humanVisits, botVisits, notes}`,
+or inspect the `runs` table in D1. `npm run dev` runs
 `wrangler dev` locally, but the data pulls need the real secrets and network.
 
 ## Data flow (the big picture)
@@ -77,6 +80,19 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so internal navigation (`refererHost === requestHost`) carries `visits: 0` and is
   intentionally dropped from referrers. Cloudflare's free tier doesn't expose unique visitors.
+- **Crawlers are counted as humans by RUM, and we do NOT block them.** These sites opt into AI
+  training (`Content-Signal: ai-train=yes`); the fix is measurement, not blocking. `src/bots.js`
+  classifies each *site-day* and sets aside "floods" (≥90% direct, ≤1.15 pages/session, ≥500
+  sessions, ≥3× a normal day). Flooded days are excluded whole from sessions, referrers, and
+  landing pages, and reported separately — never silently dropped. Two things to preserve:
+  (1) the flood test is deliberately **volume-free** (`day.signature`) so the baseline can be
+  built from the days that fail it without circular reasoning; (2) when too few clean days
+  remain, the baseline falls back to the **25th percentile**, not the median — a median inside a
+  sustained flood blesses the flood as normal, which is exactly how the Aug 2026
+  forum.objectivismonline.com flood went unflagged for eight days.
+- **A flooded day's human traffic is not recoverable.** Within a flooded day real visitors can't
+  be separated from the crawler, so those days read as zero humans rather than an estimate. The
+  UI states the excluded volume and day count; don't "improve" this by interpolating.
 - **GSC lags ~2 days.** `runDaily` requests the window `date-4 … date-2`, so keyword data is
   never truly "last 24h". The dashboard labels this.
 - **`runDaily` only deletes keyword rows inside the `if (env.GSC_SA_KEY)` block** — so a run with

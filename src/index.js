@@ -1,6 +1,7 @@
 import { SITES } from "./config.js";
 import { pullTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
+import { classifyTraffic, floodReason, floodDates } from "./bots.js";
 import { renderDashboard } from "./render.js";
 
 const utcDate = (d) => d.toISOString().slice(0, 10);
@@ -155,19 +156,47 @@ async function runDaily(env, now = new Date()) {
   await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
     .bind(now.toISOString(), date, ok ? 1 : 0, notes.join(" | ") || "ok").run();
 
-  // 4. ntfy push
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes);
-  return { date, totalVisits, gscOk, notes };
+  // 4. ntfy push — classified against the trailing history that was just written,
+  //    so the daily phone alert reports the human audience rather than whatever a
+  //    crawler happened to do that night.
+  const summary = await summarizeToday(env, date).catch(() => null);
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary);
+  return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
+    botVisits: summary?.botVisits ?? null, gscOk, notes };
 }
 
-async function sendNtfy(env, traffic, totalVisits, gscOk, notes) {
+// Re-read the last 30 days and split today into human vs crawler traffic.
+async function summarizeToday(env, date) {
+  const [hist, histRefs] = await Promise.all([
+    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date >= date(?, '-29 days')`).bind(date).all(),
+    env.DB.prepare(
+      `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
+       WHERE date >= date(?, '-29 days') GROUP BY date,host,kind`
+    ).bind(date).all(),
+  ]);
+  const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
+  let humanVisits = 0, botVisits = 0;
+  const perHost = new Map();
+  for (const { host } of SITES) {
+    const day = classified.get(host)?.get(date);
+    if (!day) continue;
+    if (day.flood) botVisits += day.visits;
+    else { humanVisits += day.visits; perHost.set(host, day.visits); }
+  }
+  const flooded = [...SITES].filter(({ host }) => classified.get(host)?.get(date)?.flood).map(({ host }) => host);
+  return { humanVisits, botVisits, perHost, flooded };
+}
+
+async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary) {
   if (!env.NTFY_TOPIC) return;
-  const top = [...traffic.entries()]
-    .sort((a, b) => b[1].visits - a[1].visits)
-    .slice(0, 4)
-    .map(([h, r]) => `${h.replace(/^www\./, "")}: ${r.visits}`)
-    .join("\n");
-  const body = `${totalVisits} visitors (24h)\n${top}${gscOk ? "" : "\n⚠ keywords: " + (notes[0] || "skipped")}`;
+  const ranked = summary
+    ? [...summary.perHost.entries()].sort((a, b) => b[1] - a[1])
+    : [...traffic.entries()].sort((a, b) => b[1].visits - a[1].visits).map(([h, r]) => [h, r.visits]);
+  const top = ranked.slice(0, 4).map(([h, v]) => `${h.replace(/^www\./, "")}: ${v}`).join("\n");
+  const headline = summary ? `${summary.humanVisits} visitors (24h)` : `${totalVisits} visitors (24h)`;
+  const crawlers = summary?.botVisits
+    ? `\n🤖 ${summary.botVisits} crawler sessions excluded (${summary.flooded.join(", ")})` : "";
+  const body = `${headline}\n${top}${crawlers}${gscOk ? "" : "\n⚠ keywords: " + (notes[0] || "skipped")}`;
   try {
     await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
       method: "POST",
@@ -191,48 +220,67 @@ async function loadDashboard(env, options = {}) {
       periodDays, domain, sort, allDomains: SITES.map((site) => site.host), anomalies: [],
       totals: { visits: 0, views: 0, search: 0, domains: selectedSites.length, active: 0,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
+        botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
         sourceMix: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
         opportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
+        botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
   const previousEnd = addDays(start, -1);
   const previousStart = addDays(previousEnd, -(periodDays - 1));
+  // Crawler detection needs enough trailing history to know what a normal day
+  // looks like, and it has to reach back over the comparison period too — a
+  // flooded "previous period" would otherwise poison every delta on the page.
+  const historyStart = [previousStart, addDays(date, -29)].sort()[0];
   const pagesQuery = env.DB.prepare(
     `SELECT host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date=? ORDER BY clicks DESC, impressions DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
   const searchSummaryQuery = env.DB.prepare(
     `SELECT host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date=?`
   ).bind(date).all().catch(() => ({ results: [] }));
+  // Referrers and landing pages keep their date so flooded days can be dropped;
+  // otherwise the detail panels would still show the crawler's millions of
+  // direct hits under a headline that had already excluded them.
   const cfPagesQuery = env.DB.prepare(
-    `SELECT host,page,SUM(visits) AS visits,SUM(views) AS views FROM daily_cf_pages
-     WHERE date BETWEEN ? AND ? GROUP BY host,page ORDER BY visits DESC`
+    `SELECT date,host,page,visits,views FROM daily_cf_pages WHERE date BETWEEN ? AND ?`
   ).bind(start, date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, hist, run] = await Promise.all([
+  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
-      `SELECT host,referrer,kind,SUM(visits) AS visits FROM daily_referrers
-       WHERE date BETWEEN ? AND ? GROUP BY host,referrer,kind ORDER BY visits DESC`
+      `SELECT date,host,referrer,kind,SUM(visits) AS visits FROM daily_referrers
+       WHERE date BETWEEN ? AND ? GROUP BY date,host,referrer,kind`
     ).bind(start, date).all(),
     env.DB.prepare(`SELECT host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
     searchSummaryQuery,
     cfPagesQuery,
-    env.DB.prepare(`SELECT date,host,visits FROM daily_traffic WHERE date >= date(?, '-29 days') ORDER BY date ASC`).bind(date).all(),
+    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
+    env.DB.prepare(
+      `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
+       WHERE date BETWEEN ? AND ? GROUP BY date,host,kind`
+    ).bind(historyStart, date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
   ]);
+  const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
 
   const byHost = (rows, h) => (rows.results ?? []).filter((r) => r.host === h);
   const availableDates = [...new Set((tr.results ?? []).map((row) => row.date))].sort();
   const previousAvailableDates = [...new Set((previousTr.results ?? []).map((row) => row.date))].sort();
-  const sumTraffic = (rows) => rows.reduce((acc, row) => ({
-    visits: acc.visits + Number(row.visits || 0),
-    views: acc.views + Number(row.views || 0),
-  }), { visits: 0, views: 0 });
+  // Split every measured day into human vs crawler. A flooded day is excluded
+  // whole rather than estimated: within such a day the real visitors are not
+  // separable from the crawler, so the honest move is to report the clean days
+  // and say plainly how many days were dropped.
+  const sumTraffic = (rows, floods) => rows.reduce((acc, row) => {
+    const visits = Number(row.visits || 0), views = Number(row.views || 0);
+    if (floods.has(row.date)) { acc.botVisits += visits; acc.botViews += views; acc.botDays += 1; }
+    else { acc.visits += visits; acc.views += views; }
+    return acc;
+  }, { visits: 0, views: 0, botVisits: 0, botViews: 0, botDays: 0 });
   const summarizeSources = (rows, visits) => {
     const result = { direct: 0, search: 0, social: 0, referral: 0, other: 0 };
     for (const row of rows) {
@@ -243,45 +291,47 @@ async function loadDashboard(env, options = {}) {
     result.other = Math.max(0, visits - attributed);
     return result;
   };
-  // Flag traffic that looks synthetic rather than human. The signature comes from
-  // the Aug 2026 forum.objectivismonline.com flood: a residential-proxy botnet ran
-  // headless Chrome against one path, so the RUM beacon fired and the numbers looked
-  // real — but every "session" was a single pageview with no referrer. Any one of
-  // these alone is normal (a viral link is direct and spiky); together they are not.
-  // Volume is measured against the median of the trailing history rather than
-  // against yesterday: a sustained flood makes the day-over-day delta flatten (or
-  // go negative as it recedes) while the traffic is still entirely fake, so a
-  // delta-based test goes quiet exactly when the problem is worst.
-  const detectAnomaly = (site) => {
-    if (site.visits < 500) return null; // too small to distinguish from noise
-    const directShare = site.visits ? site.sources.direct / site.visits : 0;
-    const flat = site.pagesPerSession > 0 && site.pagesPerSession <= 1.15;
-    if (!flat || directShare < 0.9) return null;
-    const prior = site.spark.slice(0, -1).map((p) => Number(p.visits || 0)).sort((a, b) => a - b);
-    if (prior.length < 5) return null; // not enough history to know what normal is
-    const baseline = prior[Math.floor(prior.length / 2)];
-    if (!baseline || site.visits < baseline * 3) return null;
-    return `${Math.round(directShare * 100)}% direct, ${site.pagesPerSession.toFixed(1)} pages/session, ` +
-      `${Math.round(site.visits / baseline)}x the ${prior.length}-day median`;
+  // Re-aggregate date-keyed rows once the flooded days are dropped.
+  const mergeBy = (rows, keyOf, build) => {
+    const merged = new Map();
+    for (const row of rows) {
+      const key = keyOf(row);
+      const rec = merged.get(key) ?? build(row);
+      rec.visits += Number(row.visits || 0);
+      if ("views" in rec) rec.views += Number(row.views || 0);
+      merged.set(key, rec);
+    }
+    return [...merged.values()].sort((a, b) => b.visits - a.visits);
   };
   let sites = selectedSites.map((s) => {
-    const t = sumTraffic(byHost(tr, s.host));
-    const previous = sumTraffic(byHost(previousTr, s.host));
+    const floods = floodDates(classified, s.host);
+    const days = classified.get(s.host);
+    const t = sumTraffic(byHost(tr, s.host), floods);
+    const previous = sumTraffic(byHost(previousTr, s.host), floods);
     const kwRows = byHost(kws, s.host);
     const pageRows = byHost(pages, s.host);
-    const cfPageRows = byHost(cfPages, s.host);
-    const refRows = byHost(refs, s.host);
+    const cfPageRows = mergeBy(byHost(cfPages, s.host).filter((r) => !floods.has(r.date)),
+      (r) => r.page, (r) => ({ page: r.page, visits: 0, views: 0 }));
+    const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date)),
+      (r) => `${r.referrer} ${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
     const currentRate = t.visits ? t.views / t.visits : 0;
     const previousRate = previous.visits ? previous.views / previous.visits : 0;
+    // The callout describes the most recent flooded day, which is the one the
+    // reader is looking at; older flooded days show up as gaps in the sparkline.
+    const latestFlood = [...floods].sort().at(-1);
     return {
       host: s.host,
       visits: t.visits, views: t.views,
+      botVisits: t.botVisits, botViews: t.botViews, botDays: t.botDays,
       previousVisits: previous.visits,
+      previousBotVisits: previous.botVisits,
+      cleanDays: byHost(tr, s.host).length - t.botDays,
       delta: previous.visits ? (t.visits - previous.visits) / previous.visits : null,
       pagesPerSession: currentRate,
       previousPagesPerSession: previousRate,
       pagesPerSessionDelta: previous.visits ? currentRate - previousRate : null,
+      anomaly: latestFlood ? floodReason(days?.get(latestFlood)) : null,
       referrers: refRows.slice(0, 8).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
       sources: summarizeSources(refRows, t.visits),
       keywords: kwRows.slice(0, 12).map((k) => ({ query: k.query, clicks: k.clicks,
@@ -294,11 +344,13 @@ async function loadDashboard(env, options = {}) {
       opportunityCount: kwRows.filter((k) => Number(k.impressions) >= 5 && Number(k.position) >= 4 &&
         Number(k.position) <= 20 && Number(k.clicks) / Number(k.impressions) < .04).length,
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
-      spark: byHost(hist, s.host).slice(-14).map((r) => ({ date: r.date, visits: r.visits })),
+      // The sparkline plots what was measured, flooded days included, but marks
+      // them — hiding them would turn a crawler event into a mysterious gap.
+      spark: byHost(hist, s.host).slice(-14).map((r) => ({
+        date: r.date, visits: Number(r.visits || 0), flood: floods.has(r.date),
+      })),
     };
   });
-
-  for (const site of sites) site.anomaly = detectAnomaly(site);
 
   if (sort === "name") sites.sort((a, b) => a.host.localeCompare(b.host));
   else if (sort === "change") sites.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
@@ -317,6 +369,13 @@ async function loadDashboard(env, options = {}) {
     domains: sites.length,
     active: sites.filter((s) => s.visits > 0).length,
     previousVisits: sites.reduce((a, s) => a + s.previousVisits, 0),
+    // Crawler traffic is reported, never hidden — it just does not get to sit in
+    // the same number as the human audience.
+    botVisits: sites.reduce((a, s) => a + s.botVisits, 0),
+    botViews: sites.reduce((a, s) => a + s.botViews, 0),
+    previousBotVisits: sites.reduce((a, s) => a + s.previousBotVisits, 0),
+    floodedSiteDays: sites.reduce((a, s) => a + s.botDays, 0),
+    floodedSites: sites.filter((s) => s.botDays > 0).length,
     daysAvailable: availableDates.length,
     previousDaysAvailable: previousAvailableDates.length,
     gscClicks: searchSites.reduce((sum, site) => sum + site.searchSummary.clicks, 0),
@@ -326,6 +385,8 @@ async function loadDashboard(env, options = {}) {
   };
   totals.delta = totals.previousVisits ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
   totals.searchShare = totals.visits ? totals.search / totals.visits : 0;
+  totals.botShare = totals.visits + totals.botVisits
+    ? totals.botVisits / (totals.visits + totals.botVisits) : 0;
   totals.gscCtr = totals.gscImpressions ? totals.gscClicks / totals.gscImpressions : 0;
   totals.gscPosition = totals.gscImpressions ? searchSites.reduce((sum, site) =>
     sum + site.searchSummary.position * site.searchSummary.impressions, 0) / totals.gscImpressions : 0;
