@@ -91,8 +91,10 @@ const required = [
   "spark-flood", "crawler flood, direct traffic excluded", "Human vs crawler",
   // A fully flooded site keeps the sessions it could still measure, marked as a
   // floor, instead of rendering a blank card.
-  "&ge;&nbsp;17", "The figure above is the 17 referred sessions",
+  "&ge;&nbsp;17", "The figure above is the 17 referred sessions that survived the flooded day.",
   "pageviews not separable on flooded days",
+  // ...and the mixed case, where clean days and recovered days both contribute.
+  "Human figures above cover the 4 clean days, plus 120 referred sessions that survived the flooded days.",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);

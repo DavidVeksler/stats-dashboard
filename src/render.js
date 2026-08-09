@@ -171,10 +171,10 @@ function crawlerRowDetail(site) {
       : `No referred sessions were measured on those days, so there is no human figure to report.`;
   }
   const recovered = `${fmt(site.partialVisits)} referred session${site.partialVisits === 1 ? "" : "s"} ` +
-    `survive${site.partialVisits === 1 ? "s" : ""} the flooded day${site.botDays === 1 ? "" : "s"} ` +
-    `(a crawler arrives without a referer, so a referral is still a person); the direct traffic there is not separable, ` +
-    `which is why the total is a floor.`;
-  return clean ? `${clean}, plus ${recovered}` : `The figure above is the ${recovered}`;
+    `that survived the flooded day${site.botDays === 1 ? "" : "s"}`;
+  const why = `A crawler arrives without a referer, so a referral is still a person; the direct traffic ` +
+    `on those days is not separable, which is why the total is a floor.`;
+  return `${clean ? `${clean}, plus ${recovered}` : `The figure above is the ${recovered}`}. ${why}`;
 }
 
 function siteCard(site, index, periodDays) {
