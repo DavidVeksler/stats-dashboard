@@ -1,5 +1,5 @@
 import { SITES } from "./config.js";
-import { pullTraffic, topReferrers, topPages } from "./cloudflare.js";
+import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay } from "./bots.js";
 import { renderDashboard } from "./render.js";
@@ -47,7 +47,24 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, page)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_zone_countries (
+      date TEXT NOT NULL, host TEXT NOT NULL, country TEXT NOT NULL,
+      visits INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (date, host, country)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_zone_status (
+      date TEXT NOT NULL, host TEXT NOT NULL, status INTEGER NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (date, host, status)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host)`),
   ]);
+  // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
+  // EXISTS", so swallow the one error that means it's already there.
+  try {
+    await env.DB.prepare(`ALTER TABLE daily_traffic ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`).run();
+  } catch (e) {
+    if (!/duplicate column/i.test(e.message)) throw e;
+  }
 }
 
 // ---- Nightly pull: Cloudflare + GSC -> D1 -> ntfy -------------------------
@@ -60,16 +77,35 @@ async function runDaily(env, now = new Date()) {
 
   // 1. Traffic + referrers (Cloudflare Web Analytics)
   const traffic = await pullTraffic(env, since, until);
+
+  // 1b. Zone-log traffic for hosts with no RUM beacon (trafficSource: "zone").
+  // Merged into the same `traffic` map so the rest of this function doesn't
+  // need to know which source a host came from; bytes/countries/statuses,
+  // which the RUM path has no equivalent of, are kept alongside in zoneExtra.
+  const zoneExtra = new Map();
+  for (const site of SITES.filter((s) => s.trafficSource === "zone")) {
+    try {
+      const z = await pullZoneTraffic(env, site.zoneTag, site.host, since, until);
+      traffic.set(site.host, { views: z.requests, visits: z.visits, referrers: new Map(), pages: new Map() });
+      zoneExtra.set(site.host, { bytes: z.bytes, paths: z.paths, countries: z.countries, statuses: z.statuses });
+    } catch (e) {
+      notes.push(`zone traffic ${site.host}: ${e.message}`.slice(0, 140));
+    }
+  }
+
   const stmts = [];
   for (const { host } of SITES) {
-    const rec = traffic.get(host) ?? { views: 0, visits: 0, referrers: new Map() };
+    const rec = traffic.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
+    const zx = zoneExtra.get(host);
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO daily_traffic (date,host,visits,views) VALUES (?,?,?,?)
-         ON CONFLICT(date,host) DO UPDATE SET visits=excluded.visits, views=excluded.views`
-      ).bind(date, host, rec.visits, rec.views),
+        `INSERT INTO daily_traffic (date,host,visits,views,bytes) VALUES (?,?,?,?,?)
+         ON CONFLICT(date,host) DO UPDATE SET visits=excluded.visits, views=excluded.views, bytes=excluded.bytes`
+      ).bind(date, host, rec.visits, rec.views, zx?.bytes ?? 0),
       env.DB.prepare(`DELETE FROM daily_referrers WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_cf_pages WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_zone_countries WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_zone_status WHERE date=? AND host=?`).bind(date, host),
     );
     // Keep enough rows for accurate source-mix totals; the dashboard still
     // renders only the top eight referrers per domain.
@@ -79,6 +115,30 @@ async function runDaily(env, now = new Date()) {
           `INSERT INTO daily_referrers (date,host,referrer,kind,visits) VALUES (?,?,?,?,?)`
         ).bind(date, host, r.referrer, r.kind, r.visits),
       );
+    }
+    if (zx) {
+      // Zone-sourced host: "top files" ranked by requests, plus country and
+      // status-code breakdowns the RUM path has no equivalent of.
+      for (const p of zx.paths) {
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
+          ).bind(date, host, p.path, p.requests, p.visits),
+        );
+      }
+      for (const c of zx.countries) {
+        stmts.push(
+          env.DB.prepare(`INSERT INTO daily_zone_countries (date,host,country,visits) VALUES (?,?,?,?)`)
+            .bind(date, host, c.country, c.visits),
+        );
+      }
+      for (const st of zx.statuses) {
+        stmts.push(
+          env.DB.prepare(`INSERT INTO daily_zone_status (date,host,status,requests) VALUES (?,?,?,?)`)
+            .bind(date, host, st.status, st.requests),
+        );
+      }
+      continue;
     }
     for (const p of topPages(rec.pages, 50)) {
       stmts.push(
@@ -99,6 +159,7 @@ async function runDaily(env, now = new Date()) {
       const gEnd = addDays(date, -2);
       const gscWindow = `${gStart}–${gEnd}`;
       for (const { host, gsc, gscPageFilter } of SITES) {
+        if (!gsc) continue; // no Search Console property for this host (e.g. a zone-sourced file host)
         stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
@@ -233,6 +294,7 @@ async function loadDashboard(env, options = {}) {
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         partialVisits: 0, partialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
+        bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: s.trafficSource === "zone",
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
@@ -254,8 +316,16 @@ async function loadDashboard(env, options = {}) {
   const cfPagesQuery = env.DB.prepare(
     `SELECT date,host,page,visits,views FROM daily_cf_pages WHERE date BETWEEN ? AND ?`
   ).bind(start, date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, hist, histRefs, run] = await Promise.all([
-    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
+  // Zone-sourced hosts only: country and status-code breakdowns, latest day only
+  // (same "latest snapshot, not trended" treatment as keywords/pages above).
+  const zoneCountriesQuery = env.DB.prepare(
+    `SELECT host,country,visits FROM daily_zone_countries WHERE date=? ORDER BY visits DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const zoneStatusQuery = env.DB.prepare(
+    `SELECT host,status,requests FROM daily_zone_status WHERE date=? ORDER BY requests DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, hist, histRefs, run] = await Promise.all([
+    env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
       `SELECT date,host,referrer,kind,SUM(visits) AS visits FROM daily_referrers
@@ -265,6 +335,8 @@ async function loadDashboard(env, options = {}) {
     pagesQuery,
     searchSummaryQuery,
     cfPagesQuery,
+    zoneCountriesQuery,
+    zoneStatusQuery,
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
@@ -337,6 +409,14 @@ async function loadDashboard(env, options = {}) {
     const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
       (r) => `${r.referrer} ${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
+    // Zone-sourced hosts only: bandwidth sums plainly over the period (bytes
+    // carries no crawler-flood signal to split against), country/status rows
+    // are the latest-day snapshot, same treatment as keywords/pages above.
+    const bytes = byHost(tr, s.host).reduce((sum, row) => sum + Number(row.bytes || 0), 0);
+    const zoneCountryRows = byHost(zoneCountries, s.host).slice(0, 10)
+      .map((c) => ({ country: c.country, visits: Number(c.visits || 0) }));
+    const zoneStatusRows = byHost(zoneStatuses, s.host).slice(0, 8)
+      .map((st) => ({ status: st.status, requests: Number(st.requests || 0) }));
     // Pageviews survive only from clean days, so the rate must divide by clean
     // sessions too; using the full session count would understate every flooded
     // site's pages/session.
@@ -374,6 +454,8 @@ async function loadDashboard(env, options = {}) {
       cfPages: cfPageRows.slice(0, 8).map((p) => ({ page: p.page, visits: Number(p.visits || 0), views: Number(p.views || 0) })),
       searchSummary: summaryRow ? { clicks: Number(summaryRow.clicks || 0), impressions: Number(summaryRow.impressions || 0),
         ctr: Number(summaryRow.ctr || 0), position: Number(summaryRow.position || 0) } : null,
+      bytes, zoneCountries: zoneCountryRows, zoneStatuses: zoneStatusRows,
+      zoneSourced: s.trafficSource === "zone",
       opportunityCount: kwRows.filter((k) => Number(k.impressions) >= 5 && Number(k.position) >= 4 &&
         Number(k.position) <= 20 && Number(k.clicks) / Number(k.impressions) < .04).length,
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,

@@ -113,6 +113,55 @@ function cfPageList(pages, host) {
   }).join("")}</ol>`;
 }
 
+// Top downloaded files for a zone-sourced host. cfPages rows carry "requests"
+// in `visits` and "sessions" in `views` for these hosts (see index.js).
+function fileList(pages, host) {
+  if (!pages.length) return `<p class="none">No files served in this period.</p>`;
+  return `<ol class="metric-list pages-list">${pages.map((page) => {
+    const href = `https://${host}${page.page}`;
+    return `<li class="metric-row">
+      <div class="metric-name"><a class="truncate" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(page.page)}">${esc(page.page)}</a></div>
+      <div class="metric-values"><strong>${fmt(page.visits)} reqs</strong><span>${fmt(page.views)} sessions</span></div>
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+function countryList(countries) {
+  if (!countries.length) return `<p class="none">No country data in this period.</p>`;
+  const total = countries.reduce((sum, c) => sum + Number(c.visits || 0), 0);
+  const max = Math.max(1, ...countries.map((c) => Number(c.visits || 0)));
+  const rows = countries.map((c) => {
+    const width = Math.max(7, Math.round((Number(c.visits || 0) / max) * 100));
+    const share = total ? Number(c.visits || 0) / total : 0;
+    return `<li class="ref" title="${esc(c.country)}: ${fmt(c.visits)} visits (${pct(share, 1)})">
+      <div class="bar" style="width:${width}%"></div>
+      <div class="row"><span class="name">${esc(c.country)}</span><span class="n">${fmt(c.visits)}</span></div>
+    </li>`;
+  }).join("");
+  return `<ol class="ref-list">${rows}</ol>`;
+}
+
+function statusList(statuses) {
+  if (!statuses.length) return `<p class="none">No status data in this period.</p>`;
+  const total = statuses.reduce((sum, s) => sum + Number(s.requests || 0), 0);
+  return `<ol class="metric-list">${statuses.map((s) => {
+    const share = total ? Number(s.requests || 0) / total : 0;
+    const bad = Number(s.status) >= 400;
+    return `<li class="metric-row ${bad ? "opportunity" : ""}">
+      <div class="metric-name"><span class="truncate">${esc(s.status)}</span></div>
+      <div class="metric-values"><strong>${fmt(s.requests)}</strong><span>${pct(share, 1)} of requests</span></div>
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+function bytesLabel(n) {
+  n = Number(n || 0);
+  let i = 0;
+  while (n >= 1024 && i < BYTE_UNITS.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${BYTE_UNITS[i]}`;
+}
+
 function searchSummary(summary) {
   if (!summary) return "";
   return `<div class="search-summary" aria-label="Google Search performance">
@@ -180,21 +229,32 @@ function crawlerRowDetail(site) {
 function siteCard(site, index, periodDays) {
   const id = `site-${site.host.replace(/[^a-z0-9]/gi, "-")}`;
   const periodLabel = periodDays === 1 ? "24h" : `${periodDays}d`;
-  const hasDetails = site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length || site.cfPages.length;
+  const hasDetails = site.zoneSourced
+    ? site.cfPages.length || site.zoneCountries.length || site.zoneStatuses.length
+    : site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length || site.cfPages.length;
   return `<section class="card ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
     <div class="chead">
       <div class="hostwrap">
         <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
         ${sparkline(site.spark, site.host)}
       </div>
-      <div class="nums"><div class="big">${site.visits ? `${site.partialDays ? "&ge;&nbsp;" : ""}${fmt(site.visits)}` : "—"}</div><div class="lbl">human sessions ${periodLabel}</div>
-        ${deltaBadge(site.delta, true)}<div class="pv">${site.cleanDays
-          ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
-          : `pageviews not separable on flooded days`}</div></div>
+      <div class="nums"><div class="big">${site.visits ? `${site.partialDays ? "&ge;&nbsp;" : ""}${fmt(site.visits)}` : "—"}</div><div class="lbl">${site.zoneSourced ? "sessions" : "human sessions"} ${periodLabel}</div>
+        ${deltaBadge(site.delta, true)}<div class="pv">${site.zoneSourced
+          ? `${fmt(site.views)} requests · ${bytesLabel(site.bytes)}`
+          : site.cleanDays
+            ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
+            : `pageviews not separable on flooded days`}</div></div>
     </div>
     ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${crawlerRowDetail(site)}</p>` : ""}
     ${searchSummary(site.searchSummary)}
-    ${hasDetails ? `<details class="detail" open data-card-index="${index}">
+    ${hasDetails ? (site.zoneSourced ? `<details class="detail" open data-card-index="${index}">
+      <summary><span>Countries, status codes &amp; top files</span><span class="summary-action">Hide details</span></summary>
+      <div class="cols">
+        <section class="panel"><h3><span class="dot traffic"></span>Top countries</h3>${countryList(site.zoneCountries)}</section>
+        <section class="panel"><h3><span class="dot search"></span>Status codes</h3>${statusList(site.zoneStatuses)}</section>
+      </div>
+      <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top files</h3>${fileList(site.cfPages, site.host)}</section>
+    </details>` : `<details class="detail" open data-card-index="${index}">
       <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>
       <div class="cols">
         <section class="panel"><h3><span class="dot traffic"></span>Top referrers</h3>${referrerList(site)}</section>
@@ -202,7 +262,7 @@ function siteCard(site, index, periodDays) {
       </div>
       <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top landing pages (all traffic)</h3>${cfPageList(site.cfPages, site.host)}</section>
       <section class="panel pages-panel"><h3><span class="dot good"></span>Top landing pages (Google Search)</h3>${pageList(site.pages)}</section>
-    </details>` : `<p class="none">No analytics data in this window.</p>`}
+    </details>`) : `<p class="none">No analytics data in this window.</p>`}
   </section>`;
 }
 
@@ -247,6 +307,7 @@ export function renderDashboard(data) {
   const coverageNote = data.periodDays > 1 && totals.daysAvailable < data.periodDays
     ? `${totals.daysAvailable} of ${data.periodDays} daily snapshots available` : null;
   const gscWindow = data.sites.find((site) => site.gscWindow)?.gscWindow || "latest available";
+  const hasZoneSite = data.sites.some((site) => site.zoneSourced);
   const updatedAt = data.dataUpdatedAt || data.run?.run_at;
   const stale = updatedAt ? Date.now() - Date.parse(updatedAt) > 30 * 3600 * 1000 : true;
   const stats = [
@@ -348,6 +409,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable.</div>
     <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥90% direct, ≤1.15 pages/session, at least 500 sessions, and at least 3× a normal day for that site. Flooded days are excluded whole — from sessions, referrers, and landing pages alike — and counted separately; they are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
     <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
+    ${hasZoneSite ? `<div><b>Zone-sourced sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM: "sessions" is Cloudflare's heuristic visit count, "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>
 </div>

@@ -38,6 +38,12 @@ export const SITES = [
   { host: "davidveksler.freecapitalists.org", gsc: "http://davidveksler.freecapitalists.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
   { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
+  // File-host subdomain (PDF/EPUB/MP3/MP4 payloads, no HTML pages), so the Web
+  // Analytics RUM beacon never fires here and there is no Search Console
+  // property to query. trafficSource: "zone" routes it to Cloudflare's
+  // zone-level HTTP request log (httpRequestsAdaptiveGroups) instead — see
+  // pullZoneTraffic in cloudflare.js.
+  { host: "library.freecapitalists.org", trafficSource: "zone", zoneTag: "066e5342a1531be2638029c2f1dde5f6" },
   { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
 ];
 

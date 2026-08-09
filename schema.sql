@@ -4,8 +4,9 @@
 CREATE TABLE IF NOT EXISTS daily_traffic (
   date   TEXT NOT NULL,              -- UTC date the 24h window ended
   host   TEXT NOT NULL,
-  visits INTEGER NOT NULL DEFAULT 0, -- Cloudflare Web Analytics sessions
-  views  INTEGER NOT NULL DEFAULT 0, -- pageviews
+  visits INTEGER NOT NULL DEFAULT 0, -- Cloudflare Web Analytics sessions (or zone-log visits, see config.js trafficSource)
+  views  INTEGER NOT NULL DEFAULT 0, -- pageviews (or total requests, for zone-sourced hosts)
+  bytes  INTEGER NOT NULL DEFAULT 0, -- edge response bytes; only populated for zone-sourced hosts
   PRIMARY KEY (date, host)
 );
 
@@ -63,6 +64,26 @@ CREATE TABLE IF NOT EXISTS daily_search_summary (
   PRIMARY KEY (date, host)
 );
 
+-- Zone-log traffic detail (hosts with trafficSource: "zone" in config.js —
+-- file hosts with no RUM beacon). Free-plan httpRequestsAdaptiveGroups has no
+-- referrer dimension, so country and status code stand in for the referrer
+-- and search-console panels that hosts with real GSC properties get instead.
+CREATE TABLE IF NOT EXISTS daily_zone_countries (
+  date    TEXT NOT NULL,
+  host    TEXT NOT NULL,
+  country TEXT NOT NULL,
+  visits  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, country)
+);
+
+CREATE TABLE IF NOT EXISTS daily_zone_status (
+  date     TEXT NOT NULL,
+  host     TEXT NOT NULL,
+  status   INTEGER NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, status)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,
@@ -76,3 +97,5 @@ CREATE INDEX IF NOT EXISTS idx_kw_dh  ON daily_keywords(date, host);
 CREATE INDEX IF NOT EXISTS idx_pages_dh ON daily_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host);
+CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host);
+CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host);

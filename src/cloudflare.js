@@ -70,6 +70,100 @@ export async function pullTraffic(env, startISO, endISO) {
   return hosts;
 }
 
+// httpRequestsAdaptiveGroups filter+one optional dimension. Kept to a single
+// dimension per call deliberately: combining clientRequestPath with country
+// and status on this host exploded past the 5000-row cap (thousands of files
+// x ~120 countries x ~10 statuses) and silently undercounted every sum — the
+// same failure mode gsc.js's querySearchSummary comment warns about for
+// Search Console's ranked rows. A day's total, split three single-dimension
+// ways, never approached the cap in testing (max ~3700 rows, for path).
+function zoneQuery(dimension) {
+  return `query ZoneTraffic($zoneTag: String!, $start: String!, $end: String!, $host: String!) {
+  viewer {
+    zones(filter: { zoneTag: $zoneTag }) {
+      httpRequestsAdaptiveGroups(
+        filter: { datetime_geq: $start, datetime_leq: $end, clientRequestHTTPHost: $host }
+        limit: 5000
+        orderBy: [count_DESC]
+      ) {
+        count
+        sum { visits edgeResponseBytes }
+        ${dimension ? `dimensions { ${dimension} }` : ""}
+      }
+    }
+  }
+}`;
+}
+
+async function runZoneQuery(env, dimension, zoneTag, host, startISO, endISO) {
+  const res = await fetch(GQL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: zoneQuery(dimension),
+      variables: { zoneTag, start: startISO, end: endISO, host },
+    }),
+  });
+  if (!res.ok) throw new Error(`CF zone GraphQL ${res.status} for ${host}: ${await res.text()}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(`CF zone GraphQL errors for ${host}: ${JSON.stringify(body.errors)}`);
+  return body.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups ?? [];
+}
+
+// Pull one host's traffic straight from the zone's HTTP request log, for hosts
+// that carry no Web Analytics beacon (e.g. a file host serving raw payloads,
+// no HTML wrapper for the RUM script to load from). Free-plan limit: this
+// dataset accepts at most a 1-day window per request, so callers must pass a
+// startISO/endISO span no wider than 24h.
+// Returns { visits, requests, bytes, paths, countries, statuses }.
+export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
+  const [totalRows, pathRows, countryRows, statusRows] = await Promise.all([
+    runZoneQuery(env, null, zoneTag, host, startISO, endISO),
+    runZoneQuery(env, "clientRequestPath", zoneTag, host, startISO, endISO),
+    runZoneQuery(env, "clientCountryName", zoneTag, host, startISO, endISO),
+    runZoneQuery(env, "edgeResponseStatus", zoneTag, host, startISO, endISO),
+  ]);
+
+  const totals = totalRows[0] ?? { count: 0, sum: { visits: 0, edgeResponseBytes: 0 } };
+
+  const paths = new Map();
+  for (const g of pathRows) {
+    const path = g.dimensions.clientRequestPath || "/";
+    const p = paths.get(path) ?? { visits: 0, requests: 0 };
+    p.visits += g.sum.visits;
+    p.requests += g.count;
+    paths.set(path, p);
+  }
+
+  const countries = new Map();
+  for (const g of countryRows) {
+    const country = g.dimensions.clientCountryName || "Unknown";
+    countries.set(country, (countries.get(country) ?? 0) + g.sum.visits);
+  }
+
+  const statuses = new Map();
+  for (const g of statusRows) {
+    statuses.set(g.dimensions.edgeResponseStatus, (statuses.get(g.dimensions.edgeResponseStatus) ?? 0) + g.count);
+  }
+
+  return {
+    visits: totals.sum.visits,
+    requests: totals.count,
+    bytes: totals.sum.edgeResponseBytes,
+    // Ranked by requests, not visits: for a file host, "top files" means most
+    // hit, and a single session can pull many different files.
+    paths: [...paths.entries()].sort((a, b) => b[1].requests - a[1].requests).slice(0, 50)
+      .map(([path, r]) => ({ path, visits: r.visits, requests: r.requests })),
+    countries: [...countries.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([country, v]) => ({ country, visits: v })),
+    statuses: [...statuses.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([status, requests]) => ({ status, requests })),
+  };
+}
+
 // Flatten a referrers Map into a sorted, classified, top-N array.
 export function topReferrers(referrers, n = 8) {
   return [...referrers.entries()]
