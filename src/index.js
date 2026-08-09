@@ -1,7 +1,7 @@
 import { SITES } from "./config.js";
 import { pullTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
-import { classifyTraffic, floodReason, floodDates } from "./bots.js";
+import { classifyTraffic, floodReason, floodDates, splitDay } from "./bots.js";
 import { renderDashboard } from "./render.js";
 
 const utcDate = (d) => d.toISOString().slice(0, 10);
@@ -180,8 +180,12 @@ async function summarizeToday(env, date) {
   for (const { host } of SITES) {
     const day = classified.get(host)?.get(date);
     if (!day) continue;
-    if (day.flood) botVisits += day.visits;
-    else { humanVisits += day.visits; perHost.set(host, day.visits); }
+    // Same split as the dashboard: a flooded day still contributes its referred
+    // sessions, so the phone alert reports a floor instead of a zero.
+    const part = splitDay(day);
+    botVisits += part.crawler;
+    humanVisits += part.human;
+    if (part.human) perHost.set(host, part.human);
   }
   const flooded = [...SITES].filter(({ host }) => classified.get(host)?.get(date)?.flood).map(({ host }) => host);
   return { humanVisits, botVisits, perHost, flooded };
@@ -221,11 +225,13 @@ async function loadDashboard(env, options = {}) {
       totals: { visits: 0, views: 0, search: 0, domains: selectedSites.length, active: 0,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
         botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
+        partialVisits: 0, partialSites: 0,
         sourceMix: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
         opportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
+        partialVisits: 0, partialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
@@ -271,16 +277,26 @@ async function loadDashboard(env, options = {}) {
   const byHost = (rows, h) => (rows.results ?? []).filter((r) => r.host === h);
   const availableDates = [...new Set((tr.results ?? []).map((row) => row.date))].sort();
   const previousAvailableDates = [...new Set((previousTr.results ?? []).map((row) => row.date))].sort();
-  // Split every measured day into human vs crawler. A flooded day is excluded
-  // whole rather than estimated: within such a day the real visitors are not
-  // separable from the crawler, so the honest move is to report the clean days
-  // and say plainly how many days were dropped.
-  const sumTraffic = (rows, floods) => rows.reduce((acc, row) => {
-    const visits = Number(row.visits || 0), views = Number(row.views || 0);
-    if (floods.has(row.date)) { acc.botVisits += visits; acc.botViews += views; acc.botDays += 1; }
-    else { acc.visits += visits; acc.views += views; }
+  // Split every measured day into human vs crawler (see splitDay). A flooded day
+  // still contributes its referred sessions, so a site whose only day in view was
+  // flooded reports a measured floor instead of an empty card; its direct bucket
+  // and its pageviews are the parts that stay unrecoverable.
+  const sumTraffic = (rows, days) => rows.reduce((acc, row) => {
+    const part = splitDay(days?.get(row.date));
+    acc.visits += part.human;
+    acc.views += part.views;
+    if (part.partial) {
+      acc.partialVisits += part.human;
+      acc.partialDays += 1;
+      acc.botVisits += part.crawler;
+      acc.botViews += part.crawlerViews;
+      acc.botDays += 1;
+    } else {
+      acc.cleanDays += 1;
+    }
     return acc;
-  }, { visits: 0, views: 0, botVisits: 0, botViews: 0, botDays: 0 });
+  }, { visits: 0, views: 0, partialVisits: 0, partialDays: 0,
+       botVisits: 0, botViews: 0, botDays: 0, cleanDays: 0 });
   const summarizeSources = (rows, visits) => {
     const result = { direct: 0, search: 0, social: 0, referral: 0, other: 0 };
     for (const row of rows) {
@@ -306,17 +322,28 @@ async function loadDashboard(env, options = {}) {
   let sites = selectedSites.map((s) => {
     const floods = floodDates(classified, s.host);
     const days = classified.get(s.host);
-    const t = sumTraffic(byHost(tr, s.host), floods);
-    const previous = sumTraffic(byHost(previousTr, s.host), floods);
+    const t = sumTraffic(byHost(tr, s.host), days);
+    const previous = sumTraffic(byHost(previousTr, s.host), days);
     const kwRows = byHost(kws, s.host);
     const pageRows = byHost(pages, s.host);
+    // Landing-page rows carry no referer dimension, so a flooded day's are the
+    // crawler's and stay excluded whole.
     const cfPageRows = mergeBy(byHost(cfPages, s.host).filter((r) => !floods.has(r.date)),
       (r) => r.page, (r) => ({ page: r.page, visits: 0, views: 0 }));
-    const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date)),
+    // Referrers carry a referer dimension, so on a flooded day only the direct
+    // bucket is spoiled: the referred rows survive and keep the detail panel
+    // agreeing with the headline. Landing pages above have no such dimension,
+    // which is why they stay excluded whole.
+    const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
       (r) => `${r.referrer} ${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
-    const currentRate = t.visits ? t.views / t.visits : 0;
-    const previousRate = previous.visits ? previous.views / previous.visits : 0;
+    // Pageviews survive only from clean days, so the rate must divide by clean
+    // sessions too; using the full session count would understate every flooded
+    // site's pages/session.
+    const cleanVisits = t.visits - t.partialVisits;
+    const previousCleanVisits = previous.visits - previous.partialVisits;
+    const currentRate = cleanVisits ? t.views / cleanVisits : 0;
+    const previousRate = previousCleanVisits ? previous.views / previousCleanVisits : 0;
     // The callout describes the most recent flooded day, which is the one the
     // reader is looking at; older flooded days show up as gaps in the sparkline.
     const latestFlood = [...floods].sort().at(-1);
@@ -324,10 +351,16 @@ async function loadDashboard(env, options = {}) {
       host: s.host,
       visits: t.visits, views: t.views,
       botVisits: t.botVisits, botViews: t.botViews, botDays: t.botDays,
+      // Sessions recovered from flooded days: real, but a floor rather than a
+      // count, because the direct bucket those days is unusable.
+      partialVisits: t.partialVisits, partialDays: t.partialDays,
       previousVisits: previous.visits,
       previousBotVisits: previous.botVisits,
-      cleanDays: byHost(tr, s.host).length - t.botDays,
-      delta: previous.visits ? (t.visits - previous.visits) / previous.visits : null,
+      cleanDays: t.cleanDays,
+      // A floor compared against a full count is not a like-for-like delta, so
+      // either side being partial means no comparison rather than a fake drop.
+      delta: previous.visits && !t.partialDays && !previous.partialDays
+        ? (t.visits - previous.visits) / previous.visits : null,
       pagesPerSession: currentRate,
       previousPagesPerSession: previousRate,
       pagesPerSessionDelta: previous.visits ? currentRate - previousRate : null,
@@ -374,6 +407,8 @@ async function loadDashboard(env, options = {}) {
     botVisits: sites.reduce((a, s) => a + s.botVisits, 0),
     botViews: sites.reduce((a, s) => a + s.botViews, 0),
     previousBotVisits: sites.reduce((a, s) => a + s.previousBotVisits, 0),
+    partialVisits: sites.reduce((a, s) => a + s.partialVisits, 0),
+    partialSites: sites.filter((s) => s.partialDays > 0).length,
     floodedSiteDays: sites.reduce((a, s) => a + s.botDays, 0),
     floodedSites: sites.filter((s) => s.botDays > 0).length,
     daysAvailable: availableDates.length,

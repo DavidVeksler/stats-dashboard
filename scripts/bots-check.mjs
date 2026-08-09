@@ -2,7 +2,7 @@
 // This is pure logic with no network, so unlike the rest of the project it can
 // be verified directly — and it is the piece most worth verifying, since a false
 // positive silently deletes real traffic from the dashboard.
-import { classifyTraffic } from "../src/bots.js";
+import { classifyTraffic, splitDay } from "../src/bots.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -71,6 +71,30 @@ const viral = [
   { visits: 20000, pps: 1.25, direct: .2 },
 ];
 check("a viral spike is not a crawler flood", floodsFor("viral", viral), 0);
+
+// 7. A flooded day must not zero out the site: the referred sessions are still a
+//    measured human floor, and only the direct bucket is discarded. This is the
+//    freecapitalists.org Aug 2026 case, where a 1,689-session flood on the only
+//    day in view left the whole card blank.
+const floodedSplit = (host, days, index) => {
+  const { traffic, referrers } = rows(host, days);
+  const classified = classifyTraffic(traffic, referrers);
+  return splitDay([...classified.get(host).values()][index]);
+};
+const oneDayFlood = [
+  ...Array.from({ length: 13 }, () => ({ visits: 26, pps: 1.4, direct: .6 })),
+  { visits: 1689, pps: 1.08, direct: .99 },
+];
+const floodDay = floodedSplit("fc", oneDayFlood, 13);
+check("a flooded day still reports its referred sessions", floodDay.human, 1689 - 1672);
+check("a flooded day's direct bucket is the crawler figure", floodDay.crawler, 1672);
+check("a flooded day is marked partial", floodDay.partial, true);
+check("a flooded day's pageviews stay unattributed", floodDay.views, 0);
+
+const cleanDay = floodedSplit("fc", oneDayFlood, 0);
+check("a clean day is counted whole", cleanDay.human, 26);
+check("a clean day reports no crawler traffic", cleanDay.crawler, 0);
+check("a clean day is not partial", cleanDay.partial, false);
 
 if (failures) {
   console.error(`\n${failures} bot-classifier check(s) failed`);

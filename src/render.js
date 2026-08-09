@@ -39,7 +39,7 @@ function sparkline(points, host) {
     (floodCount ? `; ${floodCount} day${floodCount === 1 ? "" : "s"} crawler-flooded` : "");
   const pointsWithTitles = coords.map(({ x, y }, index) =>
     `<circle class="spark-hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4">
-      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions${points[index].flood ? " — crawler flood, excluded from totals" : ""}</title>
+      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions${points[index].flood ? " — crawler flood, direct traffic excluded" : ""}</title>
     </circle>`).join("");
   const floodMarks = coords.map(({ x, y }, index) => points[index].flood
     ? `<circle class="spark-flood" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4"/>` : "").join("");
@@ -151,9 +151,30 @@ function crawlerNote(totals, sites) {
   return `<aside class="crawler" role="note">
     <strong>${fmt(totals.botVisits)} crawler sessions excluded</strong> — ${pct(totals.botShare, 0)} of everything measured
     in this period, across ${days} flooded site-day${days === 1 ? "" : "s"}: ${named}.
-    Nothing is blocked; these days are set aside because a crawler's sessions are indistinguishable
-    from a person's within the same day, so the human count for those days reads as zero rather than a guess.
+    Nothing is blocked. On those days only the direct bucket is unusable — a crawler arrives without a
+    referer, so referred sessions still count${totals.partialVisits
+      ? ` (${fmt(totals.partialVisits)} of them here)` : ""}, and the affected totals read as a floor rather than a guess.
   </aside>`;
+}
+
+// What the headline number actually covers once a flood is in the window. A
+// flooded day is no longer a hole: its referred sessions still count, so the
+// number is a floor. Say which parts came from where, and say plainly when the
+// referred sessions are all there is.
+function crawlerRowDetail(site) {
+  const clean = site.cleanDays
+    ? `Human figures above cover the ${site.cleanDays} clean day${site.cleanDays === 1 ? "" : "s"}` : "";
+  if (!site.partialDays) return clean ? `${clean}.` : "";
+  if (!site.partialVisits) {
+    return clean
+      ? `${clean}; the flooded day${site.botDays === 1 ? "" : "s"} produced no referred sessions at all.`
+      : `No referred sessions were measured on those days, so there is no human figure to report.`;
+  }
+  const recovered = `${fmt(site.partialVisits)} referred session${site.partialVisits === 1 ? "" : "s"} ` +
+    `survive${site.partialVisits === 1 ? "s" : ""} the flooded day${site.botDays === 1 ? "" : "s"} ` +
+    `(a crawler arrives without a referer, so a referral is still a person); the direct traffic there is not separable, ` +
+    `which is why the total is a floor.`;
+  return clean ? `${clean}, plus ${recovered}` : `The figure above is the ${recovered}`;
 }
 
 function siteCard(site, index, periodDays) {
@@ -166,10 +187,12 @@ function siteCard(site, index, periodDays) {
         <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
         ${sparkline(site.spark, site.host)}
       </div>
-      <div class="nums"><div class="big">${site.visits ? fmt(site.visits) : "—"}</div><div class="lbl">human sessions ${periodLabel}</div>
-        ${deltaBadge(site.delta, true)}<div class="pv">${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session</div></div>
+      <div class="nums"><div class="big">${site.visits ? `${site.partialDays ? "&ge;&nbsp;" : ""}${fmt(site.visits)}` : "—"}</div><div class="lbl">human sessions ${periodLabel}</div>
+        ${deltaBadge(site.delta, true)}<div class="pv">${site.cleanDays
+          ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
+          : `pageviews not separable on flooded days`}</div></div>
     </div>
-    ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${site.cleanDays ? `Human figures above cover the ${site.cleanDays} clean day${site.cleanDays === 1 ? "" : "s"}.` : `No clean day in this period, so there is no human figure to report.`}</p>` : ""}
+    ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${crawlerRowDetail(site)}</p>` : ""}
     ${searchSummary(site.searchSummary)}
     ${hasDetails ? `<details class="detail" open data-card-index="${index}">
       <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>

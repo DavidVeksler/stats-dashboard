@@ -46,6 +46,7 @@ export function classifyTraffic(trafficRows, referrerRows) {
   for (const days of byHost.values()) {
     const all = [...days.values()];
     for (const day of all) {
+      day.nonDirect = Math.max(0, day.visits - day.direct);
       day.pagesPerSession = day.visits ? day.views / day.visits : 0;
       day.directShare = day.visits ? day.direct / day.visits : 0;
       // Shape only — deliberately volume-free, so the baseline below can be built
@@ -69,6 +70,29 @@ export function classifyTraffic(trafficRows, referrerRows) {
     }
   }
   return byHost;
+}
+
+// Split one classified day into the part that is still creditable to people and
+// the part that is crawler noise.
+//
+// A flooded day used to be discarded whole, which zeroed out an entire site card
+// whenever the only day in view was flooded. But the flood test is largely a test
+// for *direct* traffic (>=90% of sessions carry no referer, because that is how
+// crawlers arrive), so the referred sessions on a flooded day are still a real,
+// measured human signal — a referral from Google or Reddit is not something the
+// crawler produces. Those sessions are reported as a floor ("at least N"), which
+// is a measurement, not the interpolation the docs rightly warn against.
+//
+// What genuinely cannot be recovered is the direct bucket, where the crawler and
+// real direct visitors are mixed beyond separation, and pageviews, which carry no
+// referer dimension at all. Both are reported as crawler volume rather than split.
+export function splitDay(day) {
+  if (!day) return { human: 0, crawler: 0, views: 0, crawlerViews: 0, partial: false };
+  if (!day.flood) {
+    return { human: day.visits, crawler: 0, views: day.views, crawlerViews: 0, partial: false };
+  }
+  return { human: day.nonDirect, crawler: day.visits - day.nonDirect, views: 0,
+    crawlerViews: day.views, partial: true };
 }
 
 // Human-readable explanation for a flooded day, for the card callout.
