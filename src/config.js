@@ -30,12 +30,9 @@ export const SITES = [
     gscPageFilter: "^https?://(?:www\\.)?davidveksler\\.com/",
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
-  { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
+  { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org" },
   { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
-  // http://, not https:// — the Search Console property was registered on the
-  // http prefix, and URL-prefix properties are protocol-exact. Querying the
-  // https form 403s, which silently zeroed this site's search data every run.
-  { host: "davidveksler.freecapitalists.org", gsc: "http://davidveksler.freecapitalists.org/" },
+  { host: "davidveksler.freecapitalists.org", gsc: "sc-domain:davidveksler.freecapitalists.org" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
   { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
   // File-host subdomain (PDF/EPUB/MP3/MP4 payloads, no HTML pages), so the Web
