@@ -15,7 +15,7 @@ export const SITES = [
   },
   {
     host: "cheatsheets.davidveksler.com",
-    gsc: "https://cheatsheets.davidveksler.com/",
+    gsc: "sc-domain:cheatsheets.davidveksler.com",
     // /history.php is hit almost entirely by bots crawling revision links, not
     // real users; drop it from traffic so sessions/views reflect actual readers.
     excludePaths: ["/history.php"],
