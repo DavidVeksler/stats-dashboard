@@ -423,7 +423,7 @@ async function loadDashboard(env, options = {}) {
     // agreeing with the headline. Landing pages above have no such dimension,
     // which is why they stay excluded whole.
     const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
-      (r) => `${r.referrer} ${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
+      (r) => `${r.referrer}\u0000${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
     // Zone-sourced hosts only: bandwidth sums plainly over the period (bytes
     // carries no crawler-flood signal to split against), country/status rows
