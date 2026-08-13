@@ -50,10 +50,15 @@ export const SITES = [
   { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
     gscPageFilter: "^https?://(?:www\\.)?freecapitalists\\.org/" },
   { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
-  // No domain property of its own, so this reads the parent domain property
-  // filtered to the subdomain. The old http:// URL-prefix property returned zero
-  // rows for every window — URL-prefix properties are protocol-exact and the site
-  // serves https — so this row was empty even when it 200'd.
+  // Reads the parent domain property filtered to the subdomain. A dedicated
+  // sc-domain:davidveksler.freecapitalists.org property was created 2026-08-12
+  // and is readable, but Search Console has not backfilled it yet: it returns
+  // zero rows for 2026-05-01..08-11 while the parent property returns this
+  // subdomain's pages for the same window. Switch this row over once the
+  // dedicated property answers with data, not before — an empty property is how
+  // this site's card went blank in the first place.
+  // (The older http:// URL-prefix property is dead for a different reason:
+  // URL-prefix properties are protocol-exact and the site serves https.)
   { host: "davidveksler.freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
     gscPageFilter: "^https?://davidveksler\\.freecapitalists\\.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
