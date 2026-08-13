@@ -1,7 +1,8 @@
 # Spec: make the dashboard actionable
 
-Status: **items 1, 2, 3, 4 and 5 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
-`e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13). Everything else proposed.
+Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
+`e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
+(2026-08-13). Items 9, 10 and 11 proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -289,15 +290,17 @@ Rules as implemented, in priority order:
 | `error-spike` | zone | responses ≥ 400 as a share of requests exceeds its 14-day mean by ≥ 2× **or** ≥ 5 points, with ≥ 3 measured baseline days, ≥ 50 error responses, and ≥ 2% share today | 1 | "Check the top failing paths below and fix or redirect them" |
 | `likely-bot-subflood` | RUM | sessions delta ≥ +100% **and** absolute change ≥ 50 **and** resulting sessions ≥ 100 **and** pages/session ≤ `FLAT_PAGES_PER_SESSION` **and** direct share ≥ 0.8 **and** top landing page ≥ 80% of entrances | 1 | "Treat as crawler traffic, not growth, and consider lowering the flood floor for this host" |
 | `malformed-urls` | RUM | ≥ 3 landing pages match `looksMalformed` (`src/urls.js`) | 2 | "Fix the broken links generating these, then redirect or noindex the junk URLs" |
-| `search-opportunity` | RUM | site has ≥ 1 query matching the shared `isOpportunity` predicate | 2 | "Open the search panel and rewrite the titles and meta descriptions for those pages" |
+| `snippet-gap` | RUM | site has ≥ 1 `snippet`-class opportunity (item 7) | 2 | "Rewrite the title and meta description for those pages; the ranking is already there" |
+| `rank-gap` | RUM | site has ≥ 1 `rank`-class opportunity (item 7) | 2 | "Strengthen those pages and link to them from the strongest related page on the site" |
 | `traffic-drop` | RUM | sessions delta ≤ -25% **and** absolute change ≥ 25 **and** not partial | 2 | "Compare the referrer list against the previous period to find what stopped" |
 | `traffic-rise` | RUM | sessions delta ≥ +25% **and** absolute change ≥ 25 **and** not `likely-bot-subflood` | 3 | "Check which referrer drove it before counting it as growth" |
 | `no-comparison` | RUM | delta suppressed because either side was partial | 3 | "Read the figure as a floor, and wait for a clean day before judging the trend" |
 
-`search-opportunity` is the placeholder for `snippet-gap`: one generic rule, because telling the
-reader to rewrite a title and description is only correct for a page that already ranks, and the
-snippet-vs-rank split that distinguishes the two remedies is item 7. **Item 7 replaces this rule with
-two.**
+The two search rules shipped as one generic `search-opportunity` placeholder in `c7eefc5` and were
+split in `e96c949` once item 7 existed. Telling the reader to rewrite a title and description is
+only correct for a page that already ranks; the table above is the post-split state. Each rule is
+weighed by its own class's click metric, so the two rank against each other on the same axis even
+though they are found by different ones.
 
 Two rules that matter more than the table:
 
@@ -342,7 +345,36 @@ Also feed the top signal into the ntfy summary (`sendNtfy`, called at `src/index
 push carries the finding rather than only volumes. Keep the existing quiet-success discipline: no
 severity-1 signal means the notification stays as-is.
 
-## 6. Fix the traffic sources panel
+## 6. Fix the traffic sources panel — IMPLEMENTED (`e96c949`)
+
+> Item 1 had already excluded zone sites from the mix (it had to: the residual segment rendered
+> wider than the whole bar otherwise), so what landed here is the labelling and the recovery of
+> internal navigation. Three corrections to what this section originally said:
+>
+> 1. **The residual was renamed in the DATA, not only on the page.** `sourceMix.other` is now
+>    `sourceMix.unattributed`, and `summarizeSources` gained an `internal` key. Keeping the field
+>    called `other` while the page said "Unattributed" would have reintroduced exactly the gap
+>    between what the code calls a thing and what the reader is told it is. `/api/json` changes
+>    shape accordingly; it is an internal, WAF-gated surface with no external consumer.
+> 2. **`internal` only exists going forward, and the panel has to say so rather than render a zero.**
+>    `kind` is frozen into `daily_referrers` by `topReferrers`/`classifyReferrer` at write time, and
+>    the referer that would decide it is not stored anywhere, so no backfill is possible even in
+>    principle. `totals.internalMeasured` reports whether any row in the selected window and for the
+>    selected hosts carries the kind; when none does, the channel is **omitted from the bar and the
+>    legend entirely**, because `Internal 0 · 0.0%` asserts a measurement nobody took. The residual
+>    footnote names the pre-change alias sessions as one of its causes in exactly that case.
+>    `dashboard-check.mjs` and `render-check.mjs` both cover it, and both cover `?period=7` and
+>    `?period=30` rather than only the 24h view — those are the windows that still reach back over
+>    old rows.
+> 3. **The two KPI tiles that contradicted each other were fixed here too**, since the work was in
+>    the tiles anyway: "Domains shown" read `12` / `12 with traffic` beside a sessions tile reading
+>    `11 RUM sites`. It now reads `11 RUM + 1 zone · 12 with traffic` (`totals.zoneDomains`), so the
+>    two tiles agree about how many sites exist and about why one of them is counted differently.
+>
+> One thing the section got right and is worth restating: the live residual was already down to
+> about 1 session in 966 after item 1, so the acceptance threshold was met before this item started.
+> The value delivered here is the honesty of the labelling — a residual named as a residual — and
+> internal navigation becoming a real, attributable category instead of a hole.
 
 **Symptom.** "Other / unlisted" is 1,060 of 2,012 sessions (52.7%). A channel panel whose largest
 bucket is unattributable cannot inform a channel decision.
@@ -358,16 +390,75 @@ from two smaller leaks: self-referrals are counted in `rec.visits` but their ref
 
 - Exclude zone-sourced sites from the mix entirely and title the panel
   `Traffic sources (RUM sites only)`. That alone takes unattributed from 52.7% to about 0.1%.
-- Rename the residual to `Unattributed` and render it outside the percentage bar, as a footnote with
-  its known causes, not as a fifth channel competing with Direct and Search.
+  (Done in item 1, out of necessity — see that item's note.)
+- Rename the residual to `Unattributed`, in the data as well as on the page (`sourceMix.other` →
+  `sourceMix.unattributed`), and render it outside the percentage bar as a footnote with its known
+  causes, not as a fifth channel competing with Direct and Search.
 - Reduce the residual at the source: write self-referrals as `kind: "internal"` in `daily_referrers`
-  instead of dropping the row (`src/cloudflare.js:55`), and render internal as its own muted
-  channel. Sessions arriving from a site's own alias hostname are a real, attributable category.
+  instead of dropping the row, and render internal as its own muted channel. Sessions arriving from
+  a site's own alias hostname are a real, attributable category.
+- **The `internal` kind is forward-only and this must not break history.** `kind` is frozen into the
+  row at write time by `topReferrers`/`classifyReferrer`, and the referer that would decide it is not
+  stored anywhere, so no backfill is possible. `totals.internalMeasured` reports whether any row in
+  the selected window and for the selected hosts carries the kind; when none does, the channel is
+  omitted from the bar and legend entirely rather than rendered as `Internal 0 · 0.0%`, which would
+  assert a measurement nobody took.
+- **Also fix the two KPI tiles that contradict each other** while the work is in the tiles:
+  "Domains shown" reads `12` / `12 with traffic` beside a sessions tile reading `11 RUM sites`. State
+  the split — `11 RUM + 1 zone · 12 with traffic`.
 
-**Acceptance.** `dashboard-check.mjs` asserts `totals.sourceMix.other / totals.visits < 0.05` on the
-standard fixture, and that no zone-sourced site contributes to `sourceMix`.
+**Acceptance.** `dashboard-check.mjs` asserts `totals.sourceMix.unattributed / totals.visits < 0.05`
+on the standard fixture, that no zone-sourced site contributes to `sourceMix`, that internal sessions
+land in `sourceMix.internal` rather than the residual, and that a window of pre-change rows reports
+`internalMeasured: false` with the channel absent. `render-check.mjs` asserts the residual renders
+below the legend as a footnote, never as a segment, and covers `?period=1`, `?period=7` and
+`?period=30`.
 
-## 7. Split opportunities by required action, rank by lost clicks
+## 7. Split opportunities by required action, rank each class by its own metric — IMPLEMENTED (`e96c949`)
+
+> **The thresholds this section originally proposed failed the very example that motivated it, and
+> "rank by lost clicks" was wrong for half the cases.** Four corrections, and the section text below
+> has been rewritten to match what shipped:
+>
+> 1. **The `rank` gates were tuned for a 30-day window.** `16 <= position <= 30` and
+>    `impressions >= 20` both exclude `bitcoin recovery` on walletrecovery.info (13 impressions, 0
+>    clicks, position 31.2) — the live query used to justify this whole item, which would have stayed
+>    invisible. GSC is queried over a **three-day** window here, so impression counts are small and
+>    any floor written for a monthly window suppresses everything. Shipped: `snippet` at position
+>    ≤ 15, `rank` from there to position 50, `watch` beyond, `OPPORTUNITY_MIN_IMPRESSIONS` staying at
+>    5, and a `MIN_ACTIONABLE_CLICKS = 0.5` floor on the class's own gain metric doing the work a
+>    fixed impression floor was doing badly. That floor scales with the CTR curve, so a deep query
+>    needs more impressions to qualify than a shallow one — which is the correct behavior and is not
+>    something a constant can express.
+> 2. **The two classes are ranked by DIFFERENT metrics, and this is the substantive change.** Lost
+>    clicks = `impressions × (expectedCtr − actualCtr)` measures what is recoverable *at the current
+>    rank*. That is exactly the right question for a snippet rewrite and exactly the wrong one for a
+>    ranking problem, where the entire value is in moving up. Ranking both classes by it guarantees
+>    that deep-ranking, business-critical queries always lose to shallow ones. Shipped: `snippet`
+>    sorts by lost clicks; `rank` sorts by **potential clicks** = `impressions ×
+>    expectedCtr(TARGET_POSITION) − clicks`, with `TARGET_POSITION = 5` as a named constant. How
+>    badly the single metric fails is now an assertion: **every** ranking-class query in the fixtures
+>    scores under `MIN_ACTIONABLE_CLICKS` on lost clicks, so one shared metric would not have demoted
+>    the class, it would have deleted it.
+> 3. **`queryDenyPatterns` was built and left empty.** This section implied suppressing
+>    forum.objectivismonline.com's adult-leaning queries. Which queries a site declines to pursue is
+>    an editorial decision belonging to the site's owner, not to this repo, so the mechanism ships
+>    documented (`src/config.js`, and AGENTS.md says how to populate it) and **unset on every site**.
+>    It turned out not to be needed for the acceptance case anyway: `incest forum` (1 click, 61
+>    impressions, position 12.8) takes 1.6% CTR against roughly 1.9% expected at that position, so
+>    the classifier does not flag it at all. That is the better outcome — it is excluded by
+>    measurement rather than by an opinion.
+> 4. **The tile subtitle changed owner.** This section wanted `N opportunities in top queries` to
+>    become an anchor link on the `Avg search position` tile; item 8 replaces that tile's value with a
+>    median and puts `N queries in the top 10` in its subtitle. Both landed: the subtitle is the
+>    top-10 count, and the opportunity link sits beside it as `N snippet · M rank`, deep-linking to
+>    the card holding the highest-scoring opportunity.
+>
+> Also shipped: `expectedCtr(position)` in `src/opportunities.js` with a sourced, dated comment
+> (SISTRIX 2020, ~80M keywords; positions 1/2/3/10 measured, 4–9 log-linear interpolation, the tail
+> past 10 our own estimate — each marked as which), `classifyOpportunity` as the single shared
+> classifier behind both the badge and the count, and `search-opportunity` in `src/signals.js`
+> replaced by `snippet-gap` and `rank-gap` with genuinely different action text.
 
 **Symptom.** The badge is mechanical. It fires on `incest forum` (1 click, 61 impressions, position
 12.8) for the Objectivism forum, a query nobody should optimize for, and skips `bitcoin recovery`
@@ -376,32 +467,91 @@ business. Worse, one label covers two opposite problems: 0% CTR at position 50 t
 problem needing content and links, while 0% CTR at position 5 to 15 is a *snippet* problem needing a
 title and description rewrite. The remedies share nothing.
 
-**Change.** In `src/opportunities.js` (created in item 3), classify each query:
+**Change.** In `src/opportunities.js` (created in item 3), classify each query. Every threshold is a
+named export, and the footer prose interpolates them rather than restating them:
 
-- `snippet`: `position <= 15` and `impressions >= 20` and `ctr < expectedCtr(position) * 0.5`.
-  Action: rewrite title and meta description.
-- `rank`: `16 <= position <= 30` and `impressions >= 20`. Action: strengthen the page, add internal
-  links from the strongest related page.
-- `watch`: `position > 30`. Not badged, not counted. It is not actionable this week.
+- `snippet`: `position <= SNIPPET_MAX_POSITION` (15) and `ctr < expectedCtr(position) *
+  SNIPPET_CTR_RATIO` (0.5). Ranked by **lost clicks** = `impressions × (expectedCtr(position) −
+  ctr)`. Action: rewrite title and meta description — the ranking is already there.
+- `rank`: `SNIPPET_MAX_POSITION < position <= RANK_MAX_POSITION` (50). Ranked by **potential
+  clicks** = `impressions × expectedCtr(TARGET_POSITION) − clicks`, `TARGET_POSITION = 5`. Action:
+  strengthen the page, add internal links from the strongest related page.
+- `watch`: `position > RANK_MAX_POSITION`. Not badged, not counted. It is a content project rather
+  than a task.
+- Both classes require `impressions >= OPPORTUNITY_MIN_IMPRESSIONS` (5 — below that CTR is not a
+  measurement) and at least `MIN_ACTIONABLE_CLICKS` (0.5) of gain **on that class's own metric**.
+  GSC is queried over a three-day window here, so these floors are deliberately low; a floor tuned
+  for a 30-day window suppresses every query on the page.
 
-Add an `expectedCtr(position)` table (a small static array of position-to-CTR benchmarks, sourced
-and dated in a comment). Rank every opportunity by **lost clicks** = `impressions × (expectedCtr −
-actualCtr)`, and sort the list by that rather than by impressions. This is what demotes
-`incest forum` (about 0.5 lost clicks) beneath real opportunities without any hand-curation.
+**The two metrics are not interchangeable and must not be unified.** Lost clicks measures what is
+recoverable at the current rank. For a query at position 31 that is near zero by construction — the
+whole point is that nobody sees it — so a shared lost-clicks ranking does not demote the ranking
+class, it deletes it. `bitcoin recovery` scores about 0.07 lost clicks and about 0.94 potential
+clicks; the second number is the one that says the work is worth doing.
 
-Add an optional `queryDenyPatterns: [/regex/]` field to `SITES` entries in `src/config.js` for
-queries a site will never pursue. Denied queries are still shown in the plain query list, they are
-only excluded from opportunities and from the headline count. This keeps the data honest while
-keeping the recommendation list usable.
+`expectedCtr(position)` is a small static table with a sourced, dated comment: SISTRIX's 2020 CTR
+study over ~80M keywords supplies positions 1, 2, 3 and 10; positions 4–9 are log-linear
+interpolation between those anchors (which lands position 5 on the commonly cited 7.2%); everything
+past position 10 is our own estimate of a flat tail. Each group is marked as which. It is an
+approximation of a 2020 average across every query intent there is, so nothing derived from it is
+rendered to more than one decimal place, it always carries a `~`, and no threshold fires on a small
+shortfall against it — that is what `SNIPPET_CTR_RATIO = 0.5` is for.
 
-Finally, make the `Avg search position` tile subtitle (`N opportunities in top queries`,
-`src/render.js:324`) an anchor link to the opportunities, and see item 8 for the tile value itself.
+Add an optional `queryDenyPatterns: ["…"]` field to `SITES` entries in `src/config.js` (JS regex
+sources, matched case-insensitively) for queries a site will never pursue. Denied queries are still
+shown in the plain query list, they are only excluded from the two classes and from the headline
+count. **Ship it unset on every site**: which queries a site declines to chase is the owner's
+editorial call, not a decision this repo should make. Document the field and how to populate it, and
+add no patterns.
 
-**Acceptance.** On today's data, walletrecovery.info's `bitcoin recovery` appears as a `rank`
-opportunity, forum.objectivismonline.com's `incest forum` does not appear in the top 5 by lost
-clicks, and every rendered badge reads either `snippet` or `rank`, never a bare `opportunity`.
+Finally, put the opportunity counts on the search-position tile as an anchor link (`N snippet ·
+M rank`, deep-linking to the card holding the highest-scoring opportunity) beside the top-10 count
+item 8 puts in that subtitle.
 
-## 8. Give every metric a comparator
+**Acceptance.** On today's data, walletrecovery.info's `bitcoin recovery` (13 impressions, 0 clicks,
+position 31.2) appears as a `rank` opportunity; forum.objectivismonline.com's `incest forum` (1
+click, 61 impressions, position 12.8) is not in the top 5 by its class metric — in fact it is not
+classified at all, because 1.6% CTR against roughly 1.9% expected at position 12.8 is a page
+performing at its rank; cheatsheets.davidveksler.com's `frontier ai labs list` (2 clicks, 6
+impressions, position 2.5) is not flagged for the same reason; and every rendered badge reads either
+`snippet` or `rank`, never a bare `opportunity`.
+
+## 8. Give every metric a comparator — IMPLEMENTED (`e96c949`)
+
+> Landed as `totals.trend` in `loadDashboard`, built entirely from history already read, plus the
+> `cmp` chip and `meanNote` in `src/render.js`. Four notes on what the section did not anticipate:
+>
+> 1. **GSC comparators are counted in SNAPSHOTS, never in days, and the field names say so.** The
+>    section's caveat was right and needed to reach further than the label: because each row covers a
+>    rolling three-day window lagging two days, consecutive rows overlap by two days out of three, so
+>    "clicks per day" is not a quantity these rows can express at all. The fields are
+>    `trend.gscClicksPerSnapshot` / `gscImpressionsPerSnapshot`, and `dashboard-check.mjs` asserts
+>    that **no** `gsc*PerDay` field exists, so the next person cannot add one by habit. The rendered
+>    range is named from `gsc_window` at both ends, and the chip's tooltip says the overlap out loud.
+>    Trailing means only; no day-over-day GSC delta is computed anywhere.
+> 2. **The CTR expectation is over the stored query mix, not the whole property.** `expectedCtr` needs
+>    a per-query position, and the only per-query rows stored are GSC's top ~25 per site. Computing
+>    the expectation from each site's *average* position instead would push a convex curve through a
+>    mean and produce a number that means nothing. So the tile reads
+>    `expected ~1.6% at this position mix` — "this position mix" being the stored queries — beside an
+>    actual CTR that covers everything. Rendered with a `~` and one decimal for that reason as much
+>    as for the curve's own approximation.
+> 3. **The clicks sparkline was not built.** `totals.trend.gscSeries` carries the per-snapshot series
+>    in `/api/json`, but a 150×38 sparkline does not fit a KPI tile beside a value, a subtitle and a
+>    comparator chip, and shrinking one to fit would render a rolling overlapping window as a trend
+>    line — the exact misreading this item exists to prevent. The comparator chip is what shipped.
+> 4. **Widening all three GSC reads to the history window costs more than the trend needs.** Only
+>    `daily_search_summary` feeds the trend; `daily_keywords` and `daily_pages` are widened as
+>    specified but every consumer filters straight back down to `date`. At ~25 keyword rows per site
+>    per day that is a few thousand rows read per dashboard load for no current benefit. Left as
+>    specified because item 11's recurrence work will want them, but if that item is dropped, narrow
+>    these two back to the latest day.
+>
+> Also shipped: the traffic tiles' 14-day means (sessions, pageviews, search sessions), computed
+> through the same `splitDay` human/crawler split the cards use so the baseline and the figure are
+> the same quantity; and `Avg search position` replaced by `Median search position` with
+> `N of M queries in the top 10` in the subtitle. `totals.gscPosition` still holds the old
+> impression-weighted mean for `/api/json` continuity and is off the page.
 
 **Symptom.** No number can be judged. Is 0.4% search CTR bad? At an average position of 10 the
 expected range is roughly 1 to 2%, so yes, materially, but the page does not say. "pages/session
@@ -409,19 +559,24 @@ fell by 3.2" against what baseline? Only the reader knows.
 
 **Change.**
 
-- Every KPI tile gets a 14-day mean beneath it, computed from the history already loaded. No new
-  queries for traffic metrics.
-- The `Search CTR` tile gets the position-adjusted expectation from `expectedCtr()`, rendered as
-  `0.4% (expected ~1.6% at this position mix)`.
+- Every KPI tile gets a 14-day mean beneath it, computed from the history already loaded, through the
+  same `splitDay` human/crawler split the cards use. No new queries for traffic metrics.
+- The `Search CTR` tile gets the position-adjusted expectation from `expectedCtr()`, impression
+  weighted over the stored per-query rows, rendered as `2.1%` with
+  `expected ~1.6% at this position mix` beneath it.
 - Replace the `Avg search position` tile value. A mean across branded position-1 queries and
   position-90 junk is not a number any decision rests on. Use **median position across queries with
-  ≥ 10 impressions**, and put `N queries in the top 10` in the subtitle.
+  ≥ `POSITION_MIN_IMPRESSIONS` (10) impressions**, and put `N of M queries in the top 10` in the
+  subtitle.
 - GSC trend is a pure read-side change: `daily_keywords`, `daily_pages`, and `daily_search_summary`
-  all store one row per day already, but `loadDashboard` reads them for the latest date only
-  (`src/index.js:324`, `:327`, `:350`). Widen those three reads to the history window to get a clicks sparkline
-  and a "clicks vs 14-day mean" comparator. **Caveat to render:** GSC rows are keyed by snapshot
-  date, not by measurement window, and the window lags 2 to 4 days, so consecutive rows overlap.
-  Label the trend as a rolling window, and prefer `gsc_window` for any date the user reads.
+  all store one row per day already, but `loadDashboard` reads them for the latest date only.
+  Widen those three reads to the history window; every panel consumer filters back down to the
+  latest date, and the trailing rows feed the comparator. **Caveat that must be rendered:** GSC rows
+  are keyed by snapshot date, not by measurement window, and the window lags 2 to 4 days, so
+  consecutive rows overlap by two days out of three. The comparator is therefore stated **per
+  snapshot, never per day**, no day-over-day GSC delta is computed anywhere, and every date a human
+  reads comes from `gsc_window` — what Google measured — rather than from the row's `date`, which is
+  only when we asked.
 
 ---
 
@@ -528,7 +683,7 @@ the returned JSON. Remember the WAF blocks non-browser user agents on this host.
 1. ~~Items 1, 2, 3.~~ Done. Headline numbers stop being wrong.
 2. ~~Items 4, 5.~~ Done. The signal engine and the actions block, which is where the actionability
    actually arrives.
-3. Items 6, 7, 8. Panels and metrics become judgeable.
+3. ~~Items 6, 7, 8.~~ Done. Panels and metrics become judgeable.
 4. Items 9, 10. Buried data surfaces. Item 9 is the only one needing a schema change.
 5. Item 11. Recurrence.
 
