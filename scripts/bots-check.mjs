@@ -2,7 +2,10 @@
 // This is pure logic with no network, so unlike the rest of the project it can
 // be verified directly — and it is the piece most worth verifying, since a false
 // positive silently deletes real traffic from the dashboard.
-import { classifyTraffic, splitDay } from "../src/bots.js";
+import {
+  classifyTraffic, splitDay, crawlerAccounting, summarizeVerifiedBots, summarizeNonContent,
+  isNonContentPath, UNVERIFIED_CATEGORY,
+} from "../src/bots.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -95,6 +98,100 @@ const cleanDay = floodedSplit("fc", oneDayFlood, 0);
 check("a clean day is counted whole", cleanDay.human, 26);
 check("a clean day reports no crawler traffic", cleanDay.crawler, 0);
 check("a clean day is not partial", cleanDay.partial, false);
+
+// 8. Zone-sourced hosts are routed to their own accounting, and must never fall
+//    through to the flood classifier's implicit "not flooded, therefore human".
+//
+//    First, why the routing has to exist: the zone log carries no referer
+//    dimension, so a zone host writes no daily_referrers rows at all. directShare
+//    is then 0 for every day, `signature` is false for every day, and no volume
+//    whatsoever can flag one. Reproduce that here with library's real shape.
+{
+  const ZONE = "library.freecapitalists.org";
+  const zoneDays = [
+    ...Array.from({ length: 13 }, () => ({ visits: 60 })),
+    { visits: 1059 }, // 17x the baseline, flat, entirely unreferred
+  ];
+  const { traffic } = rows(ZONE, zoneDays);
+  // No referrer rows: exactly what a zone-sourced host produces.
+  const classified = classifyTraffic(traffic, []);
+  const days = [...classified.get(ZONE).values()];
+  check("a zone host can never be flagged as flooded, at any volume",
+    days.filter((day) => day.flood).length, 0);
+  // ...and this is the reading that would follow if nothing else were done.
+  check("...so the flood path would call every one of its visits human",
+    splitDay(days.at(-1)).human, 1059);
+  check("...and would report zero crawler traffic for it", splitDay(days.at(-1)).crawler, 0);
+
+  // Therefore the routing: a zone-sourced site goes to the zone decomposition,
+  // whichever field the caller carries it in.
+  check("a zone-sourced site routes to the zone decomposition",
+    crawlerAccounting({ measurement: "zone" }), "zone");
+  check("...by the boolean form too", crawlerAccounting({ zoneSourced: true }), "zone");
+  check("a RUM site still routes to the flood classifier",
+    crawlerAccounting({ measurement: "rum" }), "flood");
+  check("...and so does a site that says nothing", crawlerAccounting({}), "flood");
+}
+
+// 9. The verified-bot lens is a floor. It must expose no human figure and no
+//    remainder that could be mistaken for one — the unverified bucket is 84.6% of
+//    library's real 2026-08-12 day and mixes readers with unlabelled crawlers.
+{
+  const summary = summarizeVerifiedBots([
+    { category: UNVERIFIED_CATEGORY, requests: 18538, visits: 900 },
+    { category: "Archiver", requests: 936, visits: 60 },
+    { category: "Search Engine Crawler", requests: 867, visits: 55 },
+    { category: "AI Crawler", requests: 696, visits: 40 },
+    { category: "Search Engine Optimization", requests: 446, visits: 30 },
+    { category: "AI Search", requests: 405, visits: 25 },
+    { category: "Page Preview", requests: 21, visits: 3 },
+    { category: "Monitoring & Analytics", requests: 10, visits: 2 },
+    { category: "Accessibility", requests: 8, visits: 1 },
+  ]);
+  check("verified requests are summed across categories", summary.verifiedRequests, 3389);
+  check("verified visits are summed too, so the card can decompose zone visits",
+    summary.verifiedVisits, 216);
+  check("the unverified bucket is kept, named, and separate", summary.unverifiedRequests, 18538);
+  check("the floor is a minority of the day, which is the point",
+    summary.verifiedShare < .16, true);
+  check("categories are ranked by requests", summary.categories[0].category, "Archiver");
+  check("...and the unverified bucket is not one of them",
+    summary.categories.some((row) => row.category === UNVERIFIED_CATEGORY), false);
+  // The whole point of item 2: nothing here asserts, or can be trivially turned
+  // into, a human count for a zone host.
+  for (const field of ["human", "humanRequests", "humanVisits", "likelyHuman", "remainder"]) {
+    check(`no ${field} field is derived from a verified-bot floor`, field in summary, false);
+  }
+  check("a host with no rows yet is marked unmeasured, not zero-crawler",
+    summarizeVerifiedBots([]).measured, false);
+}
+
+// 10. The non-content lens, from tables that already exist. Two components, kept
+//     apart: they overlap each other and there is no (path, status) pair stored
+//     anywhere to measure the overlap with.
+{
+  check("robots.txt is non-content", isNonContentPath("/robots.txt"), true);
+  check("a sitemap variant is non-content", isNonContentPath("/sitemap_index.xml"), true);
+  check("a well-known probe is non-content", isNonContentPath("/.well-known/security.txt"), true);
+  check("a Cloudflare endpoint is non-content", isNonContentPath("/cdn-cgi/trace"), true);
+  check("a real file is content", isNonContentPath("/books/mises.pdf"), false);
+  check("a path merely containing robots.txt is content",
+    isNonContentPath("/books/robots.txt.pdf"), false);
+
+  const nonContent = summarizeNonContent(
+    // Zone daily_cf_pages rows carry requests in `visits`.
+    [{ page: "/robots.txt", visits: 684 }, { page: "/favicon.ico", visits: 42 },
+      { page: "/cdn-cgi/trace", visits: 230 }, { page: "/books/mises.pdf", visits: 141 }],
+    [{ status: 200, requests: 15200 }, { status: 404, requests: 1745 }, { status: 406, requests: 769 }],
+  );
+  check("non-content paths are summed", nonContent.pathRequests, 684 + 42 + 230);
+  check("...and content paths are left out", nonContent.paths.length, 3);
+  check("error responses are summed", nonContent.errorRequests, 1745 + 769);
+  check("...and 2xx responses are left out", nonContent.errorStatuses.length, 2);
+  for (const field of ["requests", "total", "nonContentRequests", "contentRequests"]) {
+    check(`the two components are never merged into a ${field} total`, field in nonContent, false);
+  }
+}
 
 if (failures) {
   console.error(`\n${failures} bot-classifier check(s) failed`);

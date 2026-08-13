@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS daily_zone_status (
   PRIMARY KEY (date, host, status)
 );
 
+-- Verified-crawler breakdown for zone-sourced hosts, from the
+-- verifiedBotCategory dimension. Cloudflare labels only the bots it
+-- cryptographically verifies, so these rows are a FLOOR on crawler volume, never
+-- a bot/human split: everything unverified lands in the single '(unverified)'
+-- row, which mixes real people with unverified and spoofing crawlers and cannot
+-- be separated further (botScore is plan-gated on this zone). Nothing derives a
+-- human count from this table.
+CREATE TABLE IF NOT EXISTS daily_zone_bots (
+  date     TEXT NOT NULL,
+  host     TEXT NOT NULL,
+  category TEXT NOT NULL,             -- e.g. 'AI Crawler', 'Archiver', or '(unverified)'
+  requests INTEGER NOT NULL DEFAULT 0,
+  visits   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, category)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,
@@ -99,3 +115,4 @@ CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host);
+CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host);

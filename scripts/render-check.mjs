@@ -100,8 +100,48 @@ const fixture = {
       cfPages: [{ page: "/robots.txt", visits: 684, views: 612 }, { page: "/books/mises.pdf", visits: 141, views: 120 }],
       zoneCountries: [{ country: "US", visits: 620 }, { country: "DE", visits: 190 }],
       zoneStatuses: [{ status: 200, requests: 15200 }, { status: 404, requests: 1745 }],
+      // Crawler accounting in place of a flood verdict, which cannot fire here.
+      // Two lenses that overlap, so the card renders both and adds neither.
+      zoneBots: {
+        categories: [
+          { category: "Archiver", requests: 936, visits: 60 },
+          { category: "Search Engine Crawler", requests: 867, visits: 55 },
+          { category: "AI Crawler", requests: 696, visits: 40 },
+        ],
+        verifiedRequests: 2499, verifiedVisits: 155,
+        unverifiedRequests: 17007, unverifiedVisits: 904,
+        totalRequests: 19506, totalVisits: 1059,
+        verifiedShare: 2499 / 19506, measured: true,
+      },
+      zoneNonContent: {
+        paths: [{ page: "/robots.txt", requests: 684 }],
+        pathRequests: 684,
+        errorStatuses: [{ status: 404, requests: 1745 }],
+        errorRequests: 1745,
+      },
       sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
       spark: [{ date: "2026-07-15", visits: 940, flood: false }, { date: "2026-07-16", visits: 1059, flood: false }],
+    },
+    // A second zone host on a pre-migration deployment: daily_zone_bots does not
+    // exist yet, so the verified lens has nothing in it. The card must still
+    // render, must not print a confident zero, and must still show the other lens.
+    {
+      host: "files.example", measurement: "zone", zoneSourced: true,
+      visits: 88, views: 940, bytes: 2_400_000_000,
+      previousVisits: 0, delta: null,
+      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
+      partialVisits: 0, partialDays: 0,
+      pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
+      searchSummary: null, gscWindow: null,
+      referrers: [], keywords: [], pages: [],
+      cfPages: [{ page: "/dl/handbook.epub", visits: 120, views: 20 }],
+      zoneCountries: [], zoneStatuses: [],
+      zoneBots: { categories: [], verifiedRequests: 0, verifiedVisits: 0,
+        unverifiedRequests: 0, unverifiedVisits: 0, totalRequests: 0, totalVisits: 0,
+        verifiedShare: 0, measured: false },
+      zoneNonContent: { paths: [], pathRequests: 0, errorStatuses: [], errorRequests: 0 },
+      sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
+      spark: [{ date: "2026-07-15", visits: 80, flood: false }, { date: "2026-07-16", visits: 88, flood: false }],
     },
   ],
 };
@@ -128,6 +168,19 @@ const required = [
   "1.4 pages / session · RUM only",
   "19,506 requests · 1,059 zone visits · 71.4 GB",
   "Counted from zone HTTP request logs (no RUM tag on this site).",
+  // Zone crawler accounting: two lenses, both rendered, neither summed, and no
+  // human count claimed for a host where crawler share is unmeasurable.
+  "Verified crawlers (a floor)",
+  "&ge;&nbsp;2,499 requests", "&ge;&nbsp;155 zone visits",
+  "Archiver <b>936</b> req · 60 vis",
+  "not included and cannot be measured on this plan",
+  "Non-content requests (a separate lens)",
+  "Crawler-protocol and asset paths", "<b>684 requests</b>",
+  "Error responses (status &ge; 400): <b>1,745 requests</b>",
+  "The two lenses overlap and must not be added.",
+  "This card reports no human count for library.example",
+  // The pre-migration card renders without inventing a zero.
+  "Verified-crawler figures appear after the next daily pull.",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
@@ -145,6 +198,32 @@ if (html.indexOf("Zone-log measurement") > zoneCardAt) {
 const zoneBlock = html.slice(zoneCardAt, html.indexOf("</main>", zoneCardAt));
 if (zoneBlock.includes("human sessions")) {
   throw new Error("A zone-sourced card must never label its numbers as human sessions");
+}
+// ...nor invent one under any other name. The verified-bot floor covers 12.8% of
+// this fixture's requests; the remaining 87.2% is readers and unlabelled crawlers
+// mixed together, and nothing on the card may present a slice of it as an audience.
+for (const claim of [/human (?:requests|visits|traffic)/i, /likely human/i, /estimated (?:human|crawler)/i]) {
+  if (claim.test(zoneBlock)) {
+    throw new Error(`A zone-sourced card must not assert a human figure: matched ${claim}`);
+  }
+}
+// Both lenses appear on the measured zone card, and the overlap warning appears
+// with them — a combined total would double-count a crawler that fetched robots.txt.
+const measuredCard = zoneBlock.slice(0, zoneBlock.indexOf("files.example"));
+for (const marker of ["Verified crawlers (a floor)", "Non-content requests (a separate lens)",
+  "must not be added"]) {
+  if (!measuredCard.includes(marker)) {
+    throw new Error(`Zone crawler accounting is missing from the card: ${marker}`);
+  }
+}
+// The pre-migration card renders, and reports the lens as unmeasured instead of
+// printing a floor of zero that would read as "no crawlers here".
+const preMigrationCard = zoneBlock.slice(zoneBlock.indexOf("files.example"));
+if (!preMigrationCard.includes("Verified-crawler figures appear after the next daily pull.")) {
+  throw new Error("A zone card with no daily_zone_bots rows must say so, not render a zero floor");
+}
+if (/&ge;&nbsp;0 requests/.test(preMigrationCard)) {
+  throw new Error("A zone card with no verified-bot data must not render a zero floor");
 }
 
 // Footer prose is interpolated from the classifier's own constants. Computed

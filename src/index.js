@@ -1,7 +1,8 @@
 import { SITES } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
-import { classifyTraffic, floodReason, floodDates, splitDay } from "./bots.js";
+import { classifyTraffic, floodReason, floodDates, splitDay,
+  crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
 import { isOpportunity } from "./opportunities.js";
 import { renderDashboard } from "./render.js";
 
@@ -66,6 +67,14 @@ async function ensureSchema(env) {
       requests INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (date, host, status)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host)`),
+    // Verified-crawler categories for zone-sourced hosts. A floor on crawler
+    // volume, not a bot/human split — see summarizeVerifiedBots in bots.js.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_zone_bots (
+      date TEXT NOT NULL, host TEXT NOT NULL, category TEXT NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, category)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host)`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -96,7 +105,8 @@ async function runDaily(env, now = new Date()) {
     try {
       const z = await pullZoneTraffic(env, site.zoneTag, site.host, since, until);
       traffic.set(site.host, { views: z.requests, visits: z.visits, referrers: new Map(), pages: new Map() });
-      zoneExtra.set(site.host, { bytes: z.bytes, paths: z.paths, countries: z.countries, statuses: z.statuses });
+      zoneExtra.set(site.host, { bytes: z.bytes, paths: z.paths, countries: z.countries,
+        statuses: z.statuses, bots: z.bots });
     } catch (e) {
       notes.push(`zone traffic ${site.host}: ${e.message}`.slice(0, 140));
     }
@@ -115,6 +125,7 @@ async function runDaily(env, now = new Date()) {
       env.DB.prepare(`DELETE FROM daily_cf_pages WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_zone_countries WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_zone_status WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_zone_bots WHERE date=? AND host=?`).bind(date, host),
     );
     // Keep enough rows for accurate source-mix totals; the dashboard still
     // renders only the top eight referrers per domain.
@@ -145,6 +156,15 @@ async function runDaily(env, now = new Date()) {
         stmts.push(
           env.DB.prepare(`INSERT INTO daily_zone_status (date,host,status,requests) VALUES (?,?,?,?)`)
             .bind(date, host, st.status, st.requests),
+        );
+      }
+      // Verified-crawler categories, including the "(unverified)" remainder,
+      // which is stored rather than dropped so the card can show what share of
+      // the day the floor does not cover.
+      for (const b of zx.bots ?? []) {
+        stmts.push(
+          env.DB.prepare(`INSERT INTO daily_zone_bots (date,host,category,requests,visits) VALUES (?,?,?,?,?)`)
+            .bind(date, host, b.category, b.requests, b.visits),
         );
       }
       continue;
@@ -324,6 +344,8 @@ async function loadDashboard(env, options = {}) {
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
         measurement: measurementOf(s),
+        zoneBots: measurementOf(s) === "zone" ? summarizeVerifiedBots([]) : null,
+        zoneNonContent: measurementOf(s) === "zone" ? summarizeNonContent([], []) : null,
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
@@ -353,7 +375,13 @@ async function loadDashboard(env, options = {}) {
   const zoneStatusQuery = env.DB.prepare(
     `SELECT host,status,requests FROM daily_zone_status WHERE date=? ORDER BY requests DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, hist, histRefs, run] = await Promise.all([
+  // Verified crawlers per category. Same schema tolerance as the queries above:
+  // the table arrives with ensureSchema on the next run, and until then the
+  // dashboard renders without it rather than 500ing.
+  const zoneBotsQuery = env.DB.prepare(
+    `SELECT host,category,requests,visits FROM daily_zone_bots WHERE date=? ORDER BY requests DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, zoneBots, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -366,6 +394,7 @@ async function loadDashboard(env, options = {}) {
     cfPagesQuery,
     zoneCountriesQuery,
     zoneStatusQuery,
+    zoneBotsQuery,
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
@@ -446,6 +475,15 @@ async function loadDashboard(env, options = {}) {
       .map((c) => ({ country: c.country, visits: Number(c.visits || 0) }));
     const zoneStatusRows = byHost(zoneStatuses, s.host).slice(0, 8)
       .map((st) => ({ status: st.status, requests: Number(st.requests || 0) }));
+    // Zone hosts get a crawler decomposition instead of a flood verdict: the
+    // flood classifier structurally cannot fire on them (no referrer rows means
+    // directShare is always 0), so without this their crawler volume would be
+    // counted as an audience by implication. Two independent lenses, both
+    // latest-day so they describe the same window, and deliberately never
+    // combined into one figure — see bots.js.
+    const zoneRoute = crawlerAccounting({ measurement: measurementOf(s) }) === "zone";
+    const zoneBotRows = zoneRoute ? byHost(zoneBots, s.host) : [];
+    const latestCfPageRows = zoneRoute ? byHost(cfPages, s.host).filter((r) => r.date === date) : [];
     // Pageviews survive only from clean days, so the rate must divide by clean
     // sessions too; using the full session count would understate every flooded
     // site's pages/session.
@@ -486,6 +524,9 @@ async function loadDashboard(env, options = {}) {
       bytes, zoneCountries: zoneCountryRows, zoneStatuses: zoneStatusRows,
       zoneSourced: measurementOf(s) === "zone",
       measurement: measurementOf(s),
+      zoneBots: zoneRoute ? summarizeVerifiedBots(zoneBotRows) : null,
+      zoneNonContent: zoneRoute
+        ? summarizeNonContent(latestCfPageRows, byHost(zoneStatuses, s.host)) : null,
       opportunityCount: kwRows.filter(isOpportunity).length,
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
       // The sparkline plots what was measured, flooded days included, but marks

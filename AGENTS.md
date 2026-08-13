@@ -12,8 +12,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `runs`), not docs |
-| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1 and 3 implemented; the rest proposed) |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `runs`), not docs |
+| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1, 2 and 3 implemented; the rest proposed) |
 | What counts as a search "opportunity" | `src/opportunities.js` — one predicate, imported by both `index.js` and `render.js` |
 | Everything else | this file |
 
@@ -132,10 +132,39 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   volume flags it. Until the RUM/zone split landed, library.freecapitalists.org's raw crawler
   traffic flowed straight into "Human sessions", supplying 1,059 of 2,012 (52.6%) on 2026-08-13
   while its own top file was `/robots.txt` at 684 requests. Keep every session-shaped aggregate
-  RUM-only (see "Two measurement classes" above). Giving zone hosts their own crawler decomposition
-  is item 2 of `docs/actionability-spec.md` and is not done: **the zone card's own numbers still
-  include crawlers**, which is why the card says so in a header note and the strip says "request
-  counts, not comparable to RUM sessions".
+  RUM-only (see "Two measurement classes" above). `crawlerAccounting(site)` in `src/bots.js` is the
+  routing that replaces the missing verdict — see the next bullet for what it routes to.
+- **Verified bots are a FLOOR on crawler volume, never a bot/human split.** Zone hosts get two
+  independent lenses instead of a flood verdict, both on the zone card, and **the renderer is
+  required to say they must not be added** (they overlap: a verified crawler fetches `robots.txt`
+  too, and there is no stored `(path, status)` pair to measure the overlap with).
+  1. **Verified crawlers** — the `verifiedBotCategory` dimension on `httpRequestsAdaptiveGroups`,
+     pulled with both `count` and `sum { visits }` (the visits figure is what lets the card
+     decompose its own zone-visit headline), stored in `daily_zone_bots(date, host, category,
+     requests, visits)` and summarized by `summarizeVerifiedBots`. Cloudflare labels **only** the
+     bots it cryptographically verifies; everything else comes back with an empty category, which
+     we store under the explicit name `(unverified)` so a bucket meaning "not verified" can never
+     be read as one meaning "human". On library that bucket was 84.6% of a 21,929-request day
+     (verified: Archiver 936, Search Engine Crawler 867, AI Crawler 696, SEO 446, AI Search 405,
+     Page Preview 21, Monitoring 10, Accessibility 8 = 3,389, i.e. 15.4%).
+  2. **Non-content requests** — `/robots.txt`, `/favicon.ico`, `/sitemap*`, `/.well-known/*`,
+     `/cdn-cgi/*` from `daily_cf_pages`, plus every response `>= 400` from `daily_zone_status`
+     (`summarizeNonContent`). No new query; both components are returned separately and there is
+     deliberately **no combined total field**, because they overlap each other too.
+
+  **Do not re-run the bot-dimension spike** (done 2026-08-12 against zone
+  `066e5342a1531be2638029c2f1dde5f6`): `botScore` and `botScoreSrcName` are **plan-gated** —
+  `"zone … does not have access to the field 'botscore'"`, `code: "authz"`, no workaround — and
+  `clientRequestUserAgent` is **not a valid dimension** on this dataset (`unknown field`). Nothing
+  can separate the unverified bucket on this plan, so **never derive a human count for a zone host**:
+  do not subtract the floor and call the remainder human, do not interpolate, do not add the two
+  lenses. `summarizeVerifiedBots` intentionally exposes no `human*` field and `bots-check.mjs`
+  asserts that; the card says outright that the remainder cannot be characterized.
+- **Two dimensions in one zone query are legal.** The one-dimension-per-call convention at
+  `src/cloudflare.js:73-79` is a 5,000-row-cap workaround for high-cardinality combinations, not an
+  API ceiling. The same spike confirmed `{ clientRequestPath, edgeResponseStatus }` filtered
+  `edgeResponseStatus_geq: 400` returns 1,376 rows on this zone without approaching the cap. Pair
+  dimensions only where a filter keeps the product that small.
 - **Footer prose is interpolated, not retyped.** The flood thresholds and the opportunity
   thresholds in `render.js`'s footer come from the exported constants in `src/bots.js`
   (`FLOOD_MIN_VISITS`, `FLOOD_MULTIPLE`, `FLAT_PAGES_PER_SESSION`, `DIRECT_SHARE`) and

@@ -111,3 +111,116 @@ export function floodDates(classified, host) {
   if (!days) return new Set();
   return new Set([...days.values()].filter((day) => day.flood).map((day) => day.date));
 }
+
+// ---- Zone-sourced hosts: the same problem, a different instrument ---------
+//
+// Everything above runs on RUM sessions and cannot fire on a zone-sourced host
+// at all. `classifyTraffic` derives `directShare` from daily_referrers rows, and
+// the zone log carries no referer dimension, so a zone host writes none: direct
+// is always 0, `signature` is always false, and no volume whatever can flag the
+// day. Left there, every crawler fetch of /robots.txt would flow into the page
+// as a human arrival by implication. `crawlerAccounting` is the routing that
+// stops that, and the two summaries below are what a zone host gets instead of
+// a flood verdict.
+//
+// Neither of them ever produces a human figure, and there is no field here from
+// which one could be subtracted out. That is deliberate — see summarizeVerifiedBots.
+export function crawlerAccounting(site) {
+  return site?.measurement === "zone" || site?.zoneSourced ? "zone" : "flood";
+}
+
+// Cloudflare labels the empty verifiedBotCategory nothing at all; we name it, so
+// that a bucket meaning "not verified" can never be read as a bucket meaning
+// "human".
+export const UNVERIFIED_CATEGORY = "(unverified)";
+
+// Requests that are never a person reading something: crawler protocol files,
+// browser-automatic asset fetches, and Cloudflare's own endpoints.
+export const NON_CONTENT_PATTERNS = [
+  /^\/robots\.txt$/i,
+  /^\/favicon\.ico$/i,
+  /^\/sitemap[^/]*$/i,
+  /^\/\.well-known(\/|$)/i,
+  /^\/cdn-cgi(\/|$)/i,
+];
+
+export const isNonContentPath = (path) =>
+  NON_CONTENT_PATTERNS.some((re) => re.test(String(path || "")));
+
+// Lens 1: verified crawlers, from the verifiedBotCategory dimension on
+// httpRequestsAdaptiveGroups.
+//
+// This is a FLOOR on crawler volume and nothing else. Cloudflare only labels the
+// bots it cryptographically verifies (reverse-DNS or HTTP message signatures);
+// everything it did not verify comes back with an empty category, and that bucket
+// is people and unverified or spoofing crawlers mixed together. On
+// library.freecapitalists.org it is 84.6% of requests. The dimensions that would
+// separate it — botScore, botScoreSrcName — are plan-gated on this zone (spike
+// 2026-08-12: "zone ... does not have access to the field 'botscore'", code
+// "authz"), and clientRequestUserAgent is not a dimension on this dataset at all.
+//
+// So: no `human` field, no `likelyHuman`, no remainder anyone can subtract into
+// one. The unverified bucket is reported under its own name and left uncharacterized.
+export function summarizeVerifiedBots(rows) {
+  const categories = [];
+  let verifiedRequests = 0, verifiedVisits = 0, unverifiedRequests = 0, unverifiedVisits = 0;
+  for (const row of rows ?? []) {
+    const requests = Number(row.requests || 0);
+    const visits = Number(row.visits || 0);
+    if (!row.category || row.category === UNVERIFIED_CATEGORY) {
+      unverifiedRequests += requests;
+      unverifiedVisits += visits;
+      continue;
+    }
+    categories.push({ category: row.category, requests, visits });
+    verifiedRequests += requests;
+    verifiedVisits += visits;
+  }
+  categories.sort((a, b) => b.requests - a.requests);
+  const totalRequests = verifiedRequests + unverifiedRequests;
+  return {
+    categories, verifiedRequests, verifiedVisits, unverifiedRequests, unverifiedVisits,
+    totalRequests, totalVisits: verifiedVisits + unverifiedVisits,
+    verifiedShare: totalRequests ? verifiedRequests / totalRequests : 0,
+    // False before the first pull that wrote daily_zone_bots. The card renders
+    // the other lens and says so, rather than printing a confident 0.
+    measured: (rows?.length ?? 0) > 0,
+  };
+}
+
+// Lens 2: non-content requests, derived from tables that already exist —
+// daily_cf_pages for paths, daily_zone_status for response codes. No new query.
+//
+// The two components are returned separately and there is no combined total,
+// because they overlap each other (a 404 on /favicon.ico is in both) and the
+// (path, status) pair needed to measure that overlap is not stored anywhere.
+// This lens also overlaps lens 1 — a verified crawler fetches robots.txt too —
+// which is why the renderer is required to say the figures must not be added.
+export function summarizeNonContent(pageRows, statusRows) {
+  const paths = [];
+  let pathRequests = 0;
+  for (const row of pageRows ?? []) {
+    if (!isNonContentPath(row.page)) continue;
+    // Zone-sourced daily_cf_pages rows carry requests in `visits` (see the
+    // insert in runDaily); the column names follow the RUM path, the meaning
+    // does not.
+    const requests = Number(row.visits || 0);
+    paths.push({ page: row.page, requests });
+    pathRequests += requests;
+  }
+  paths.sort((a, b) => b.requests - a.requests);
+
+  const errorStatuses = [];
+  let errorRequests = 0;
+  for (const row of statusRows ?? []) {
+    if (Number(row.status) < 400) continue;
+    const requests = Number(row.requests || 0);
+    errorStatuses.push({ status: Number(row.status), requests });
+    errorRequests += requests;
+  }
+  errorStatuses.sort((a, b) => b.requests - a.requests);
+
+  // Only the top 50 paths and top 8 statuses are persisted per day, so both
+  // components are themselves floors over what was recorded.
+  return { paths, pathRequests, errorStatuses, errorRequests };
+}

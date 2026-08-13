@@ -1,4 +1,5 @@
 import { CF_ACCOUNTS, HOST_ALIASES, EXCLUDE_PATHS, classifyReferrer } from "./config.js";
+import { UNVERIFIED_CATEGORY } from "./bots.js";
 
 const GQL = "https://api.cloudflare.com/client/v4/graphql";
 
@@ -77,6 +78,12 @@ export async function pullTraffic(env, startISO, endISO) {
 // same failure mode gsc.js's querySearchSummary comment warns about for
 // Search Console's ranked rows. A day's total, split three single-dimension
 // ways, never approached the cap in testing (max ~3700 rows, for path).
+//
+// It is a row-cap convention, not an API ceiling: a two-dimension call is legal
+// and works. `{ clientRequestPath, edgeResponseStatus }` filtered to
+// edgeResponseStatus_geq: 400 returned 1,376 rows on this zone without
+// approaching the cap (spike 2026-08-12). Pair dimensions only where a filter
+// keeps the product small like that.
 function zoneQuery(dimension) {
   return `query ZoneTraffic($zoneTag: String!, $start: String!, $end: String!, $host: String!) {
   viewer {
@@ -118,13 +125,14 @@ async function runZoneQuery(env, dimension, zoneTag, host, startISO, endISO) {
 // no HTML wrapper for the RUM script to load from). Free-plan limit: this
 // dataset accepts at most a 1-day window per request, so callers must pass a
 // startISO/endISO span no wider than 24h.
-// Returns { visits, requests, bytes, paths, countries, statuses }.
+// Returns { visits, requests, bytes, paths, countries, statuses, bots }.
 export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
-  const [totalRows, pathRows, countryRows, statusRows] = await Promise.all([
+  const [totalRows, pathRows, countryRows, statusRows, botRows] = await Promise.all([
     runZoneQuery(env, null, zoneTag, host, startISO, endISO),
     runZoneQuery(env, "clientRequestPath", zoneTag, host, startISO, endISO),
     runZoneQuery(env, "clientCountryName", zoneTag, host, startISO, endISO),
     runZoneQuery(env, "edgeResponseStatus", zoneTag, host, startISO, endISO),
+    runZoneQuery(env, "verifiedBotCategory", zoneTag, host, startISO, endISO),
   ]);
 
   const totals = totalRows[0] ?? { count: 0, sum: { visits: 0, edgeResponseBytes: 0 } };
@@ -149,6 +157,20 @@ export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
     statuses.set(g.dimensions.edgeResponseStatus, (statuses.get(g.dimensions.edgeResponseStatus) ?? 0) + g.count);
   }
 
+  // Verified crawlers. Both count (requests) and visits are kept: the visits
+  // figure is what lets the card decompose its own headline zone-visit number
+  // rather than only its request total. The empty category is stored under an
+  // explicit "(unverified)" name, never dropped and never read as "human" — see
+  // summarizeVerifiedBots in bots.js for why that distinction is the whole point.
+  const bots = new Map();
+  for (const g of botRows) {
+    const category = g.dimensions.verifiedBotCategory || UNVERIFIED_CATEGORY;
+    const b = bots.get(category) ?? { requests: 0, visits: 0 };
+    b.requests += g.count;
+    b.visits += g.sum.visits;
+    bots.set(category, b);
+  }
+
   return {
     visits: totals.sum.visits,
     requests: totals.count,
@@ -161,6 +183,10 @@ export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
       .map(([country, v]) => ({ country, visits: v })),
     statuses: [...statuses.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
       .map(([status, requests]) => ({ status, requests })),
+    // Not sliced: this dimension has ~10 values, and truncating it would turn a
+    // floor into a smaller floor for no benefit.
+    bots: [...bots.entries()].sort((a, b) => b[1].requests - a[1].requests)
+      .map(([category, b]) => ({ category, requests: b.requests, visits: b.visits })),
   };
 }
 

@@ -41,6 +41,39 @@ const ZONE_DAYS = [
   { date: "2026-08-09", visits: 1059, requests: 19506, bytes: 76_658_000_000 },
 ];
 
+// The crawler accounting a zone host gets in place of a flood verdict, in the
+// real 2026-08-12 proportions: verified bots are a sixth of the day and the
+// unverified remainder — readers and unlabelled crawlers together — is the rest.
+const ZONE_BOTS = [
+  { date: "2026-08-09", host: ZONE_HOST, category: "(unverified)", requests: 16117, visits: 843 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "Archiver", requests: 936, visits: 60 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "Search Engine Crawler", requests: 867, visits: 55 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "AI Crawler", requests: 696, visits: 40 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "Search Engine Optimization", requests: 446, visits: 31 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "AI Search", requests: 405, visits: 25 },
+  { date: "2026-08-09", host: ZONE_HOST, category: "Page Preview", requests: 39, visits: 5 },
+];
+const VERIFIED_REQUESTS = 936 + 867 + 696 + 446 + 405 + 39;
+const VERIFIED_VISITS = 60 + 55 + 40 + 31 + 25 + 5;
+
+// Zone daily_cf_pages rows carry requests in `visits` (see runDaily's insert).
+const ZONE_PAGES = [
+  { date: "2026-08-08", host: ZONE_HOST, page: "/robots.txt", visits: 590, views: 0 },
+  { date: "2026-08-09", host: ZONE_HOST, page: "/robots.txt", visits: 684, views: 0 },
+  { date: "2026-08-09", host: ZONE_HOST, page: "/favicon.ico", visits: 42, views: 0 },
+  { date: "2026-08-09", host: ZONE_HOST, page: "/cdn-cgi/trace", visits: 230, views: 0 },
+  { date: "2026-08-09", host: ZONE_HOST, page: "/books/mises.pdf", visits: 141, views: 0 },
+];
+const ZONE_STATUSES = [
+  { date: "2026-08-09", host: ZONE_HOST, status: 200, requests: 15200 },
+  { date: "2026-08-09", host: ZONE_HOST, status: 404, requests: 1745 },
+  { date: "2026-08-09", host: ZONE_HOST, status: 406, requests: 769 },
+];
+
+// Flipped to false to reproduce a pre-migration deployment, where the read runs
+// before ensureSchema has created daily_zone_bots.
+let zoneBotsTableExists = true;
+
 const traffic = [
   ...DAYS.map((day) => ({
     date: day.date, host: HOST, visits: day.visits, views: Math.round(day.visits * day.pps),
@@ -69,6 +102,14 @@ const db = {
       if (sql.includes("FROM runs")) return { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
       if (sql.includes("daily_traffic")) return { results: between(traffic, binds) };
       if (sql.includes("daily_referrers")) return { results: between(referrers, binds) };
+      if (sql.includes("daily_cf_pages")) return { results: between(ZONE_PAGES, binds) };
+      if (sql.includes("daily_zone_status")) return { results: ZONE_STATUSES.filter((r) => r.date === binds[0]) };
+      if (sql.includes("daily_zone_bots")) {
+        // A missing table is what D1 raises before the migration lands; the read
+        // path has to survive it, not 500 the whole dashboard.
+        if (!zoneBotsTableExists) throw new Error("D1_ERROR: no such table: daily_zone_bots");
+        return { results: ZONE_BOTS.filter((r) => r.date === binds[0]) };
+      }
       return { results: [] };
     };
     const stmt = {
@@ -165,6 +206,61 @@ const load = async (query) => {
   // Sorting ranks within a measurement class, never across it: 19,506 requests
   // must not outrank a RUM site's sessions.
   check("zone cards sort after every RUM card", data.sites.at(-1).host, ZONE_HOST);
+}
+
+// 5. Zone crawler accounting. The flood classifier cannot fire on a zone host
+//    (no referrer rows, so directShare is always 0), so its crawler volume would
+//    otherwise be counted as an audience by implication. Two lenses replace the
+//    verdict, and neither may yield a human figure.
+{
+  const { data } = await load("period=1");
+  const zone = data.sites.find((s) => s.host === ZONE_HOST);
+  const rum = data.sites.find((s) => s.host === HOST);
+
+  check("the zone host is never flagged as flooded", zone.botDays, 0);
+  check("...and gets the zone decomposition instead of that silence",
+    zone.zoneBots !== null, true);
+  check("verified crawlers are summed as a floor", zone.zoneBots.verifiedRequests, VERIFIED_REQUESTS);
+  check("...in visits as well as requests", zone.zoneBots.verifiedVisits, VERIFIED_VISITS);
+  check("...a floor that is a minority of the day", zone.zoneBots.verifiedShare < .2, true);
+  check("the unverified remainder is kept and named", zone.zoneBots.unverifiedRequests, 16117);
+  check("...and excluded from the verified categories", zone.zoneBots.categories.length, 6);
+  check("...ranked by requests", zone.zoneBots.categories[0].category, "Archiver");
+  for (const field of ["human", "humanRequests", "likelyHuman"]) {
+    check(`no ${field} figure is asserted for a zone host`, field in zone.zoneBots, false);
+  }
+
+  check("non-content paths come from the latest day only",
+    zone.zoneNonContent.pathRequests, 684 + 42 + 230);
+  check("...leaving real files out of it", zone.zoneNonContent.paths.length, 3);
+  check("error responses are counted from the status table",
+    zone.zoneNonContent.errorRequests, 1745 + 769);
+  check("the two lenses are never merged into one total",
+    "requests" in zone.zoneNonContent, false);
+
+  check("RUM sites get no zone decomposition", rum.zoneBots, null);
+  check("...nor a non-content lens", rum.zoneNonContent, null);
+  // The headline stays what item 1 made it: zone volume never joins a session total.
+  check("crawler accounting does not disturb the RUM headline", data.totals.visits,
+    data.sites.filter((s) => !s.zoneSourced).reduce((sum, s) => sum + s.visits, 0));
+}
+
+// 6. Pre-migration: daily_zone_bots does not exist yet. The dashboard must still
+//    load, and the card must report the lens as unmeasured rather than printing a
+//    confident zero.
+{
+  zoneBotsTableExists = false;
+  try {
+    const { data } = await load("period=1");
+    const zone = data.sites.find((s) => s.host === ZONE_HOST);
+    check("a missing daily_zone_bots table still renders the dashboard", data.sites.length > 0, true);
+    check("...with the zone card intact", zone.visits, ZONE_DAYS.at(-1).visits);
+    check("...the verified lens marked unmeasured, not zero", zone.zoneBots.measured, false);
+    check("...claiming no verified crawlers either way", zone.zoneBots.verifiedRequests, 0);
+    check("...and the other lens still working", zone.zoneNonContent.pathRequests, 684 + 42 + 230);
+  } finally {
+    zoneBotsTableExists = true;
+  }
 }
 
 if (failures) {
