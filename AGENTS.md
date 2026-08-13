@@ -8,6 +8,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | --- | --- |
 | What this is / architecture / data flow | this file |
 | Commands | this file (`## Commands`) |
+| Signal rules, severities, thresholds | `src/signals.js` (one module, all rules) |
+| Planned work / why a thing is shaped this way | `docs/actionability-spec.md` |
 | Secrets / env | this file (`## Secrets`) |
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
@@ -44,7 +46,10 @@ npm run tail                    # live Worker logs (npx wrangler tail)
 `npm run check` covers syntax, the crawler classifier (`scripts/bots-check.mjs`, real Aug 2026
 traffic shapes — since a false positive deletes real traffic from the dashboard), the aggregation
 layer above it (`scripts/dashboard-check.mjs` drives `loadDashboard` against a stubbed D1, because
-that is where a flooded day used to erase a whole site card), and a render smoke test. Beyond that, verification is
+that is where a flooded day used to erase a whole site card, and where the signal rules are exercised
+end-to-end against the real 2026-08-13 fixtures), and a render smoke test.
+`node scripts/dashboard-check.mjs --signals` prints the signal list those fixtures produce, which is
+the fastest way to see what a rule change does. Beyond that, verification is
 end-to-end: hit `/run` and read the returned `{gscOk, totalVisits, humanVisits, botVisits, notes}`,
 or inspect the `runs` table in D1. `npm run dev` runs
 `wrangler dev` locally, but the data pulls need the real secrets and network.
@@ -58,7 +63,9 @@ The Worker has two entry points in `src/index.js`:
   2. `queryKeywords()` (`gsc.js`) → Google Search Console → top keywords (only if `GSC_SA_KEY` set).
   3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_keywords`), plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
-- **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
+- **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `computeSignals()` (`signals.js`) ranks what needs doing → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
+
+**The signal engine** (`src/signals.js`) is where every rule lives. `computeSignals` is a **pure function of rows `loadDashboard` has already read** — it queries nothing — which is what lets `runDaily` reuse it for the ntfy push instead of growing a second copy of the rules. When a rule needs more history, **widen an existing read rather than adding a query** (`daily_zone_status` was widened from latest-day to the history window for the `error-spike` baseline). Signals are `{ severity, kind, host, headline, evidence, action, href, recurrence }`, severity 1 = act today, 2 = look at it, 3 = context; the top three severity-1/2 signals render as "Today's actions" above the KPI tiles, and the top severity-1 signal is appended to the ntfy push. `recurrence` is populated only where the loaded history answers it exactly (today: consecutive flooded days behind `no-comparison`, in the 24h view) — nothing guesses it, because a wrong "3rd consecutive day" is worse than an absent one.
 
 **Two measurement classes, never mixed.** `loadDashboard` partitions `SITES` on
 `site.trafficSource` into `measurement: "rum"` and `measurement: "zone"` (the `measurementOf`
@@ -172,6 +179,24 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   imports, so changing a threshold and not the prose fails `npm run check`. The prose had already
   drifted once: it claimed flooded days were "excluded whole, from sessions, referrers, and landing
   pages alike" for as long as `splitDay` had been keeping the referred sessions.
+- **Signals respect measurement class, and the gate is not optional.** Session-delta and
+  pages-per-session rules run on **RUM sites only**. A zone-sourced host is measured in HTTP requests
+  out of the zone log, so "sessions rose 40%" or "pages/session fell by 2.1" about one is not a weak
+  signal, it is a different quantity wearing the same words — the live NOTABLE list led with exactly
+  that for library.freecapitalists.org. Zone hosts are eligible **only for zone-specific rules**;
+  today that is `error-spike`. The gate reads `site.measurement` / `site.zoneSourced`, never a
+  hostname. Adding a rule means deciding which class it belongs to first.
+- **Every ratio rule carries an absolute floor.** A percentage on a single-digit base is noise
+  dressed as signal (`whopaysforai.org ↑600%` was 6 sessions to 7). `DELTA_MIN_ABSOLUTE` in
+  `src/signals.js` is imported by `deltaBadge` in `src/render.js` so the per-card badge and the
+  signal list share one floor: below it the badge renders the raw change (`+13`) muted instead of a
+  percentage. `likely-bot-subflood` has its own, deliberately lower floor (≥ 50 sessions of change
+  **and** ≥ 100 resulting sessions, not the ≥ 100 absolute change the spec first proposed, which
+  would have missed the live wiki.freecapitalists.org spike it was written for at +97). The three
+  shape tests beside it — flat pages/session, ≥ 80% direct, one landing page taking ≥ 80% of
+  entrances — are what make a low volume floor safe there.
+- **`likely-bot-subflood` and `traffic-rise` are mutually exclusive by construction.** A spike is
+  either growth or a crawler; reporting it as both is how the reader learns to ignore the list.
 - **GSC lags ~2 days.** `runDaily` requests the window `date-4 … date-2`, so keyword data is
   never truly "last 24h". The dashboard labels this.
 - **`runDaily` only deletes keyword rows inside the `if (env.GSC_SA_KEY)` block** — so a run with

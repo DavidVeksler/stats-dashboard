@@ -1,6 +1,7 @@
 # Spec: make the dashboard actionable
 
-Status: **items 1, 2 and 3 implemented** (`bd7e14d`, `b774260`, 2026-08-12); everything else proposed.
+Status: **items 1, 2, 3, 4 and 5 implemented** (`bd7e14d`, `b774260`, `ce541c1`, `e28f6ba`, 2026-08-12;
+items 4 and 5 2026-08-13); everything else proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -208,7 +209,48 @@ constants, computed rather than typed.
 
 # P1. Turn observations into decisions
 
-## 4. Replace NOTABLE with a ranked signal engine
+## 4. Replace NOTABLE with a ranked signal engine — IMPLEMENTED
+
+> Landed as `src/signals.js` (all rules), `src/urls.js` (the malformed-URL predicate), a widened
+> `daily_zone_status` read in `loadDashboard`, an absolute-change floor on `deltaBadge`, and signal
+> coverage in `dashboard-check.mjs`. **Four things this section originally said were wrong against
+> live data, and the rule table below has been rewritten to match what shipped:**
+>
+> 1. **The `likely-bot-subflood` volume floor was too high to catch the case it was written for.**
+>    "absolute change ≥ 100" would have missed the live wiki.freecapitalists.org spike — 151 sessions
+>    up from about 54, an absolute change of +97. The floor shipped as **absolute change ≥ 50 AND
+>    resulting sessions ≥ 100**. The other three tests (pages/session ≤ `FLAT_PAGES_PER_SESSION`,
+>    direct share ≥ 0.8, top landing page ≥ 80% of entrances) are unchanged and are what make a low
+>    volume floor safe: a real 100-session day is not simultaneously flat, ~all direct, and ~all
+>    landing on one URL.
+> 2. **The rule table said nothing about measurement class, and it had to.** The live NOTABLE list
+>    led with "library.freecapitalists.org pages/session fell by 2.1", which is not a weak signal but
+>    a category error — library is zone-sourced, so its "pages/session" is requests per zone-log
+>    visit. Session-delta and pages-per-session rules now run on **RUM sites only**; zone-sourced
+>    hosts are eligible **only for zone-specific rules**, today just `error-spike`. The gate reads
+>    `site.measurement` / `site.zoneSourced` from item 1, never a hostname.
+> 3. **`snippet-gap` could not be built.** It depends on item 7's snippet-vs-rank split, which does
+>    not exist. What shipped is a single generic `search-opportunity` rule driven by the existing
+>    shared `isOpportunity` predicate; item 7 replaces it with two rules whose remedies differ.
+> 4. **`malformed-urls` needed item 10's predicate, which did not exist.** Only the predicate was
+>    built — `looksMalformed` in the new `src/urls.js`, tested against the two live
+>    davidveksler.freecapitalists.org paths. Item 10's per-row badging is untouched.
+>
+> Two implementation notes the section did not anticipate:
+>
+> - **Unmeasured days are absent from the `error-spike` baseline, not zero.** A day with traffic but
+>   no `daily_zone_status` row was not measured (the table arrived with a later migration, or that
+>   night's pull failed); counting it as a 0% error day drags the mean down and manufactures a spike
+>   out of an ordinary day. The first fixture run did exactly this, reporting a 0.3% baseline where
+>   the measured days averaged 1.1%.
+> - **`runDaily` gets its ntfy finding by calling `loadDashboard`**, not by re-deriving anything.
+>   That is the whole reason `computeSignals` is a pure function of already-loaded rows: one copy of
+>   the rules, the same discipline item 3 established for the opportunity predicate. `sendNtfy`
+>   appends the top **severity-1** signal only, so a quiet day's push is byte-for-byte what it was.
+>
+> The old standalone pages/session anomaly is gone with NOTABLE and was not replaced: the rule table
+> has no such rule. The measurement-class gate is written as a general guard rather than a
+> per-rule check, so it applies to whatever is added next.
 
 **Symptom.** "Notable" reports deltas without diagnosis or priority. On 2026-08-13 the top chip is
 `wiki.freecapitalists.org sessions rose 178%`, which reads as good news. The same page shows what it
@@ -228,20 +270,34 @@ Signal shape:
 
 `severity` 1 = act today, 2 = look at it, 3 = context. `evidence` is the numbers that justify the
 call. `action` is an imperative sentence. `href` deep-links to the relevant card anchor, GSC query,
-or Cloudflare view. `recurrence` counts consecutive prior days the same `(kind, host)` fired,
-recomputed over the history window.
+or Cloudflare view. `recurrence` counts consecutive prior days the same `(kind, host)` fired.
 
-Rules to implement, in priority order:
+**`recurrence` is populated only where the loaded history answers it exactly**, and is `null`
+otherwise. Today that is one rule: `no-comparison` in the 24h view, where a flooded day is precisely
+a day whose delta was suppressed, so "flooded N days running" and "this fired N days running" are the
+same statement. Item 11 owns real recurrence for the rest; nothing guesses it, because a wrong "3rd
+consecutive day" is worse than an absent one.
 
-| kind | condition | severity | action text |
-| --- | --- | --- | --- |
-| `error-spike` | zone 4xx or 5xx share exceeds its 14-day mean by ≥ 2× or ≥ 5 points | 1 | "Check the top failing paths below" |
-| `likely-bot-subflood` | sessions delta ≥ +100% **and** absolute change ≥ 100 **and** pages/session ≤ `FLAT_PAGES_PER_SESSION` **and** direct share ≥ 0.8 **and** top landing page ≥ 80% of entries | 1 | "Treat as crawler, not growth. Consider lowering the flood floor for this host" |
-| `malformed-urls` | ≥ 3 landing pages match the malformed-URL predicate (item 9) | 2 | "Broken links generating junk URLs, redirect or noindex" |
-| `snippet-gap` | site has ≥ 1 severity-weighted snippet opportunity (item 7) | 2 | "Rewrite title and meta description on N pages" |
-| `traffic-drop` | sessions delta ≤ -25% **and** absolute change ≥ 25 **and** not partial | 2 | "Compare referrers against yesterday" |
-| `traffic-rise` | sessions delta ≥ +25% **and** absolute change ≥ 25 **and** not `likely-bot-subflood` | 3 | "Check which referrer drove it" |
-| `no-comparison` | delta suppressed because either side was partial | 3 | "Flooded day, no like-for-like comparison available" |
+**Measurement class gates every rule.** Session-delta and pages-per-session rules are RUM-only;
+zone-sourced hosts are eligible only for the zone column below. This is not a matter of confidence —
+a zone host's "sessions" and "pages/session" are different quantities wearing the same words.
+
+Rules as implemented, in priority order:
+
+| kind | class | condition | severity | action text |
+| --- | --- | --- | --- | --- |
+| `error-spike` | zone | responses ≥ 400 as a share of requests exceeds its 14-day mean by ≥ 2× **or** ≥ 5 points, with ≥ 3 measured baseline days, ≥ 50 error responses, and ≥ 2% share today | 1 | "Check the top failing paths below and fix or redirect them" |
+| `likely-bot-subflood` | RUM | sessions delta ≥ +100% **and** absolute change ≥ 50 **and** resulting sessions ≥ 100 **and** pages/session ≤ `FLAT_PAGES_PER_SESSION` **and** direct share ≥ 0.8 **and** top landing page ≥ 80% of entrances | 1 | "Treat as crawler traffic, not growth, and consider lowering the flood floor for this host" |
+| `malformed-urls` | RUM | ≥ 3 landing pages match `looksMalformed` (`src/urls.js`) | 2 | "Fix the broken links generating these, then redirect or noindex the junk URLs" |
+| `search-opportunity` | RUM | site has ≥ 1 query matching the shared `isOpportunity` predicate | 2 | "Open the search panel and rewrite the titles and meta descriptions for those pages" |
+| `traffic-drop` | RUM | sessions delta ≤ -25% **and** absolute change ≥ 25 **and** not partial | 2 | "Compare the referrer list against the previous period to find what stopped" |
+| `traffic-rise` | RUM | sessions delta ≥ +25% **and** absolute change ≥ 25 **and** not `likely-bot-subflood` | 3 | "Check which referrer drove it before counting it as growth" |
+| `no-comparison` | RUM | delta suppressed because either side was partial | 3 | "Read the figure as a floor, and wait for a clean day before judging the trend" |
+
+`search-opportunity` is the placeholder for `snippet-gap`: one generic rule, because telling the
+reader to rewrite a title and description is only correct for a page that already ranks, and the
+snippet-vs-rank split that distinguishes the two remedies is item 7. **Item 7 replaces this rule with
+two.**
 
 Two rules that matter more than the table:
 
@@ -250,15 +306,32 @@ Two rules that matter more than the table:
   **per-card delta badge does not** (`src/render.js:242`, `deltaBadge` at `:10-18`), which is why
   `whopaysforai.org ↑600%` (6 sessions to 7) renders with the same visual weight as a real move.
   Add a minimum-absolute-change gate to `deltaBadge` itself; below it, render the delta muted or as
-  `±<n>` rather than a percentage.
+  `±<n>` rather than a percentage. Shipped as `DELTA_MIN_ABSOLUTE` in `src/signals.js`, imported by
+  `render.js` so the badge and the session-delta rules share one floor by construction: the page
+  shows a percentage exactly when a percentage could mean something.
 - **Say when you are silent.** Today a flooded site drops out of NOTABLE without a word because
   `site.delta` is `null` (`src/index.js:458`). The `no-comparison` signal makes that visible.
 
-**Acceptance.** A `render-check` fixture reproducing the 2026-08-13 wiki shape produces exactly one
-severity-1 `likely-bot-subflood` signal for that host and **no** `traffic-rise` signal. A fixture
-with a 6-to-7 session site produces no signal and no percentage badge.
+**Acceptance** (met against the 2026-08-13 fixtures in `dashboard-check.mjs`).
+wiki.freecapitalists.org — 151 sessions, +180%, 1.0 pages/session, 90% direct, `/wiki/Main_Page` at
+89% of entrances — produces exactly one severity-1 `likely-bot-subflood` signal and no
+`traffic-rise`; the two are mutually exclusive by construction.
+library.freecapitalists.org produces no session-delta or pages-per-session signal and fires
+`error-spike` on 2,514 responses ≥ 400 (12.9% of requests) against a 1.1% four-day mean.
+davidveksler.com (40 sessions from 27, +48%, +13) produces no signal and renders `+13` muted rather
+than a percentage. forum-style fully flooded hosts produce `no-comparison` instead of vanishing.
 
-## 5. "Today's actions" block
+## 5. "Today's actions" block — IMPLEMENTED
+
+> Landed as `actionsBlock` in `src/render.js`, rendered first inside `<main>` above the KPI tiles,
+> with `.action` styling and `render-check.mjs` coverage. The `<h2>` id doubles as nothing — the
+> deep links use `cardAnchor(host)`, exported from `src/signals.js` and used by `siteCard` to build
+> the card id, so a signal href can never point at an anchor no card carries. The check asserts that.
+>
+> Severity-3 signals are deliberately excluded from the block, not merely ranked below: a "no
+> like-for-like comparison" note taking one of three slots would displace a real finding. With only
+> severity-3 signals the block reads "Nothing needs attention today", which is accurate — there is
+> context on the cards, and nothing to do.
 
 **Change.** Above the KPI tiles, render the top 3 severity-1/2 signals as a short list: headline,
 one line of evidence, one imperative action, one link. If there are none, render
@@ -382,8 +455,10 @@ host, status, requests)` and `daily_cf_pages(date, host, page, visits, views)`. 
 - Split TOP FILES into `Content` and `Assets and crawler noise` using `isNonContentPath` from
   `src/bots.js` (shipped in item 2 — do not write a second predicate) so real file demand is visible
   instead of being crowded out by `robots.txt`.
-- Feed the `error-spike` signal from item 4 off `daily_zone_status` history, which already stores a
-  row per day and therefore already supports a 14-day baseline with no ingest work.
+- ~~Feed the `error-spike` signal from item 4 off `daily_zone_status` history~~ — **done in item 4.**
+  `loadDashboard`'s `daily_zone_status` read was widened from latest-day to the history window and
+  the baseline is built from the days that actually carry status rows (an unmeasured day is absent,
+  not zero). Nothing further is needed here; the per-path detail below is what remains.
 
 **Note on scope.** `daily_zone_status` exists only for zone-sourced hosts, so this gives error
 visibility for library only. The 11 RUM sites have no per-day status data at all. Adding it for them
@@ -396,11 +471,16 @@ error visibility proves valuable on library.
 `/category/austrian-economics/%3E%C3%97%3C/span%3E8%3C/span%3E` and seven siblings. These are real
 crawl and index pollution from broken pagination markup, presented as ordinary rows.
 
-**Change.** Add a `looksMalformed(path)` predicate to `src/render.js` (or a small shared util):
-percent-encoded angle brackets, an embedded `/span` or other tag fragment, doubled slashes, or a
-percent-encoded sequence decoding to markup. Badge matching rows, and emit the `malformed-urls`
-signal from item 4 with the count and the suggested remedy. Deterministic, cheap, and it turns a row
-nobody reads into a cleanup ticket.
+**Change.** ~~Add a `looksMalformed(path)` predicate~~ — **the predicate shipped with item 4**, as
+`src/urls.js`: percent-encoded angle brackets, a tag fragment beside a bracket, a bare `/span`-style
+segment, doubled slashes, and percent sequences that decode to markup or cannot be decoded at all.
+It is deliberately biased to false negatives — `/img`, `/p`, `/a`, `/em` and `/scripts` are real path
+segments somewhere and are never matched on their own — because a false positive would badge a real
+page. Do not write a second predicate.
+
+What remains for this item is the rendering: **badge the matching rows** in the landing-page lists so
+the reader can see which ones they are. The `malformed-urls` signal already fires with the count and
+the remedy. Deterministic, cheap, and it turns a row nobody reads into a cleanup ticket.
 
 ---
 
@@ -414,8 +494,10 @@ fleet built around routines acting on data, the dashboard stops exactly where a 
 start.
 
 **Change.** Compute signals (item 4) over each of the last N days in the already-loaded history and
-set `recurrence` to the count of consecutive prior days the same `(kind, host)` fired. Render as
-`3rd consecutive day` on the chip. Escalate severity by one level at `recurrence >= 3`, since a
+set `recurrence` to the count of consecutive prior days the same `(kind, host)` fired. The field and
+its rendering slot already exist (`N days running` on the action row, asserted in `render-check.mjs`)
+and `no-comparison` already populates it exactly; every other rule returns `null` rather than a
+guess, so this item is filling in a wired-up hole rather than adding one. Escalate severity by one level at `recurrence >= 3`, since a
 repeating signal that nobody has acted on is more urgent than a fresh one, not less.
 
 If read-side recomputation proves slow, persist instead: `daily_signals(date, host, kind, severity,
@@ -443,9 +525,9 @@ the returned JSON. Remember the WAF blocks non-browser user agents on this host.
 
 # Suggested order
 
-1. Items 1, 2, 3. Headline numbers stop being wrong. Each is independently shippable.
-2. Items 4, 5. The signal engine and the actions block, which is where the actionability actually
-   arrives.
+1. ~~Items 1, 2, 3.~~ Done. Headline numbers stop being wrong.
+2. ~~Items 4, 5.~~ Done. The signal engine and the actions block, which is where the actionability
+   actually arrives.
 3. Items 6, 7, 8. Panels and metrics become judgeable.
 4. Items 9, 10. Buried data surfaces. Item 9 is the only one needing a schema change.
 5. Item 11. Recurrence.

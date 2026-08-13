@@ -17,8 +17,47 @@ const fixture = {
   periodDays: 7,
   domain: null,
   sort: "traffic",
-  allDomains: ["example.com", "davidveksler.freecapitalists.org", "library.example"],
-  anomalies: [{ type: "up", host: "example.com", metric: "sessions", value: .31 }],
+  allDomains: ["example.com", "davidveksler.freecapitalists.org", "davidveksler.com", "library.example"],
+  // Ranked signals replace the old NOTABLE chips. Severity 1 and 2 are what the
+  // "Today's actions" block renders, at most three of them; severity 3 is context
+  // and must stay out of it.
+  signals: [
+    {
+      severity: 1, kind: "likely-bot-subflood", host: "wiki.example",
+      headline: "wiki.example is up 180%, and it looks like a crawler rather than growth",
+      evidence: "151 sessions (was 54), 90% direct, 1.0 pages/session, 89% of entrances on /wiki/Main_Page.",
+      action: "Treat as crawler traffic, not growth, and consider lowering the flood floor for this host.",
+      href: "#site-wiki-example", recurrence: null,
+    },
+    {
+      severity: 1, kind: "error-spike", host: "library.example",
+      headline: "library.example error responses are 12.9% of requests",
+      evidence: "2,514 responses ≥ 400 out of 19,506 requests, against a 4-day mean of 1.1%.",
+      action: "Check the top failing paths below and fix or redirect them.",
+      href: "#site-library-example", recurrence: null,
+    },
+    {
+      severity: 2, kind: "malformed-urls", host: "davidveksler.freecapitalists.org",
+      headline: "davidveksler.freecapitalists.org is serving 8 malformed URLs",
+      evidence: "8 landing pages contain encoded markup or tag fragments, e.g. /category/austrian-economics/%3E%C3%97%3C/span%3E8%3C/span%3E.",
+      action: "Fix the broken links generating these, then redirect or noindex the junk URLs.",
+      href: "#site-davidveksler-freecapitalists-org", recurrence: null,
+    },
+    {
+      severity: 2, kind: "search-opportunity", host: "example.com",
+      headline: "example.com has 4 search queries ranking without clicks",
+      evidence: "4 queries are on page one or two with a CTR near zero.",
+      action: "Open the search panel and rewrite the titles and meta descriptions for those pages.",
+      href: "#site-example-com", recurrence: null,
+    },
+    {
+      severity: 3, kind: "no-comparison", host: "flooded.example",
+      headline: "flooded.example has no like-for-like comparison",
+      evidence: "17 sessions is a floor: this period contains a crawler-flooded day whose direct bucket is not separable.",
+      action: "Read the figure as a floor, and wait for a clean day before judging the trend.",
+      href: "#site-flooded-example", recurrence: 2,
+    },
+  ],
   // Headline totals are RUM-only: the zone site's 1,059 zone visits and 19,506
   // requests are in totals.zone and nowhere else. Summed the old way these tiles
   // would read 2,359 sessions over 21,276 "pageviews" — 9.0 pages/session, an
@@ -69,6 +108,34 @@ const fixture = {
       searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
       gscWindow: null, referrers: [], keywords: [], pages: [], cfPages: [],
       spark: [{ date: "2026-07-15", visits: 25 }, { date: "2026-07-16", visits: 30 }],
+    },
+    // The sub-flood shape: 151 sessions from 54, flat, almost all direct, almost
+    // all on one URL. Under FLOOD_MIN_VISITS, so the flood classifier is right
+    // not to fire; the card looks like growth and the signal says otherwise.
+    {
+      host: "wiki.example", visits: 151, views: 151, previousVisits: 54, delta: 97 / 54,
+      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
+      partialVisits: 0, partialDays: 0, previousPartialDays: 0,
+      pagesPerSession: 1, previousPagesPerSession: 1.4, pagesPerSessionDelta: -.4,
+      searchSummary: null, gscWindow: null,
+      referrers: [{ referrer: "(direct)", kind: "direct", visits: 136 }],
+      keywords: [], pages: [],
+      cfPages: [{ page: "/wiki/Main_Page", visits: 134, views: 134 },
+        { page: "/sitemap.xml.gz", visits: 10, views: 10 }],
+      spark: [{ date: "2026-07-15", visits: 54 }, { date: "2026-07-16", visits: 151 }],
+    },
+    // A real but tiny move: 40 sessions from 27 is +48%, and 13 sessions. The
+    // percentage is arithmetically true and editorially worthless, so the badge
+    // shows the raw change instead. This is the whopaysforai.org "↑600%" case
+    // (6 sessions to 7) that taught the eye to ignore the badge entirely.
+    {
+      host: "davidveksler.com", visits: 40, views: 82, previousVisits: 27, delta: 13 / 27,
+      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
+      partialVisits: 0, partialDays: 0, previousPartialDays: 0,
+      pagesPerSession: 2.05, previousPagesPerSession: 2, pagesPerSessionDelta: .05,
+      searchSummary: null, gscWindow: null,
+      referrers: [], keywords: [], pages: [], cfPages: [],
+      spark: [{ date: "2026-07-15", visits: 27 }, { date: "2026-07-16", visits: 40 }],
     },
     // The freecapitalists.org case: every day in view was flooded, so there is no
     // clean day at all. The card must still show the referred sessions it did
@@ -149,7 +216,16 @@ const fixture = {
 const html = renderDashboard(fixture);
 const required = [
   "Human sessions", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
-  "aria-label=\"Notable changes\"", "high impression opportunity", "Last successful pull",
+  "high impression opportunity", "Last successful pull",
+  // "Today's actions": the top three severity-1/2 signals, each with headline,
+  // evidence, an imperative action, and a link.
+  "Today's actions", "Act today", "Look at it",
+  "wiki.example is up 180%, and it looks like a crawler rather than growth",
+  "89% of entrances on /wiki/Main_Page",
+  "Treat as crawler traffic, not growth",
+  "Open wiki.example &rarr;", `href="#site-wiki-example"`,
+  "library.example error responses are 12.9% of requests",
+  "davidveksler.freecapitalists.org is serving 8 malformed URLs",
   "Google clicks", "Search impressions", "Traffic sources", "Avg search position",
   "min-height:44px", "Use \" + target + \" color theme",
   "if (matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
@@ -186,6 +262,89 @@ for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
 }
 if (html.includes("Total visitors")) throw new Error("Legacy visitor terminology remains in the rendered dashboard");
+
+// ---- "Today's actions" (spec item 5) --------------------------------------
+// The block is the first thing in <main>, above the KPI tiles: it is the answer
+// to "what do I do", and the tiles are the answer to "what happened".
+const actionsAt = html.indexOf(`class="actions"`);
+if (actionsAt < 0 || actionsAt > html.indexOf(`class="totals"`)) {
+  throw new Error("Today's actions must render above the KPI tiles");
+}
+const actionsBlockHtml = html.slice(actionsAt, html.indexOf("</section>", actionsAt));
+// At most three, and only severity 1 and 2. Severity 3 is context for the card,
+// not an instruction — a "no like-for-like comparison" note must not displace a
+// real finding from a three-slot list.
+if ((actionsBlockHtml.match(/<li class="action /g) || []).length !== 3) {
+  throw new Error("Today's actions must render exactly the top three severity-1/2 signals");
+}
+if (actionsBlockHtml.includes("no like-for-like comparison")) {
+  throw new Error("A severity-3 signal must not appear in Today's actions");
+}
+if (actionsBlockHtml.includes("example.com has 4 search queries")) {
+  throw new Error("Today's actions is capped at three; the fourth signal leaked in");
+}
+// Every rendered action carries all four parts. A headline with no action is the
+// old NOTABLE list with better typography.
+for (const part of ["action-head", "action-why", "action-do"]) {
+  if (!actionsBlockHtml.includes(part)) {
+    throw new Error(`An action row is missing its ${part}`);
+  }
+}
+// Links must land on anchors the page actually renders.
+for (const anchor of actionsBlockHtml.match(/href="#site-[a-z0-9-]+"/g) || []) {
+  const id = anchor.slice(7, -1);
+  if (!html.includes(`id="${id}"`)) {
+    throw new Error(`Today's actions links at #${id}, which no card carries`);
+  }
+}
+
+// Recurrence renders when the engine can populate it honestly, and is silent
+// otherwise — spec item 11 owns filling it in for the remaining rules, and this
+// keeps the slot it lands in wired up.
+const repeatHtml = renderDashboard({
+  ...fixture,
+  signals: fixture.signals.map((s, i) => (i === 0 ? { ...s, recurrence: 3 } : s)),
+});
+if (!repeatHtml.includes("3 days running")) {
+  throw new Error("A signal carrying a recurrence must render it");
+}
+if (html.includes("days running")) {
+  throw new Error("A signal with recurrence null must render no recurrence text");
+}
+
+// With no signals at all the block still renders, and says so. An empty
+// container is indistinguishable from the block failing to render.
+const quietHtml = renderDashboard({ ...fixture, signals: [] });
+if (!quietHtml.includes("Nothing needs attention today.")) {
+  throw new Error("With no signals the actions block must say so, not render empty");
+}
+if (quietHtml.includes(`<li class="action `)) {
+  throw new Error("An empty signal list must not render action rows");
+}
+// ...and with only severity-3 signals, which are context rather than instructions.
+const contextOnlyHtml = renderDashboard({ ...fixture, signals: fixture.signals.filter((s) => s.severity === 3) });
+if (!contextOnlyHtml.includes("Nothing needs attention today.")) {
+  throw new Error("Severity-3-only signals must still read as nothing to act on");
+}
+
+// ---- Absolute-change floor on the delta badge (spec item 4) ---------------
+// 40 sessions from 27 is +48%, an absolute change of 13. The percentage is real
+// and the movement is not, so the badge shows the raw change, muted.
+const smallCardAt = html.indexOf(`id="site-davidveksler-com"`);
+if (smallCardAt < 0) throw new Error("The small-change fixture card did not render");
+const smallCard = html.slice(smallCardAt, html.indexOf("</section>", smallCardAt));
+if (!/class="delta small"/.test(smallCard) || !smallCard.includes("+13")) {
+  throw new Error("A change below the absolute floor must render as ±n, muted");
+}
+if (/class="delta up"[^>]*>↑ 48%/.test(smallCard) || smallCard.includes("↑ 48%<")) {
+  throw new Error("A change below the absolute floor must not render as a percentage");
+}
+// ...while a real move keeps its percentage, in the same badge, at full weight.
+const bigCardAt = html.indexOf(`id="site-example-com"`);
+const bigCard = html.slice(bigCardAt, html.indexOf("</section>", bigCardAt));
+if (!bigCard.includes(`class="delta up">↑ 38%`)) {
+  throw new Error("A change above the absolute floor must still render as a percentage");
+}
 
 // Zone cards live below the "Zone-log measurement" heading, never above it and
 // never interleaved with the RUM grid. Anchored on the card markup, not the

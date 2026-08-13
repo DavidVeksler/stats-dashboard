@@ -4,6 +4,7 @@ import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from ".
 import { classifyTraffic, floodReason, floodDates, splitDay,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
 import { isOpportunity } from "./opportunities.js";
+import { computeSignals } from "./signals.js";
 import { renderDashboard } from "./render.js";
 
 // Which instrumentation a site's numbers come from. RUM sites carry the Web
@@ -259,9 +260,19 @@ async function runDaily(env, now = new Date()) {
   //    so the daily phone alert reports the human audience rather than whatever a
   //    crawler happened to do that night.
   const summary = await summarizeToday(env, date).catch(() => null);
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts);
+  // The push carries the finding, not only the volumes. The signal engine runs
+  // read-side over what was just written rather than being re-derived here: one
+  // copy of the rules, exactly as spec item 3 established for the opportunity
+  // predicate. Quiet-success discipline is preserved — only a severity-1 signal
+  // ("act today") is worth waking a phone for, and with none the push is
+  // byte-for-byte what it was before.
+  const dashboard = await loadDashboard(env).catch(() => null);
+  const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal);
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
-    botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts], notes };
+    botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
+    topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
+    notes };
 }
 
 // Re-read the last 30 days and split today into human vs crawler traffic.
@@ -290,7 +301,7 @@ async function summarizeToday(env, date) {
   return { humanVisits, botVisits, perHost, flooded };
 }
 
-async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set()) {
+async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null) {
   if (!env.NTFY_TOPIC) return;
   const ranked = summary
     ? [...summary.perHost.entries()].sort((a, b) => b[1] - a[1])
@@ -306,7 +317,10 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
     : gscFailedHosts.size
       ? `\n⚠ no search data: ${[...gscFailedHosts].join(", ")}`.slice(0, 300)
       : `\n⚠ keywords: ${notes[0] || "skipped"}`;
-  const body = `${headline}\n${top}${crawlers}${gscWarn}`;
+  // Only severity 1 ("act today") is added. Nothing else changes about the push,
+  // so a quiet day still reads exactly as it did before the signal engine existed.
+  const finding = topSignal ? `\n\n❗ ${topSignal.headline}\n→ ${topSignal.action}` : "";
+  const body = `${headline}\n${top}${crawlers}${gscWarn}${finding}`;
   try {
     await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
       method: "POST",
@@ -327,7 +341,7 @@ async function loadDashboard(env, options = {}) {
   const date = latest?.d;
   if (!date) {
     return { date: null, coverageStart: null, generatedAt: new Date().toISOString(), dataUpdatedAt: null, run: null,
-      periodDays, domain, sort, allDomains: SITES.map((site) => site.host), anomalies: [],
+      periodDays, domain, sort, allDomains: SITES.map((site) => site.host), signals: [],
       totals: { visits: 0, views: 0, pagesPerSession: 0, search: 0,
         domains: selectedSites.length, active: 0,
         rumDomains: selectedSites.filter((s) => measurementOf(s) === "rum").length,
@@ -341,6 +355,7 @@ async function loadDashboard(env, options = {}) {
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         partialVisits: 0, partialDays: 0,
+        previousPartialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
         measurement: measurementOf(s),
@@ -367,14 +382,19 @@ async function loadDashboard(env, options = {}) {
   const cfPagesQuery = env.DB.prepare(
     `SELECT date,host,page,visits,views FROM daily_cf_pages WHERE date BETWEEN ? AND ?`
   ).bind(start, date).all().catch(() => ({ results: [] }));
-  // Zone-sourced hosts only: country and status-code breakdowns, latest day only
-  // (same "latest snapshot, not trended" treatment as keywords/pages above).
+  // Zone-sourced hosts only: country breakdown, latest day only (same "latest
+  // snapshot, not trended" treatment as keywords/pages above).
   const zoneCountriesQuery = env.DB.prepare(
     `SELECT host,country,visits FROM daily_zone_countries WHERE date=? ORDER BY visits DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
+  // Status codes are read over the whole history window, not just the latest day:
+  // daily_zone_status has always stored a row per day, and the `error-spike`
+  // signal needs a 14-day baseline to say whether today's 4xx share is a spike or
+  // just what this host looks like. Widening an existing read beats adding a
+  // query. The card still renders the latest day only.
   const zoneStatusQuery = env.DB.prepare(
-    `SELECT host,status,requests FROM daily_zone_status WHERE date=? ORDER BY requests DESC`
-  ).bind(date).all().catch(() => ({ results: [] }));
+    `SELECT date,host,status,requests FROM daily_zone_status WHERE date BETWEEN ? AND ? ORDER BY date ASC, requests DESC`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
   // Verified crawlers per category. Same schema tolerance as the queries above:
   // the table arrives with ensureSchema on the next run, and until then the
   // dashboard renders without it rather than 500ing.
@@ -473,7 +493,10 @@ async function loadDashboard(env, options = {}) {
     const bytes = byHost(tr, s.host).reduce((sum, row) => sum + Number(row.bytes || 0), 0);
     const zoneCountryRows = byHost(zoneCountries, s.host).slice(0, 10)
       .map((c) => ({ country: c.country, visits: Number(c.visits || 0) }));
-    const zoneStatusRows = byHost(zoneStatuses, s.host).slice(0, 8)
+    // The card is a latest-day snapshot; the trailing days in this read exist for
+    // the error-spike baseline in src/signals.js and are filtered out here.
+    const latestZoneStatusRows = byHost(zoneStatuses, s.host).filter((st) => st.date === date);
+    const zoneStatusRows = latestZoneStatusRows.slice(0, 8)
       .map((st) => ({ status: st.status, requests: Number(st.requests || 0) }));
     // Zone hosts get a crawler decomposition instead of a flood verdict: the
     // flood classifier structurally cannot fire on them (no referrer rows means
@@ -501,6 +524,10 @@ async function loadDashboard(env, options = {}) {
       // Sessions recovered from flooded days: real, but a floor rather than a
       // count, because the direct bucket those days is unusable.
       partialVisits: t.partialVisits, partialDays: t.partialDays,
+      // Carried so the `no-comparison` signal can name which side of the
+      // comparison was partial, rather than lumping a flooded previous period in
+      // with a site that simply has no history yet.
+      previousPartialDays: previous.partialDays,
       previousVisits: previous.visits,
       previousBotVisits: previous.botVisits,
       cleanDays: t.cleanDays,
@@ -526,7 +553,7 @@ async function loadDashboard(env, options = {}) {
       measurement: measurementOf(s),
       zoneBots: zoneRoute ? summarizeVerifiedBots(zoneBotRows) : null,
       zoneNonContent: zoneRoute
-        ? summarizeNonContent(latestCfPageRows, byHost(zoneStatuses, s.host)) : null,
+        ? summarizeNonContent(latestCfPageRows, latestZoneStatusRows) : null,
       opportunityCount: kwRows.filter(isOpportunity).length,
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
       // The sparkline plots what was measured, flooded days included, but marks
@@ -603,21 +630,22 @@ async function loadDashboard(env, options = {}) {
   totals.gscPosition = totals.gscImpressions ? searchSites.reduce((sum, site) =>
     sum + site.searchSummary.position * site.searchSummary.impressions, 0) / totals.gscImpressions : 0;
 
-  const anomalies = sites.flatMap((site) => {
-    const items = [];
-    if (site.delta !== null && Math.abs(site.delta) >= 0.25 && site.visits >= 10) {
-      items.push({ type: site.delta > 0 ? "up" : "down", host: site.host, metric: "sessions", value: site.delta });
-    }
-    if (site.pagesPerSessionDelta !== null && Math.abs(site.pagesPerSessionDelta) >= 0.4 && site.visits >= 10) {
-      items.push({ type: site.pagesPerSessionDelta > 0 ? "up" : "down", host: site.host,
-        metric: "pages/session", value: site.pagesPerSessionDelta });
-    }
-    return items;
-  }).sort((a, b) => Math.abs(b.value) - Math.abs(a.value)).slice(0, 4);
+  // Ranked signals replace the old NOTABLE list, which reported bare deltas with
+  // no diagnosis, no priority, and no idea what it was measuring — its top chip
+  // on 2026-08-13 was a pages/session change for a zone-sourced host, a quantity
+  // that does not exist. The engine is a pure function of rows already read here
+  // (the classifier window reaches back 30 days), so runDaily can reuse it for the
+  // ntfy push without a second copy of the rules.
+  const signals = computeSignals({
+    sites, date, periodDays,
+    zoneStatusRows: zoneStatuses.results ?? [],
+    trafficRows: hist.results ?? [],
+    floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
+  });
 
   return { date, start, coverageStart: availableDates[0] || date, previousStart, previousEnd, generatedAt: new Date().toISOString(),
     dataUpdatedAt: run?.run_at || `${date}T00:00:00Z`, run, periodDays, domain, sort,
-    allDomains: SITES.map((site) => site.host), anomalies, totals, sites };
+    allDomains: SITES.map((site) => site.host), signals, totals, sites };
 }
 
 // Internal, WAF-gated dashboard: tell compliant crawlers and AI agents to stay
