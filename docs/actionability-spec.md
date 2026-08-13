@@ -1,6 +1,7 @@
 # Spec: make the dashboard actionable
 
-Status: proposed, not implemented. Written 2026-08-12 against the live page and `master` @ `6a07946`.
+Status: **items 1 and 3 implemented** (`bd7e14d`, 2026-08-12); everything else proposed.
+Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
 acceptance test. Read `AGENTS.md` first for the data flow and the crawler-flood rules; where this
@@ -48,7 +49,17 @@ so explicitly rather than presenting an uncontextualized figure.
 
 # P0. Correctness of headline numbers
 
-## 1. Separate measurement classes: RUM sessions vs zone requests
+## 1. Separate measurement classes: RUM sessions vs zone requests — IMPLEMENTED (`bd7e14d`)
+
+> Landed as specified, plus one thing the spec did not anticipate: `sourceMix` had to become
+> RUM-only in the same commit rather than waiting for item 6. The mix bar's segment widths are
+> `value / totals.visits`, so once `totals.visits` dropped to RUM-only while the zone host still
+> contributed its 1,059 sessions to the `other` residual, the residual segment rendered wider than
+> 100% of the bar. Item 6's remaining work — renaming the residual to `Unattributed`, moving it out
+> of the bar, and writing self-referrals as `kind: "internal"` — is untouched.
+> `site.measurement` (`"rum" | "zone"`) is the field that was added; `site.zoneSourced` stays as the
+> same fact in boolean form, since the renderer and the check scripts already read it.
+
 
 **Symptom.** The library card sits first in a traffic-sorted grid, styled identically to RUM cards,
 using the word "sessions", with a value (1,059) that is Cloudflare's zone-log visit heuristic over
@@ -115,7 +126,13 @@ item 2), so library's crawler volume is silently counted as human.
 to the zone decomposition and never returned as `flood: false, human: <all visits>` by implication.
 The library card shows a crawler or non-content figure, or an explicit "crawler share unknown".
 
-## 3. Unify the opportunity predicate and fix the doc drift
+## 3. Unify the opportunity predicate and fix the doc drift — IMPLEMENTED (`1497cab`, `bd7e14d`)
+
+> The NUL-byte chore landed first in `1497cab`; the predicate extraction and the footer prose in
+> `bd7e14d`. The predicate moved verbatim into `src/opportunities.js` — item 7 still owns replacing
+> it with the snippet/rank split. One correction to this section's wording: `isOpportunity` accepts
+> either a raw D1 row or the renderer's shaped row (which carries a precomputed `ctr`) and derives
+> CTR itself, because the two call sites were passing different row shapes.
 
 Three small correctness chores that block later items.
 
