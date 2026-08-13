@@ -571,7 +571,60 @@ impressions, position 2.5) is not flagged for the same reason; and every rendere
 >    specified but every consumer filters straight back down to `date`. At ~25 keyword rows per site
 >    per day that is a few thousand rows read per dashboard load for no current benefit. Left as
 >    specified because item 11's recurrence work will want them, but if that item is dropped, narrow
->    these two back to the latest day.
+>    these two back to the latest day. **Narrowed in the follow-up below** — item 11 has not been
+>    built, and the cost stopped being theoretical.
+>
+> ### Follow-up (2026-08-13): the comparator was drawn from 1.1% of the corpus
+>
+> Correction 2 above made both sides of the CTR comparator come from the same rows, which was the
+> right fix and left a second problem standing: **those rows were a sliver.** At a stored-keyword cap
+> of 25, the estate held 119 query rows covering **647 of 58,832 impressions — 1.1%**. 51 of 258
+> clicks came from that 1.1%; the ~58,185 impressions nobody stored earned roughly 207 clicks at about
+> 0.36%. The tile said `thin sample` and meant it. A comparator that is honest and useless is still
+> useless, so three things landed together — raising one alone would have been pointless or expensive:
+>
+> 1. **The cap is a named constant and it is 500.** `KEYWORD_ROW_LIMIT` in `src/gsc.js` is both the
+>    `rowLimit` sent to Search Console and, because whatever GSC returns is what `runDaily` stores,
+>    the stored slice. One constant, because it is one decision. Google accepts 25,000, so the request
+>    side was never the constraint; storage is. **The ceiling no cap can cross:** Search Console omits
+>    anonymized queries from the query dimension entirely, so measured coverage will plateau somewhere
+>    below the corpus no matter what this number is. Tune it from the measured `gscSampleShare` after
+>    a live pull, and if the flag stops rendering, that is the intended outcome —
+>    `THIN_SAMPLE_SHARE` was never the thing that needed changing.
+> 2. **`daily_keywords` and `daily_pages` are read for the latest date only** (note 4's own advice).
+>    30 days × 12 sites × 500 would be up to 180,000 rows on every dashboard load, all of them
+>    filtered back down to `date` by every consumer. `daily_search_summary` stays wide; the trend has
+>    no other source. `dashboard-check.mjs` now asserts the bind width of all three, so a re-widening
+>    cannot land silently. **If item 11 wants per-query history, price it first**: recurrence over 14
+>    days is roughly 84,000 keyword rows a load, and it should read a narrow projection
+>    (`host, date, query`) or a table pre-aggregated for the purpose, not whole rows.
+> 3. **The night's writes are chunked.** One `env.DB.batch()` of ~300 statements became ~6,300, so
+>    `batchInChunks` cuts the stream into groups of `D1_MAX_BATCH_STATEMENTS` (100) awaited **in
+>    order**. Ordering is the entire safety argument: idempotency is DELETE-then-INSERT per
+>    (table, host), and at 500 rows a site those now land in different chunks. New
+>    `scripts/write-check.mjs` drives `runDaily` against stubbed D1/Cloudflare/GSC and asserts the
+>    ordering, the chunk sizes, that a delete/insert pair really straddles a boundary, and that the
+>    keyword DELETEs stay inside the `if (env.GSC_SA_KEY)` guard.
+>
+> Three things this follow-up found that the reasoning above did not anticipate:
+>
+> - **The median-position tile changes meaning, and should.** It used to be the median of each site's
+>   25 best queries; it is now the median of everything stored above `POSITION_MIN_IMPRESSIONS`, which
+>   the deep tail drags upward. That is the estate's real median rather than a flattering one, and the
+>   impression floor is what keeps the 1-impression tail out of it. `dashboard-check.mjs` fixtures 485
+>   tail queries and asserts both halves: the 440 one-impression rows stay out, the 45 that clear the
+>   floor come in and move the median.
+> - **The opportunity classes absorb the tail without growing.** 485 new candidates admit zero new
+>   opportunities — 440 fail `OPPORTUNITY_MIN_IMPRESSIONS`, 45 sit past `RANK_MAX_POSITION` — which is
+>   what `MIN_ACTIONABLE_CLICKS` and the position horizon were for. Asserted, not assumed.
+> - **Per-site query counts are no longer uniform.** A small site stores 40 rows and a forum stores
+>   500, so any copy or logic assuming a fixed 25 is now wrong. The card list stays capped at 12.
+>
+> **Row growth is reported, not acted on.** `daily_keywords` goes from about 110k rows a year to about
+> 2.2M — a few hundred MB against D1's 10 GB limit, so years of headroom. There is no pruning anywhere
+> in this codebase and none was added: deleting stored history is irreversible and is David's call. A
+> recommendation, if one is wanted later: keep every row for 90 days, then keep one snapshot a week
+> beyond that, implemented as a dated, reversible-by-re-pull job rather than a nightly delete.
 >
 > Also shipped: the traffic tiles' 14-day means (sessions, pageviews, search sessions), computed
 > through the same `splitDay` human/crawler split the cards use so the baseline and the figure are
@@ -701,6 +754,11 @@ schema change, and D1 retains everything already (there is no pruning anywhere i
   block, no percentage delta badge on a site below the absolute-change floor.
 - `scripts/bots-check.mjs`: add the zone-host routing case from item 2. Keep the existing real
   Aug-2026 traffic shapes untouched, since a false positive deletes real traffic from the dashboard.
+- `scripts/write-check.mjs` (added with item 8's follow-up): drives `runDaily` against a stubbed D1,
+  Cloudflare and Search Console. It is the only check that exercises the **write** path, and it is
+  what makes the chunked batch safe to change — statement ordering across chunk boundaries, chunk
+  sizes, the request-side row limit, and the `if (env.GSC_SA_KEY)` guard on the keyword DELETEs.
+  `--verbose` prints the shape of a night's write.
 
 Beyond the check scripts, verification stays end-to-end per `AGENTS.md`: deploy, hit `/run`, read
 the returned JSON. Remember the WAF blocks non-browser user agents on this host.

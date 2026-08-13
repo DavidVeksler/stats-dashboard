@@ -1,6 +1,6 @@
 import { SITES } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
-import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
+import { getAccessToken, queryKeywords, queryPages, querySearchSummary, KEYWORD_ROW_LIMIT } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
@@ -19,6 +19,40 @@ const COMPARATOR_DAYS = 14;
 // the "Two measurement classes" gotcha in AGENTS.md). Derived from config so no
 // aggregate has to know a hostname.
 const measurementOf = (site) => (site.trafficSource === "zone" ? "zone" : "rum");
+
+// How many prepared statements go into one `env.DB.batch()` call.
+//
+// The night's writes used to be one batch. At 25 keyword rows per site that was
+// roughly 300 statements; at KEYWORD_ROW_LIMIT (500) it is closer to 7,000 bound
+// statements in a single call, which is well past the size any D1 batch should be
+// asked to carry. So the stream is cut into chunks and the chunks are awaited
+// **in order**.
+//
+// ORDER IS THE WHOLE CONTRACT HERE. Idempotency in `runDaily` is DELETE-then-
+// INSERT per (table, host) for the snapshot date, and the statements are appended
+// in that order; executing the chunks sequentially is what keeps a DELETE ahead of
+// its INSERTs even when the two land in different chunks. Never run these
+// concurrently (`Promise.all` over the chunks would be a silent data-loss bug),
+// and never reorder or sort `stmts`.
+//
+// What chunking costs: a batch is a transaction, so a run that dies midway now
+// leaves the night partially written instead of not written at all. That is
+// recoverable and self-healing — every affected (table, host) is deleted and
+// rewritten wholesale by the next run, and `/run` can be triggered by hand — and
+// it is the cheaper failure than a batch that is refused outright.
+export const D1_MAX_BATCH_STATEMENTS = 100;
+
+// Execute prepared statements in order, in safely sized batches. Returns the
+// number of batches issued, which is what the write check asserts against.
+export async function batchInChunks(db, stmts, size = D1_MAX_BATCH_STATEMENTS) {
+  let batches = 0;
+  for (let i = 0; i < stmts.length; i += size) {
+    // Sequential on purpose. See the ordering note above.
+    await db.batch(stmts.slice(i, i + size));
+    batches += 1;
+  }
+  return batches;
+}
 
 const utcDate = (d) => d.toISOString().slice(0, 10);
 function addDays(dateStr, n) {
@@ -201,12 +235,18 @@ async function runDaily(env, now = new Date()) {
       const gscWindow = `${gStart}–${gEnd}`;
       for (const { host, gsc, gscPageFilter } of SITES) {
         if (!gsc) continue; // no Search Console property for this host (e.g. a zone-sourced file host)
+        // These three DELETEs are pushed BEFORE the INSERTs that follow them and
+        // must stay that way: the write is chunked (see batchInChunks), and
+        // sequential in-order execution is the only thing keeping a DELETE ahead
+        // of its INSERTs once a site's ~500 keyword rows straddle a chunk
+        // boundary. They also stay inside this `if (env.GSC_SA_KEY)` block, so a
+        // run with no GSC key refreshes traffic without wiping keyword history.
         stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
         let rows = [], pages = [], summary = null;
         try {
-          rows = await queryKeywords(token, gsc, gStart, gEnd, 25, gscPageFilter);
+          rows = await queryKeywords(token, gsc, gStart, gEnd, KEYWORD_ROW_LIMIT, gscPageFilter);
         } catch (e) {
           notes.push(`gsc queries ${host}: ${e.message}`.slice(0, 140));
           gscFailedHosts.add(host);
@@ -253,7 +293,9 @@ async function runDaily(env, now = new Date()) {
     notes.push("GSC_SA_KEY not set — keywords skipped");
   }
 
-  await env.DB.batch(stmts);
+  // One ordered stream, several batches. Not one batch: a night's writes now run
+  // to roughly 7,000 statements, most of them keyword rows.
+  await batchInChunks(env.DB, stmts);
 
   // 3. Record the run
   const totalVisits = [...traffic.values()].reduce((a, r) => a + r.visits, 0);
@@ -387,22 +429,31 @@ async function loadDashboard(env, options = {}) {
   // looks like, and it has to reach back over the comparison period too — a
   // flooded "previous period" would otherwise poison every delta on the page.
   const historyStart = [previousStart, addDays(date, -29)].sort()[0];
-  // The three Search Console reads cover the history window rather than the
-  // latest day, which is what gives the search tiles a comparator instead of a
-  // bare number. All three tables have always stored one row per snapshot day, so
-  // this is purely read-side. The panels still render the latest day only — every
-  // consumer below filters on `r.date === date` — and the trailing rows exist for
-  // the trend.
+  // THE THREE SEARCH CONSOLE READS ARE DELIBERATELY NOT THE SAME WIDTH.
   //
-  // ROLLING WINDOW, NOT A DAILY SERIES. These rows are keyed by the date the
-  // snapshot was taken, not by the period they measure: runDaily asks GSC for
-  // `date-4 .. date-2`, so consecutive rows overlap by two days out of three and
-  // a day-over-day difference between them is not a like-for-like change. Only
-  // trailing averages are computed from them, and any date a human reads comes
-  // from `gsc_window`, never from `date`.
+  // `daily_search_summary` spans the history window, because the search tiles'
+  // comparator is built from its trailing rows and there is no other source for
+  // it. `daily_keywords` and `daily_pages` are read for the LATEST DAY ONLY:
+  // spec item 8 widened all three, but every consumer of those two filters
+  // straight back down to `date`, so the trailing rows were read and thrown away.
+  // That was a few thousand wasted rows a page load at 25 keywords per site; at
+  // KEYWORD_ROW_LIMIT (500) it would be up to 30 days x 12 sites x 500 = 180,000
+  // rows on every dashboard load, for nothing.
+  //
+  // If spec item 11 (recurrence) ever needs per-query or per-page history, widen
+  // them back — and price it first: recurrence over 14 days is ~84,000 keyword
+  // rows a load, and it should read a narrower projection (host, date, query) or a
+  // pre-aggregated table rather than the whole row.
+  //
+  // Whatever the width, these rows are a ROLLING WINDOW, NOT A DAILY SERIES: they
+  // are keyed by the date the snapshot was taken, not by the period they measure.
+  // runDaily asks GSC for `date-4 .. date-2`, so consecutive rows overlap by two
+  // days out of three and a day-over-day difference between them is not a
+  // like-for-like change. Only trailing averages are computed from them, and any
+  // date a human reads comes from `gsc_window`, never from `date`.
   const pagesQuery = env.DB.prepare(
-    `SELECT date,host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date BETWEEN ? AND ? ORDER BY clicks DESC, impressions DESC`
-  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
+    `SELECT date,host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date=? ORDER BY clicks DESC, impressions DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
   const searchSummaryQuery = env.DB.prepare(
     `SELECT date,host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date BETWEEN ? AND ?`
   ).bind(historyStart, date).all().catch(() => ({ results: [] }));
@@ -438,7 +489,10 @@ async function loadDashboard(env, options = {}) {
       `SELECT date,host,referrer,kind,SUM(visits) AS visits FROM daily_referrers
        WHERE date BETWEEN ? AND ? GROUP BY date,host,referrer,kind`
     ).bind(start, date).all(),
-    env.DB.prepare(`SELECT date,host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date BETWEEN ? AND ? ORDER BY clicks DESC, impressions DESC`).bind(historyStart, date).all(),
+    // Latest snapshot only — see the read-width note above. At 500 rows per site
+    // the history window would be up to 180,000 rows every page load, and every
+    // consumer of this read filters back down to `date` anyway.
+    env.DB.prepare(`SELECT date,host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
     searchSummaryQuery,
     cfPagesQuery,
@@ -512,8 +566,10 @@ async function loadDashboard(env, options = {}) {
     const days = classified.get(s.host);
     const t = sumTraffic(byHost(tr, s.host), days);
     const previous = sumTraffic(byHost(previousTr, s.host), days);
-    // The GSC reads now span the history window for the trend below; the panels
-    // are still a latest-snapshot view, so they filter back down to `date`.
+    // Latest-snapshot views. The keyword and page reads are already narrowed to
+    // `date` in SQL (see the read-width note); the filter stays as a cheap
+    // belt-and-braces so a future widening of either read cannot silently turn
+    // these panels into a sum over the window.
     const kwRows = byHost(kws, s.host).filter((r) => r.date === date);
     const pageRows = byHost(pages, s.host).filter((r) => r.date === date);
     // Both opportunity classes, each ranked by its own metric, over every stored
@@ -710,8 +766,10 @@ async function loadDashboard(env, options = {}) {
   // rendered with a "~" and one decimal and never as a target.
   //
   // TRAP — BOTH SIDES OF A COMPARATOR MUST COME FROM THE SAME ROWS. `expectedCtr`
-  // needs a per-query position, and the only per-query rows stored are GSC's top
-  // ~25 per site: a small, much better positioned sample. `totals.gscCtr` is the
+  // needs a per-query position, and the only per-query rows stored are the top
+  // KEYWORD_ROW_LIMIT queries GSC returns per site: a better positioned sample
+  // than the corpus, and one Search Console truncates by anonymization on top of
+  // our own cap. `totals.gscCtr` is the
   // whole corpus out of `daily_search_summary`, deep tail included. The tile
   // originally printed the corpus actual (0.4% over 58,832 impressions) beside
   // this top-query expectation (~5.9%) and read as a 15x shortfall; the corpus

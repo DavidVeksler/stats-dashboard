@@ -91,7 +91,36 @@ export async function querySearchSummary(token, siteUrl, start, end, pageFilter 
   };
 }
 
-export async function queryKeywords(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
+// How many query rows to ask Search Console for, per property, per snapshot.
+//
+// This is the SAME number on both sides of the pull: whatever GSC returns is
+// what `runDaily` stores, so raising the request limit without raising the
+// stored slice (or the reverse) does nothing at all. There is one constant
+// because there is one decision.
+//
+// Why it is not 25 any more. At 25 the estate stored 119 query rows covering
+// 647 of 58,832 impressions — **1.1% of the corpus** — and the Search CTR tile's
+// comparator, which can only be computed over stored per-query rows (it needs a
+// per-query position), was therefore drawn from a sample too thin to say anything
+// about the estate: 51 of 258 clicks came from that 1.1%, while the unseen
+// ~58,185 impressions earned about 207 clicks at roughly 0.36%. The comparator was
+// honest — it labelled itself `thin sample` below THIN_SAMPLE_SHARE in render.js —
+// and useless.
+//
+// Why 500 and not more. Google accepts rowLimit up to 25,000 per request, so the
+// request side is not the constraint; the storage side is. 500 per property per
+// day is up to 6,000 rows a night across 12 properties, about 2.2M rows a year
+// with no pruning anywhere in the codebase (see AGENTS.md). That is affordable and
+// legible; 25,000 would be 110M rows a year for a tail nothing reads. Tune this
+// from the measured `totals.gscSampleShare` after a live pull, not by guessing.
+//
+// NOTE the ceiling this cannot cross: Search Console omits anonymized queries
+// from the query dimension entirely, so no rowLimit ever reaches 100% coverage.
+// If the measured share plateaus well below the corpus, that is the anonymization
+// floor, not a cap that needs raising again.
+export const KEYWORD_ROW_LIMIT = 500;
+
+export async function queryKeywords(token, siteUrl, start, end, rowLimit = KEYWORD_ROW_LIMIT, pageFilter = null) {
   const rows = await querySearchAnalytics(token, siteUrl, start, end, "query", rowLimit, pageFilter);
   return rows.map((r) => ({
     query: r.keys[0],

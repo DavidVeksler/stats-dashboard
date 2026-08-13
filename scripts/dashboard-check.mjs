@@ -7,7 +7,9 @@
 // where a flooded day used to erase a site's traffic, referrers and all.
 import worker from "../src/index.js";
 import { looksMalformed } from "../src/urls.js";
-import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS } from "../src/opportunities.js";
+import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS,
+  POSITION_MIN_IMPRESSIONS, RANK_MAX_POSITION, OPPORTUNITY_MIN_IMPRESSIONS } from "../src/opportunities.js";
+import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -223,9 +225,21 @@ const referrers = [
 const nonDirect = (date) =>
   referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
 
+// A deliberately deep tail of stored queries, appended to the keyword rows only
+// inside the block that exercises the raised KEYWORD_ROW_LIMIT. Empty otherwise,
+// so every other assertion in this file keeps describing the 15-row fixture.
+let keywordTail = [];
+
 // Minimal D1 stub: routes on the table named in the SQL and applies the date
 // filter from the bound parameters. Enough for loadDashboard's read path.
+// The two date shapes are not interchangeable, and which one a table gets is a
+// decision this file checks rather than tolerates — see readWidths below.
 const between = (rows, [a, b]) => rows.filter((r) => r.date >= a && r.date <= b);
+const onDate = (rows, [d]) => rows.filter((r) => r.date === d);
+// Every SELECT the read path issues, as { table, binds }, so the read WIDTH can
+// be asserted rather than inferred from the results.
+let readWidths = [];
+const tableOf = (sql) => (sql.match(/FROM\s+(\w+)/i) ?? [])[1] ?? null;
 const db = {
   prepare(sql) {
     let binds = [];
@@ -234,11 +248,15 @@ const db = {
       if (sql.includes("FROM runs")) return { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
       if (sql.includes("daily_traffic")) return { results: between(traffic, binds) };
       if (sql.includes("daily_referrers")) return { results: between(referrers, binds) };
-      // All three GSC reads span the history window now (spec item 8). They were
-      // latest-day-only, which is why no search figure on the page had a
-      // comparator. The date filter here is what proves the panels still narrow
-      // back down to the latest snapshot.
-      if (sql.includes("daily_keywords")) return { results: between(KEYWORDS, binds) };
+      // The three GSC reads are NOT the same width, and that asymmetry is load
+      // bearing. `daily_search_summary` spans the history window because the
+      // comparator's trailing means have no other source. `daily_keywords` and
+      // `daily_pages` are latest-day only: spec item 8 widened them too, but
+      // every consumer filters back down to `date`, and at KEYWORD_ROW_LIMIT (500)
+      // rows a site the wasted read would be up to 180,000 rows per page load.
+      // The stub applies whichever filter the SQL actually asks for, so a read
+      // that widens again shows up as a changed row count rather than passing.
+      if (sql.includes("daily_keywords")) return { results: onDate([...KEYWORDS, ...keywordTail], binds) };
       if (sql.includes("daily_search_summary")) return { results: between(SEARCH_SUMMARIES, binds) };
       if (sql.includes("daily_cf_pages")) return { results: between(ZONE_PAGES, binds) };
       // Read over the whole history window now, not just the latest day: the
@@ -252,10 +270,14 @@ const db = {
       }
       return { results: [] };
     };
+    const record = () => {
+      readWidths.push({ table: tableOf(sql), binds: [...binds] });
+      return run();
+    };
     const stmt = {
       bind: (...args) => { binds = args; return stmt; },
-      all: async () => run(),
-      first: async () => run(),
+      all: async () => record(),
+      first: async () => record(),
     };
     return stmt;
   },
@@ -776,6 +798,117 @@ for (const period of [7, 30]) {
     rank.action.includes("Strengthen those pages"), true);
   check("...and never tells the reader to rewrite a snippet nobody sees",
     /rewrite/i.test(rank.action), false);
+}
+
+// 13. Read width. The three GSC tables are read at two different widths on
+//     purpose, and the reason is cost: `daily_search_summary` has to span the
+//     history window because the comparator's trailing means come from nowhere
+//     else, while `daily_keywords` and `daily_pages` are latest-day only because
+//     every consumer filters back down to `date` anyway. Item 8 widened all three
+//     and flagged the waste; at KEYWORD_ROW_LIMIT rows a site it stops being
+//     theoretical — 30 days x 12 sites x 500 is up to 180,000 rows a page load.
+{
+  readWidths = [];
+  const { data } = await load("period=30");
+  const width = (table) => readWidths.filter((r) => r.table === table).map((r) => r.binds.length);
+
+  check("daily_keywords is read for one date, not a range", width("daily_keywords").join(","), "1");
+  check("...that date being the latest snapshot",
+    readWidths.find((r) => r.table === "daily_keywords").binds[0], data.date);
+  check("daily_pages is read the same way", width("daily_pages").join(","), "1");
+  check("daily_search_summary keeps the history window it needs for the trend",
+    width("daily_search_summary").join(","), "2");
+  // The narrowing must not have cost the trend anything.
+  check("...and the trend still has its snapshots", data.totals.trend.gscSnapshots > 1, true);
+  readWidths = [];
+}
+
+// 14. The raised stored-keyword cap (KEYWORD_ROW_LIMIT). At 25 rows a site the
+//     estate stored 119 queries covering 1.1% of impressions and the CTR
+//     comparator labelled itself a thin sample, correctly and uselessly. Raising
+//     the cap changes what several other numbers are computed over, so the deep
+//     tail is fixtured here rather than reasoned about:
+//
+//       - the median-position tile now sees a long tail of deep-ranked queries,
+//         which is exactly what POSITION_MIN_IMPRESSIONS exists to filter;
+//       - the opportunity classes now see hundreds more candidates, which is what
+//         MIN_ACTIONABLE_CLICKS and RANK_MAX_POSITION exist to filter.
+//
+//     Both floors are asserted at the new volume. The tail is sized to sit just
+//     under the cap for one host, so the fixture describes a site that would
+//     actually be truncated by it.
+{
+  const TAIL_HOST = FORUM_HOST;
+  const forumRows = KEYWORDS.filter((row) => row.host === TAIL_HOST).length;
+  // 440 one-impression queries: real, and below every floor on the page.
+  const noise = Array.from({ length: 440 }, (_, i) => ({
+    host: TAIL_HOST, query: `tail noise ${i}`, clicks: 0, impressions: 1,
+    position: 30 + (i % 66),
+  }));
+  // 45 queries that DO clear the impression floor and are ranked far too deep to
+  // act on. These move the median, and that is the honest answer rather than a
+  // regression: the tile now describes the estate instead of its 25 best queries.
+  const deep = Array.from({ length: 45 }, (_, i) => ({
+    host: TAIL_HOST, query: `deep tail ${i}`, clicks: 0, impressions: 12,
+    position: 70 + (i % 21),
+  }));
+  keywordTail = [...noise, ...deep].map((row) => ({ ...row, date: KEYWORD_DATE,
+    gsc_window: "2026-08-05–2026-08-07" }));
+
+  check("the fixture host sits just under the stored-keyword cap",
+    forumRows + keywordTail.length <= KEYWORD_ROW_LIMIT, true);
+  check("...and would have been truncated by the old one", forumRows + keywordTail.length > 25, true);
+
+  try {
+    const { data } = await load("period=1");
+    const totals = data.totals;
+    const forum = data.sites.find((s) => s.host === TAIL_HOST);
+    const stored = [...KEYWORDS, ...keywordTail];
+
+    // Coverage is the whole point of the change.
+    check("every stored row reaches the comparator's sample", totals.gscSampleQueries, stored.length);
+    check("...raising the sample's impression coverage above a sliver",
+      totals.gscSampleShare > .5, true);
+    check("...without the sample ever exceeding the corpus it is a sample of",
+      totals.gscSampleImpressions <= totals.gscImpressions, true);
+
+    // The impression floor at the new volume. 440 one-impression queries do not
+    // reach the median; the 45 twelve-impression ones do, because they are a real
+    // measurement of a real ranking.
+    const eligible = stored.filter((row) => row.impressions >= POSITION_MIN_IMPRESSIONS);
+    const sorted = eligible.map((row) => row.position).sort((a, b) => a - b);
+    const expectedMedian = sorted.length % 2
+      ? sorted[(sorted.length - 1) / 2]
+      : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+    check("the impression floor keeps 1-impression tail queries out of the median",
+      totals.gscPositionQueries, eligible.length);
+    check("...admitting only the tail rows that clear it", eligible.length, 13 + deep.length);
+    check("...and the median is the median of exactly those", totals.gscMedianPosition, expectedMedian);
+    check("...which the deep tail moves, honestly, rather than leaving flattered",
+      totals.gscMedianPosition > 12.8, true);
+    check("...while the top-10 count is unchanged by any of it", totals.gscTop10Queries, 5);
+
+    // The opportunity floors at the new volume. 485 extra candidate queries admit
+    // exactly none: 440 fail OPPORTUNITY_MIN_IMPRESSIONS, 45 are past
+    // RANK_MAX_POSITION. A list that grew by hundreds of near-zero items would be
+    // unusable, which is what these two constants are for.
+    check("hundreds of new candidates admit no new opportunities",
+      totals.opportunities, totals.snippetOpportunities + totals.rankOpportunities);
+    check("...still seven snippet gaps", totals.snippetOpportunities, 7);
+    check("...and five ranking gaps", totals.rankOpportunities, 5);
+    check("...none of them from the tail",
+      [...forum.opportunities.snippet, ...forum.opportunities.rank]
+        .some((row) => /^(tail noise|deep tail)/.test(row.query)), false);
+    check("the one-impression tail is below the CTR floor by construction",
+      noise[0].impressions < OPPORTUNITY_MIN_IMPRESSIONS, true);
+    check("...and the deep tail is past the ranking horizon",
+      deep.every((row) => row.position > RANK_MAX_POSITION), true);
+
+    // The card list stays a list a person can read.
+    check("the card still shows at most twelve queries", forum.keywords.length, 12);
+  } finally {
+    keywordTail = [];
+  }
 }
 
 if (failures) {

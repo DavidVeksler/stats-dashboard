@@ -18,6 +18,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 implemented; 9, 10, 11 proposed) |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
+| How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
+| Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | Everything else | this file |
 
@@ -49,10 +51,16 @@ npm run tail                    # live Worker logs (npx wrangler tail)
 traffic shapes — since a false positive deletes real traffic from the dashboard), the aggregation
 layer above it (`scripts/dashboard-check.mjs` drives `loadDashboard` against a stubbed D1, because
 that is where a flooded day used to erase a whole site card, and where the signal rules are exercised
-end-to-end against the real 2026-08-13 fixtures), and a render smoke test.
+end-to-end against the real 2026-08-13 fixtures), the **write** path
+(`scripts/write-check.mjs` drives `runDaily` against a stubbed D1, Cloudflare and Search Console —
+it is the only check that touches writes, and it exists because the night's batch is now chunked;
+see the chunked-write gotcha below), and a render smoke test.
 `node scripts/dashboard-check.mjs --signals` prints the signal list those fixtures produce, and
 `--opportunities` prints both ranked opportunity classes; between them they are the fastest way to
-see what a rule, threshold or CTR-curve change does. `npm run preview` writes `.preview/dashboard.html`
+see what a rule, threshold or CTR-curve change does. `node scripts/write-check.mjs --verbose` prints
+the shape of a night's write (statements, batches, statements per table), which is the fastest way to
+see what moving `KEYWORD_ROW_LIMIT` or `D1_MAX_BATCH_STATEMENTS` costs.
+`npm run preview` writes `.preview/dashboard.html`
 for inspection without deploying (the WAF blocks non-browser user agents on the live host, so parse
 the file rather than curling the site). Beyond that, verification is
 end-to-end: hit `/run` and read the returned `{gscOk, totalVisits, humanVisits, botVisits, notes}`,
@@ -162,8 +170,9 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   This has gone wrong twice, in different shapes, so it is a rule rather than a habit.
   (1) **The Search CTR tile.** The headline `totals.gscCtr` is the whole corpus out of
   `daily_search_summary` — every query on every property, deep tail included, 58,832 impressions —
-  but `expectedCtr` needs a per-query position and the only per-query rows stored are GSC's top ~25
-  per site, a small and much better positioned sample. The tile printed `0.4%` beside
+  but `expectedCtr` needs a per-query position and the only per-query rows stored are the top
+  `KEYWORD_ROW_LIMIT` queries GSC returns per site, a better positioned sample than the corpus and
+  (until the cap was raised from 25) a tiny one. The tile printed `0.4%` beside
   `expected ~5.9% at this position mix` and asserted a 15× shortfall; the corpus mean position of
   10.1 expects roughly 2.5%, so the real gap was nearer 6×. The comparator is now computed on both
   sides over `latestKeywordRows` (`totals.gscSampleCtr` and `totals.gscExpectedCtr` share the
@@ -194,9 +203,49 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   nothing else; a malformed pattern denies nothing rather than throwing. **Which queries a site
   declines to pursue is the owner's editorial call**, so do not add patterns to any site on your own
   judgment — surface the query and ask.
-- **GSC rows are a ROLLING WINDOW keyed by snapshot date, not a daily series.** `daily_keywords`,
-  `daily_pages` and `daily_search_summary` are all read over the history window now (widened from
-  latest-day-only for the comparators; read-side only, all three always stored a row per day). Each
+- **`KEYWORD_ROW_LIMIT` (`src/gsc.js`, 500) is the SAME number on both sides of the pull.** It is
+  what `runDaily` asks Search Console for *and* what it stores, because whatever GSC returns is what
+  gets written; raising one side alone changes nothing. It was 25, which stored 119 query rows across
+  the estate covering **647 of 58,832 impressions — 1.1%** — so the Search CTR comparator, which can
+  only be computed over stored per-query rows, was drawn from a sample too thin to say anything (it
+  labelled itself `thin sample` and was right to). Google accepts rowLimit up to 25,000, so the
+  request side is not the constraint; storage is. **There is a ceiling this cannot cross:** Search
+  Console omits anonymized queries from the query dimension entirely, so no limit reaches 100%
+  coverage — a measured share that plateaus is the anonymization floor, not a cap to raise again.
+  Tune it from the measured `totals.gscSampleShare` after a live pull. Two consequences to keep in
+  mind: **per-site query counts are no longer uniform** (a small site stores 40 rows, a forum stores
+  500), so nothing may assume a fixed count; and the median-position tile now sees the deep tail,
+  which is what `POSITION_MIN_IMPRESSIONS` is for — the median got worse and more honest, it did not
+  regress. Do **not** "fix" a surviving `thin sample` label by moving `THIN_SAMPLE_SHARE`.
+- **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
+  anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
+  it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB
+  limit, so years of headroom). If that ever needs a retention policy, it is David's call — deleting
+  stored history is irreversible and no agent should implement one on its own initiative.
+- **The three GSC reads are deliberately NOT the same width, and the asymmetry is about cost.**
+  `daily_search_summary` spans the history window because the search tiles' trailing comparators have
+  no other source. `daily_keywords` and `daily_pages` are read for the **latest date only**: spec item
+  8 widened all three, but every consumer of those two filters straight back down to `date`, so the
+  trailing rows were read and discarded — a few thousand wasted rows a page load at 25 keywords per
+  site, and up to **30 days × 12 sites × 500 = 180,000 rows on every dashboard load** at the raised
+  cap. `dashboard-check.mjs` asserts the bind width of all three, so a widening cannot land silently.
+  If spec item 11 (recurrence) needs per-query history, widen them back deliberately and price it
+  first — and read a narrow projection or a pre-aggregated table rather than whole rows.
+- **A night's writes are CHUNKED, and sequential execution is the whole safety argument.** `runDaily`
+  builds one ordered statement stream and `batchInChunks` (`src/index.js`) feeds it to `env.DB.batch()`
+  in groups of `D1_MAX_BATCH_STATEMENTS` (100), awaited **in order**. Roughly 6,300–7,000 statements a
+  night, so about 64–70 batches. Idempotency is DELETE-the-day-then-INSERT-it-again per (table, host),
+  and at 500 keyword rows a site those DELETEs and INSERTs land in *different* chunks — so running the
+  chunks concurrently (`Promise.all`), sorting `stmts`, or moving a DELETE after its INSERTs would
+  destroy a day of data with nothing else in the repo noticing. `scripts/write-check.mjs` asserts the
+  ordering, the chunk sizes, that the flattened order is the order statements were prepared, that a
+  delete/insert pair really does straddle a boundary, and that the keyword DELETEs stay inside the
+  `if (env.GSC_SA_KEY)` guard. What chunking costs: a batch is a transaction, so a run that dies
+  midway leaves the night partly written — self-healing, since the next run deletes and rewrites the
+  same (table, host) rows wholesale, and `/run` can be triggered by hand.
+- **GSC rows are a ROLLING WINDOW keyed by snapshot date, not a daily series.** All three tables
+  store a row per day; only `daily_search_summary` is *read* that way (see the read-width bullet
+  above — `daily_keywords` and `daily_pages` are latest-day-only, deliberately). Each
   snapshot asks Google for `date-4 … date-2`, so **consecutive rows overlap by two days out of
   three** and a day-over-day difference between them is not a like-for-like change. Only trailing
   means are computed from them, the comparator is stated per *snapshot* rather than per day

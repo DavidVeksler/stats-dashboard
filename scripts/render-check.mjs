@@ -416,6 +416,28 @@ if (!thinHtml.includes("9.1% of impressions · thin sample")) {
 if (html.includes("thin sample")) {
   throw new Error("A comparator covering 41% of impressions was labelled thin");
 }
+// Per-site query counts stopped being uniform when the stored-keyword cap went
+// from 25 to KEYWORD_ROW_LIMIT: a site may store 40 queries or 500, so the
+// sample count on this tile is now a four-figure number across the estate and the
+// copy has to survive both the comma and the size. This is also what the raised
+// cap is FOR — at high coverage the thin-sample label stops rendering on its own,
+// because THIN_SAMPLE_SHARE was never the thing that needed changing.
+const wideHtml = renderDashboard({
+  ...fixture,
+  totals: { ...fixture.totals,
+    gscSampleQueries: 1842, gscSampleClicks: 214, gscSampleCtr: 214 / 47_300,
+    gscSampleImpressions: 47_300, gscSampleShare: 47_300 / 58_832, gscImpressions: 58_832,
+    gscPositionQueries: 968, gscTop10Queries: 121 },
+});
+if (!wideHtml.includes("stored top 1,842 queries:")) {
+  throw new Error("The CTR tile's sample count did not render at estate scale");
+}
+if (!wideHtml.includes("121 of 968 stored top queries in the top 10")) {
+  throw new Error("The position tile's subtitle did not render at estate scale");
+}
+if (wideHtml.includes("thin sample")) {
+  throw new Error("A comparator covering 80% of impressions was still labelled thin");
+}
 
 // ---- Opportunity classes (spec item 7) ------------------------------------
 // Every badge names its class. A bare "opportunity" told the reader that

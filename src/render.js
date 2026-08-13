@@ -508,8 +508,9 @@ export function renderDashboard(data) {
       ? cmp(`14-snapshot mean ${fmt(Math.round(value))}`, rolling) : "");
     // The CTR tile describes TWO populations and has to say which is which. The
     // headline is the whole corpus out of daily_search_summary; the expectation
-    // can only be computed from the stored per-query rows (GSC's top ~25 per
-    // site), which are far better positioned. Printing 0.4% beside
+    // can only be computed from the stored per-query rows (the top
+    // KEYWORD_ROW_LIMIT queries GSC returns per site, minus whatever it
+    // anonymizes), which are better positioned than the tail. Printing 0.4% beside
     // `expected ~5.9%` implied a 15x shortfall that does not exist — so the
     // comparator's actual side is the sample too, and the sample's impression
     // coverage is stated beside it. See the trap note in src/index.js.
