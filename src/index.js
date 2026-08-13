@@ -2,7 +2,16 @@ import { SITES } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay } from "./bots.js";
+import { isOpportunity } from "./opportunities.js";
 import { renderDashboard } from "./render.js";
+
+// Which instrumentation a site's numbers come from. RUM sites carry the Web
+// Analytics beacon and are measured in sessions; zone sites have no HTML page to
+// fire that beacon, so their numbers are HTTP request counts out of the zone log
+// and are a different quantity entirely (see loadDashboard's totals split, and
+// the "Two measurement classes" gotcha in AGENTS.md). Derived from config so no
+// aggregate has to know a hostname.
+const measurementOf = (site) => (site.trafficSource === "zone" ? "zone" : "rum");
 
 const utcDate = (d) => d.toISOString().slice(0, 10);
 function addDays(dateStr, n) {
@@ -299,18 +308,22 @@ async function loadDashboard(env, options = {}) {
   if (!date) {
     return { date: null, coverageStart: null, generatedAt: new Date().toISOString(), dataUpdatedAt: null, run: null,
       periodDays, domain, sort, allDomains: SITES.map((site) => site.host), anomalies: [],
-      totals: { visits: 0, views: 0, search: 0, domains: selectedSites.length, active: 0,
+      totals: { visits: 0, views: 0, pagesPerSession: 0, search: 0,
+        domains: selectedSites.length, active: 0,
+        rumDomains: selectedSites.filter((s) => measurementOf(s) === "rum").length,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
         botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
         partialVisits: 0, partialSites: 0,
         sourceMix: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
+        zone: { visits: 0, requests: 0, bytes: 0, sites: 0, hosts: [] },
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
         opportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         partialVisits: 0, partialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
-        bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: s.trafficSource === "zone",
+        bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
+        measurement: measurementOf(s),
         sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
@@ -471,9 +484,9 @@ async function loadDashboard(env, options = {}) {
       searchSummary: summaryRow ? { clicks: Number(summaryRow.clicks || 0), impressions: Number(summaryRow.impressions || 0),
         ctr: Number(summaryRow.ctr || 0), position: Number(summaryRow.position || 0) } : null,
       bytes, zoneCountries: zoneCountryRows, zoneStatuses: zoneStatusRows,
-      zoneSourced: s.trafficSource === "zone",
-      opportunityCount: kwRows.filter((k) => Number(k.impressions) >= 5 && Number(k.position) >= 4 &&
-        Number(k.position) <= 20 && Number(k.clicks) / Number(k.impressions) < .04).length,
+      zoneSourced: measurementOf(s) === "zone",
+      measurement: measurementOf(s),
+      opportunityCount: kwRows.filter(isOpportunity).length,
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
       // The sparkline plots what was measured, flooded days included, but marks
       // them — hiding them would turn a crawler event into a mysterious gap.
@@ -483,32 +496,54 @@ async function loadDashboard(env, options = {}) {
     };
   });
 
-  if (sort === "name") sites.sort((a, b) => a.host.localeCompare(b.host));
-  else if (sort === "change") sites.sort((a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity));
-  else sites.sort((a, b) => b.visits - a.visits);
+  // Sorting applies inside a measurement class, never across one: ranking 19,506
+  // HTTP requests against 291 RUM sessions puts the two quantities in the same
+  // order as though they were the same thing.
+  const bySort = sort === "name" ? (a, b) => a.host.localeCompare(b.host)
+    : sort === "change" ? (a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity)
+      : (a, b) => b.visits - a.visits;
+  const rumSites = sites.filter((s) => s.measurement === "rum").sort(bySort);
+  const zoneSites = sites.filter((s) => s.measurement === "zone").sort(bySort);
+  sites = [...rumSites, ...zoneSites];
 
-  const sourceMix = sites.reduce((acc, site) => {
+  // Every session-shaped aggregate below reduces over RUM sites only. Zone hosts
+  // report HTTP requests, and Cloudflare's zone-log "visits" heuristic counts
+  // crawler fetches of /robots.txt as arrivals; summing them into the headline
+  // made "pages / session" the ratio of two unrelated quantities (10.4 rather
+  // than the true 1.46 on 2026-08-13). Zone volume is reported in totals.zone,
+  // never merged.
+  const sourceMix = rumSites.reduce((acc, site) => {
     for (const key of Object.keys(acc)) acc[key] += site.sources[key];
     return acc;
   }, { direct: 0, search: 0, social: 0, referral: 0, other: 0 });
   const searchSites = sites.filter((site) => site.searchSummary);
   const totals = {
-    visits: sites.reduce((a, s) => a + s.visits, 0),
-    views: sites.reduce((a, s) => a + s.views, 0),
+    visits: rumSites.reduce((a, s) => a + s.visits, 0),
+    views: rumSites.reduce((a, s) => a + s.views, 0),
     search: sourceMix.search,
     sourceMix,
+    // Reported separately, in its own units, so it can be read but never averaged
+    // against a session count.
+    zone: {
+      visits: zoneSites.reduce((a, s) => a + s.visits, 0),
+      requests: zoneSites.reduce((a, s) => a + s.views, 0),
+      bytes: zoneSites.reduce((a, s) => a + s.bytes, 0),
+      sites: zoneSites.length,
+      hosts: zoneSites.map((s) => s.host),
+    },
     domains: sites.length,
+    rumDomains: rumSites.length,
     active: sites.filter((s) => s.visits > 0).length,
-    previousVisits: sites.reduce((a, s) => a + s.previousVisits, 0),
+    previousVisits: rumSites.reduce((a, s) => a + s.previousVisits, 0),
     // Crawler traffic is reported, never hidden — it just does not get to sit in
     // the same number as the human audience.
-    botVisits: sites.reduce((a, s) => a + s.botVisits, 0),
-    botViews: sites.reduce((a, s) => a + s.botViews, 0),
-    previousBotVisits: sites.reduce((a, s) => a + s.previousBotVisits, 0),
-    partialVisits: sites.reduce((a, s) => a + s.partialVisits, 0),
-    partialSites: sites.filter((s) => s.partialDays > 0).length,
-    floodedSiteDays: sites.reduce((a, s) => a + s.botDays, 0),
-    floodedSites: sites.filter((s) => s.botDays > 0).length,
+    botVisits: rumSites.reduce((a, s) => a + s.botVisits, 0),
+    botViews: rumSites.reduce((a, s) => a + s.botViews, 0),
+    previousBotVisits: rumSites.reduce((a, s) => a + s.previousBotVisits, 0),
+    partialVisits: rumSites.reduce((a, s) => a + s.partialVisits, 0),
+    partialSites: rumSites.filter((s) => s.partialDays > 0).length,
+    floodedSiteDays: rumSites.reduce((a, s) => a + s.botDays, 0),
+    floodedSites: rumSites.filter((s) => s.botDays > 0).length,
     daysAvailable: availableDates.length,
     previousDaysAvailable: previousAvailableDates.length,
     gscClicks: searchSites.reduce((sum, site) => sum + site.searchSummary.clicks, 0),
@@ -517,6 +552,9 @@ async function loadDashboard(env, options = {}) {
     opportunities: sites.reduce((sum, site) => sum + site.opportunityCount, 0),
   };
   totals.delta = totals.previousVisits ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
+  // RUM pageviews over RUM sessions. Meaningful only because both sides now come
+  // from the same instrument.
+  totals.pagesPerSession = totals.visits ? totals.views / totals.visits : 0;
   totals.searchShare = totals.visits ? totals.search / totals.visits : 0;
   totals.botShare = totals.visits + totals.botVisits
     ? totals.botVisits / (totals.visits + totals.botVisits) : 0;

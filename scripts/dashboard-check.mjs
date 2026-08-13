@@ -32,9 +32,23 @@ const DAYS = [
   { date: "2026-08-09", visits: 1689, direct: DIRECT_SHARE_FLOOD, pps: 1.08 },
 ];
 
-const traffic = DAYS.map((day) => ({
-  date: day.date, host: HOST, visits: day.visits, views: Math.round(day.visits * day.pps),
-}));
+// A zone-log host (config.js marks library.freecapitalists.org trafficSource:
+// "zone"): no RUM beacon, so `visits` is Cloudflare's zone-log arrival heuristic
+// and `views` is raw HTTP requests. These must never reach a session total.
+const ZONE_HOST = "library.freecapitalists.org";
+const ZONE_DAYS = [
+  { date: "2026-08-08", visits: 940, requests: 17400, bytes: 61_000_000_000 },
+  { date: "2026-08-09", visits: 1059, requests: 19506, bytes: 76_658_000_000 },
+];
+
+const traffic = [
+  ...DAYS.map((day) => ({
+    date: day.date, host: HOST, visits: day.visits, views: Math.round(day.visits * day.pps),
+  })),
+  ...ZONE_DAYS.map((day) => ({
+    date: day.date, host: ZONE_HOST, visits: day.visits, views: day.requests, bytes: day.bytes,
+  })),
+];
 const referrers = DAYS.flatMap((day) => {
   const direct = Math.round(day.visits * day.direct);
   return [
@@ -115,9 +129,42 @@ const load = async (query) => {
 // 3. A site with no flood at all must be untouched by any of this.
 {
   const { data } = await load("period=7");
-  const quiet = data.sites.find((s) => s.host !== HOST);
+  const quiet = data.sites.find((s) => s.host !== HOST && !s.zoneSourced);
   check("unflooded sites report no partial days", quiet.partialDays, 0);
   check("unflooded sites report no recovered sessions", quiet.partialVisits, 0);
+}
+
+// 4. Measurement classes stay separate. A zone-log host counts HTTP requests, not
+//    RUM sessions; summing the two is what made the headline "pages / session"
+//    an artifact (20,897 "pageviews" of which 19,506 were library requests).
+{
+  const { data } = await load("period=1");
+  const zone = data.sites.find((s) => s.host === ZONE_HOST);
+  const today = ZONE_DAYS.at(-1);
+  const rumSites = data.sites.filter((s) => !s.zoneSourced);
+  const rumVisits = rumSites.reduce((sum, s) => sum + s.visits, 0);
+  const rumViews = rumSites.reduce((sum, s) => sum + s.views, 0);
+
+  check("zone hosts are typed from config, not by hostname", zone.measurement, "zone");
+  check("...and still report their own volume", zone.visits, today.visits);
+  check("totals.visits excludes every zoneSourced site", data.totals.visits, rumVisits);
+  check("totals.views excludes every zoneSourced site", data.totals.views, rumViews);
+  check("...so the headline carries no zone visits", data.totals.visits, nonDirect("2026-08-09"));
+  check("...and no zone requests", data.totals.views, 0);
+  check("previous-period totals exclude them too", data.totals.previousVisits,
+    rumSites.reduce((sum, s) => sum + s.previousVisits, 0));
+  check("zone volume is reported separately, not dropped", data.totals.zone.visits, today.visits);
+  check("...with requests in their own units", data.totals.zone.requests, today.requests);
+  check("...and bandwidth alongside", data.totals.zone.bytes, today.bytes);
+  check("...naming the hosts it covers", data.totals.zone.hosts.join(","), ZONE_HOST);
+  check("...over one zone site", data.totals.zone.sites, 1);
+  check("pages/session is RUM pageviews over RUM sessions", data.totals.pagesPerSession,
+    rumVisits ? rumViews / rumVisits : 0);
+  check("the source mix is RUM-only as well",
+    Object.values(data.totals.sourceMix).reduce((a, b) => a + b, 0) <= rumVisits, true);
+  // Sorting ranks within a measurement class, never across it: 19,506 requests
+  // must not outrank a RUM site's sessions.
+  check("zone cards sort after every RUM card", data.sites.at(-1).host, ZONE_HOST);
 }
 
 if (failures) {

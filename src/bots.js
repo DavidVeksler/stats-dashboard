@@ -13,8 +13,10 @@
 
 export const FLOOD_MIN_VISITS = 500;   // below this, a "flood" is indistinguishable from noise
 export const FLOOD_MULTIPLE = 3;       // ...and must be this many times a normal day
-const FLAT_PAGES_PER_SESSION = 1.15;   // humans click through; crawlers hit one URL and leave
-const DIRECT_SHARE = 0.9;              // crawlers send no referer
+// Exported so the footer prose that explains these rules can interpolate them
+// rather than restate them as literals that drift out of sync with the code.
+export const FLAT_PAGES_PER_SESSION = 1.15;   // humans click through; crawlers hit one URL and leave
+export const DIRECT_SHARE = 0.9;              // crawlers send no referer
 
 const quantile = (sorted, q) =>
   sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))] : 0;

@@ -13,7 +13,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
 | Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `runs`), not docs |
-| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (proposed, not implemented) |
+| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1 and 3 implemented; the rest proposed) |
+| What counts as a search "opportunity" | `src/opportunities.js` — one predicate, imported by both `index.js` and `render.js` |
 | Everything else | this file |
 
 ## What this is
@@ -58,6 +59,26 @@ The Worker has two entry points in `src/index.js`:
   3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_keywords`), plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
 - **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
+
+**Two measurement classes, never mixed.** `loadDashboard` partitions `SITES` on
+`site.trafficSource` into `measurement: "rum"` and `measurement: "zone"` (the `measurementOf`
+helper — derived from config, never from a hostname; `site.zoneSourced` is the same fact as a
+boolean). Every session-shaped aggregate in `totals.*` — `visits`, `views`, `pagesPerSession`,
+`previousVisits`, `sourceMix`, and the crawler/partial counters — reduces over **RUM sites only**.
+Zone volume is reported beside it in `totals.zone = { visits, requests, bytes, sites, hosts }`,
+rendered as its own strip under the KPI tiles and its own `Zone-log measurement` card section, and
+`options.sort` ranks within a class rather than across it. Why: a zone host has no RUM beacon, so
+its numbers are HTTP request counts out of the zone log and its "visits" is Cloudflare's arrival
+heuristic over those requests (crawler fetches of `robots.txt` included). They are not sessions and
+are not comparable to them. Summing them produced a headline "pages / session" of 10.4 on
+2026-08-13 — 20,897 "pageviews" of which 19,506 were library.freecapitalists.org HTTP requests —
+against a true RUM figure of 1.46 over 953 sessions. Zone-sourced sites are not dropped: zone logs
+are the only instrumentation those hosts have. They are reported in their own units.
+
+The **search-opportunity predicate lives once**, in `src/opportunities.js` (`isOpportunity` plus its
+named thresholds). `loadDashboard` uses it for `totals.opportunities`, `render.js` uses it for the
+badge, and the footer prose interpolates the same constants. It used to exist twice, over different
+row sets, so the headline count could exceed the visible badges with no way to tell that from a bug.
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics
@@ -105,6 +126,23 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   it is reported as crawler volume, not estimated.
   Before this split existed, a site whose only day in view was flooded rendered a completely
   blank card (freecapitalists.org, 2026-08-09).
+- **A zone-sourced host can never be flagged as flooded, so it must never sit in a session total.**
+  `classifyTraffic` derives `directShare` from `daily_referrers` rows, and a zone host writes none
+  (zone logs carry no referer dimension), so `direct = 0`, `signature` is always false, and no
+  volume flags it. Until the RUM/zone split landed, library.freecapitalists.org's raw crawler
+  traffic flowed straight into "Human sessions", supplying 1,059 of 2,012 (52.6%) on 2026-08-13
+  while its own top file was `/robots.txt` at 684 requests. Keep every session-shaped aggregate
+  RUM-only (see "Two measurement classes" above). Giving zone hosts their own crawler decomposition
+  is item 2 of `docs/actionability-spec.md` and is not done: **the zone card's own numbers still
+  include crawlers**, which is why the card says so in a header note and the strip says "request
+  counts, not comparable to RUM sessions".
+- **Footer prose is interpolated, not retyped.** The flood thresholds and the opportunity
+  thresholds in `render.js`'s footer come from the exported constants in `src/bots.js`
+  (`FLOOD_MIN_VISITS`, `FLOOD_MULTIPLE`, `FLAT_PAGES_PER_SESSION`, `DIRECT_SHARE`) and
+  `src/opportunities.js`. `render-check.mjs` asserts the rendered sentence against those same
+  imports, so changing a threshold and not the prose fails `npm run check`. The prose had already
+  drifted once: it claimed flooded days were "excluded whole, from sessions, referrers, and landing
+  pages alike" for as long as `splitDay` had been keeping the referred sessions.
 - **GSC lags ~2 days.** `runDaily` requests the window `date-4 … date-2`, so keyword data is
   never truly "last 24h". The dashboard labels this.
 - **`runDaily` only deletes keyword rows inside the `if (env.GSC_SA_KEY)` block** — so a run with

@@ -1,5 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { renderDashboard } from "../src/render.js";
+// Imported, never retyped: the footer prose that explains these rules is
+// asserted against the constants themselves, so the two cannot drift.
+import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "../src/bots.js";
 
 const today = new Date().toISOString();
 const fixture = {
@@ -14,12 +17,18 @@ const fixture = {
   periodDays: 7,
   domain: null,
   sort: "traffic",
-  allDomains: ["example.com", "davidveksler.freecapitalists.org"],
+  allDomains: ["example.com", "davidveksler.freecapitalists.org", "library.example"],
   anomalies: [{ type: "up", host: "example.com", metric: "sessions", value: .31 }],
-  totals: { visits: 1300, views: 1770, search: 260, domains: 2, active: 2, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
+  // Headline totals are RUM-only: the zone site's 1,059 zone visits and 19,506
+  // requests are in totals.zone and nowhere else. Summed the old way these tiles
+  // would read 2,359 sessions over 21,276 "pageviews" — 9.0 pages/session, an
+  // artifact of dividing HTTP requests by RUM sessions.
+  totals: { visits: 1300, views: 1770, pagesPerSession: 1770 / 1300, search: 260,
+    domains: 4, rumDomains: 3, active: 4, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
     botVisits: 42000, botViews: 42350, previousBotVisits: 0, botShare: .97, floodedSiteDays: 3, floodedSites: 1,
     partialVisits: 120, partialSites: 1,
     sourceMix: { direct: 700, search: 260, social: 80, referral: 60, other: 200 },
+    zone: { visits: 1059, requests: 19506, bytes: 76658000000, sites: 1, hosts: ["library.example"] },
     gscClicks: 46, gscImpressions: 2200, gscCtr: .0209, gscPosition: 7.8, searchDataDomains: 2, opportunities: 1 },
   sites: [
     {
@@ -76,6 +85,24 @@ const fixture = {
       keywords: [], pages: [], cfPages: [],
       spark: [{ date: "2026-07-15", visits: 24, flood: false }, { date: "2026-07-16", visits: 1689, flood: true }],
     },
+    // A zone-log host: a file index with no HTML page to fire the RUM beacon, so
+    // its numbers are HTTP request counts. It must render below its own heading,
+    // in its own units, and never claim a session count.
+    {
+      host: "library.example", measurement: "zone", zoneSourced: true,
+      visits: 1059, views: 19506, bytes: 76658000000,
+      previousVisits: 940, delta: .127,
+      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
+      partialVisits: 0, partialDays: 0,
+      pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
+      searchSummary: null, gscWindow: null,
+      referrers: [], keywords: [], pages: [],
+      cfPages: [{ page: "/robots.txt", visits: 684, views: 612 }, { page: "/books/mises.pdf", visits: 141, views: 120 }],
+      zoneCountries: [{ country: "US", visits: 620 }, { country: "DE", visits: 190 }],
+      zoneStatuses: [{ status: 200, requests: 15200 }, { status: 404, requests: 1745 }],
+      sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
+      spark: [{ date: "2026-07-15", visits: 940, flood: false }, { date: "2026-07-16", visits: 1059, flood: false }],
+    },
   ],
 };
 
@@ -95,11 +122,43 @@ const required = [
   "pageviews not separable on flooded days",
   // ...and the mixed case, where clean days and recovered days both contribute.
   "Human figures above cover the 4 clean days, plus 120 referred sessions that survived the flooded days.",
+  // Measurement classes are separated: the headline is RUM-only and the zone
+  // host's request counts are reported beside it, in their own units.
+  "Zone-log measurement", `class="card card--zone`, "3 RUM sites",
+  "1.4 pages / session · RUM only",
+  "19,506 requests · 1,059 zone visits · 71.4 GB",
+  "Counted from zone HTTP request logs (no RUM tag on this site).",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
 }
 if (html.includes("Total visitors")) throw new Error("Legacy visitor terminology remains in the rendered dashboard");
+
+// Zone cards live below the "Zone-log measurement" heading, never above it and
+// never interleaved with the RUM grid. Anchored on the card markup, not the
+// class name, which also appears in the stylesheet above the heading.
+const zoneCardAt = html.indexOf(`class="card card--zone`);
+if (html.indexOf("Zone-log measurement") > zoneCardAt) {
+  throw new Error("Zone cards must render below the Zone-log measurement heading");
+}
+// ...and nothing inside a zone card may call a request count a human session.
+const zoneBlock = html.slice(zoneCardAt, html.indexOf("</main>", zoneCardAt));
+if (zoneBlock.includes("human sessions")) {
+  throw new Error("A zone-sourced card must never label its numbers as human sessions");
+}
+
+// Footer prose is interpolated from the classifier's own constants. Computed
+// here from the same imports, never typed, so changing a threshold in bots.js
+// fails this check until the prose follows.
+const floodProse = `≥${(DIRECT_SHARE * 100).toFixed(0)}% direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, ` +
+  `at least ${FLOOD_MIN_VISITS.toLocaleString("en-US")} sessions, and at least ${FLOOD_MULTIPLE}× a normal day`;
+if (!html.includes(floodProse)) {
+  throw new Error(`Footer flood thresholds do not match src/bots.js: expected "${floodProse}"`);
+}
+// The sentence the splitDay rework made false.
+if (html.includes("excluded whole — from sessions, referrers, and landing pages alike")) {
+  throw new Error("Footer still claims flooded days are excluded whole; referred sessions survive");
+}
 // A site with no crawler activity must not sprout an empty crawler callout:
 // two of the three fixture sites have bot traffic.
 if (html.split(`class="crawler-row"`).length - 1 !== 2) {

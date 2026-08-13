@@ -1,5 +1,10 @@
 // Renders the dashboard HTML from data read out of D1.
 import { APPLE_SPLASH_LINKS } from "./appleSplashLinks.js";
+import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "./bots.js";
+import {
+  isOpportunity, OPPORTUNITY_MIN_IMPRESSIONS, OPPORTUNITY_MIN_POSITION,
+  OPPORTUNITY_MAX_POSITION, OPPORTUNITY_MAX_CTR,
+} from "./opportunities.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -76,7 +81,8 @@ function keywordList(keywords) {
   if (!keywords.length) return `<p class="none">No search queries in the latest GSC window.</p>`;
   return `<ol class="metric-list">${keywords.map((keyword) => {
     const ctr = keyword.impressions ? keyword.clicks / keyword.impressions : 0;
-    const opportunity = keyword.impressions >= 5 && keyword.position >= 4 && keyword.position <= 20 && ctr < .04;
+    // Same predicate that produced totals.opportunities — see src/opportunities.js.
+    const opportunity = isOpportunity(keyword);
     return `<li class="metric-row ${opportunity ? "opportunity" : ""}">
       <div class="metric-name"><span class="truncate" title="${esc(keyword.query)}">${esc(keyword.query)}</span>${opportunity ? `<span class="opportunity-tag">opportunity</span>` : ""}</div>
       <div class="metric-values"><strong>${fmt(keyword.clicks)} clk</strong><span>${fmt(keyword.impressions)} imp · ${pct(ctr, 1)} CTR · pos ${Number(keyword.position || 0).toFixed(1)}</span></div>
@@ -187,6 +193,23 @@ function sourceMix(mix, total) {
   </section>`;
 }
 
+// Zone-sourced hosts are measured by Cloudflare's zone HTTP request log, not by
+// the RUM beacon, so their numbers are request counts. They get this strip rather
+// than a KPI tile: summing them into the headline is what turned pages/session
+// into 10.4 (20,897 "pageviews" of which 19,506 were library HTTP requests)
+// against a true RUM figure of 1.46 on 2026-08-13.
+function zoneStrip(sites) {
+  const zoneSites = sites.filter((site) => site.zoneSourced);
+  if (!zoneSites.length) return "";
+  const rows = zoneSites.map((site) =>
+    `<li><b>${esc(site.host)}</b> — ${fmt(site.views)} requests · ${fmt(site.visits)} zone visits · ${bytesLabel(site.bytes)}</li>`
+  ).join("");
+  return `<aside class="zone-strip" role="note" aria-label="Zone-log sites">
+    <div class="zone-strip-label">Zone-log sites <span>request counts, not comparable to RUM sessions</span></div>
+    <ul>${rows}</ul>
+  </aside>`;
+}
+
 // Crawlers are welcome here (the sites opt into AI training) — they just are not
 // an audience. This banner keeps the excluded volume visible and named, so the
 // headline drop from "13,870 sessions" to a few hundred is explained, not silent.
@@ -232,19 +255,21 @@ function siteCard(site, index, periodDays) {
   const hasDetails = site.zoneSourced
     ? site.cfPages.length || site.zoneCountries.length || site.zoneStatuses.length
     : site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length || site.cfPages.length;
-  return `<section class="card ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
+  return `<section class="card ${site.zoneSourced ? "card--zone" : ""} ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
     <div class="chead">
       <div class="hostwrap">
         <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
         ${sparkline(site.spark, site.host)}
       </div>
-      <div class="nums"><div class="big">${site.visits ? `${site.partialDays ? "&ge;&nbsp;" : ""}${fmt(site.visits)}` : "—"}</div><div class="lbl">${site.zoneSourced ? "sessions" : "human sessions"} ${periodLabel}</div>
+      <div class="nums"><div class="big">${site.visits ? `${site.partialDays ? "&ge;&nbsp;" : ""}${fmt(site.visits)}` : "—"}</div><div class="lbl">${site.zoneSourced ? "zone visits" : "human sessions"} ${periodLabel}</div>
         ${deltaBadge(site.delta, true)}<div class="pv">${site.zoneSourced
           ? `${fmt(site.views)} requests · ${bytesLabel(site.bytes)}`
           : site.cleanDays
             ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
             : `pageviews not separable on flooded days`}</div></div>
     </div>
+    ${site.zoneSourced ? `<p class="zone-row" role="note">Counted from zone HTTP request logs (no RUM tag on this site).
+      Requests include crawlers, assets, and robots.txt, so this is not comparable to the session counts above.</p>` : ""}
     ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${crawlerRowDetail(site)}</p>` : ""}
     ${searchSummary(site.searchSummary)}
     ${hasDetails ? (site.zoneSourced ? `<details class="detail" open data-card-index="${index}">
@@ -307,12 +332,19 @@ export function renderDashboard(data) {
   const coverageNote = data.periodDays > 1 && totals.daysAvailable < data.periodDays
     ? `${totals.daysAvailable} of ${data.periodDays} daily snapshots available` : null;
   const gscWindow = data.sites.find((site) => site.gscWindow)?.gscWindow || "latest available";
-  const hasZoneSite = data.sites.some((site) => site.zoneSourced);
+  // Cards, and every headline number, are split by measurement class: RUM
+  // sessions and zone HTTP requests are different quantities and are never mixed
+  // into one figure or one ranking.
+  const rumSites = data.sites.filter((site) => !site.zoneSourced);
+  const zoneSites = data.sites.filter((site) => site.zoneSourced);
+  const hasZoneSite = zoneSites.length > 0;
+  const rumDomains = totals.rumDomains ?? rumSites.length;
+  const pagesPerSession = totals.pagesPerSession ?? (totals.visits ? totals.views / totals.visits : 0);
   const updatedAt = data.dataUpdatedAt || data.run?.run_at;
   const stale = updatedAt ? Date.now() - Date.parse(updatedAt) > 30 * 3600 * 1000 : true;
   const stats = [
-    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta)}<span>${coverageNote || periodLabel.toLowerCase()}</span>`],
-    ["Total pageviews", fmt(totals.views), `<span>${totals.visits ? (totals.views / totals.visits).toFixed(1) : "0.0"} pages / session</span>`],
+    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>`],
+    ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>`],
     ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>`],
     [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${totals.active} with traffic</span>`],
   ];
@@ -364,6 +396,8 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .crawler{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--social);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.crawler strong{color:var(--ink);font-weight:700}
 .crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
 .spark-flood{fill:var(--paper);stroke:var(--social);stroke-width:1.6}
+.zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
+.zone-section{margin-top:22px}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.other,.source-legend i.other{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.signals{display:flex;gap:7px;flex-wrap:wrap;margin:0 0 20px}.signal-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;color:var(--faint);align-self:center;margin-right:2px}.signal{font-size:11.5px;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 9px}.signal.up::before{content:"↑";color:var(--good);font-weight:800;margin-right:5px}.signal.down::before{content:"↓";color:var(--danger);font-weight:800;margin-right:5px}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}
 .ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
@@ -400,16 +434,21 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <section class="totals" aria-labelledby="overview-heading"><h2 class="sr-only" id="overview-heading">Traffic overview</h2>
       ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
     </section>
+    ${zoneStrip(data.sites)}
     ${crawlerNote(totals, data.sites)}
     ${sourceMix(totals.sourceMix, totals.visits)}
     ${data.anomalies.length ? `<aside class="signals" aria-label="Notable changes"><span class="signal-label">Notable</span>${data.anomalies.map((item) => `<span class="signal ${item.type}">${esc(anomalyText(item))} vs ${esc(previousLabel)}</span>`).join("")}</aside>` : ""}
-    <div class="grid">${data.sites.map((site, index) => siteCard(site, index, data.periodDays)).join("")}</div>
+    <div class="grid">${rumSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
+    ${hasZoneSite ? `<section class="zone-section" aria-labelledby="zone-section-heading">
+      <h2 class="section-heading" id="zone-section-heading">Zone-log measurement</h2>
+      <div class="grid">${zoneSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
+    </section>` : ""}
   </main>
   <footer>
     <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable.</div>
-    <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥90% direct, ≤1.15 pages/session, at least 500 sessions, and at least 3× a normal day for that site. Flooded days are excluded whole — from sessions, referrers, and landing pages alike — and counted separately; they are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
-    <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have impressions, average position 4–20, and CTR below 4%.</div>
-    ${hasZoneSite ? `<div><b>Zone-sourced sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM: "sessions" is Cloudflare's heuristic visit count, "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have.</div>` : ""}
+    <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count, which is why such a day's sessions read as a floor (≥) rather than a count, why pages/session divides by clean sessions only, and why a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
+    <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions, average position ${OPPORTUNITY_MIN_POSITION}–${OPPORTUNITY_MAX_POSITION}, and CTR below ${pct(OPPORTUNITY_MAX_CTR, 0)}.</div>
+    ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>
 </div>
