@@ -529,13 +529,39 @@ impressions, position 2.5) is not flagged for the same reason; and every rendere
 >    that **no** `gsc*PerDay` field exists, so the next person cannot add one by habit. The rendered
 >    range is named from `gsc_window` at both ends, and the chip's tooltip says the overlap out loud.
 >    Trailing means only; no day-over-day GSC delta is computed anywhere.
-> 2. **The CTR expectation is over the stored query mix, not the whole property.** `expectedCtr` needs
->    a per-query position, and the only per-query rows stored are GSC's top ~25 per site. Computing
->    the expectation from each site's *average* position instead would push a convex curve through a
->    mean and produce a number that means nothing. So the tile reads
->    `expected ~1.6% at this position mix` — "this position mix" being the stored queries — beside an
->    actual CTR that covers everything. Rendered with a `~` and one decimal for that reason as much
->    as for the curve's own approximation.
+> 2. **The CTR expectation is over the stored query mix, not the whole property — and the actual it
+>    is compared against must be the same rows.** `expectedCtr` needs a per-query position, and the
+>    only per-query rows stored are GSC's top ~25 per site. Computing the expectation from each
+>    site's *average* position instead would push a convex curve through a mean and produce a number
+>    that means nothing, so the expectation stays over the stored rows.
+>
+>    **The first cut of this got the other side wrong and shipped a broken comparator** (fixed in the
+>    commit that carries this paragraph). The tile rendered `0.4%` — `totals.gscCtr`, the whole
+>    corpus out of `daily_search_summary`, 58,832 impressions including the deep tail — beside
+>    `expected ~5.9% at this position mix`, computed over the stored top-25 rows, which are a small
+>    and much better positioned sample. Read together that asserted a 15× shortfall. The corpus mean
+>    position is 10.1, where `expectedCtr` is roughly 2.5%, so the real gap was nearer 6×. A
+>    comparator that is not like-for-like defeats this item's own purpose.
+>
+>    **The rule, which now applies to every comparator on the page: both sides come from the same
+>    population, and the tile names the population.** Concretely: the headline stays the true
+>    whole-corpus CTR (it is the honest top-line number and comes from the authoritative source);
+>    `totals.gscSampleCtr` = clicks ÷ impressions across `latestKeywordRows` is the comparator's
+>    actual side, sharing its denominator (`totals.gscSampleImpressions`) with `gscExpectedCtr`; and
+>    `totals.gscSampleShare` reports what fraction of corpus impressions the sample covers, labelled
+>    `thin sample` below 25%. The tile reads `headline covers every query` then
+>    `stored top N queries: X% vs expected ~Y% · Z% of impressions`.
+>
+>    The same mismatch was in the position tile's subtitle: `7 of 11 queries in the top 10` read as
+>    though the estate had 11 queries, when it is 11 *stored* rows clearing
+>    `POSITION_MIN_IMPRESSIONS` out of a 58,832-impression corpus. It now reads
+>    `N of M stored top queries in the top 10`.
+>
+>    `dashboard-check.mjs` asserts the two sides share a row set, against a fixture whose stored
+>    keyword rows (7 clicks / 954 impressions, 0.73%) deliberately disagree with the
+>    `daily_search_summary` totals (9 / 2,250, 0.40%), so each of the three wrong pairings produces a
+>    different number and is caught. Everything derived from `expectedCtr` is still rendered with a
+>    `~` and one decimal, for the curve's own approximation as much as for the sampling.
 > 3. **The clicks sparkline was not built.** `totals.trend.gscSeries` carries the per-snapshot series
 >    in `/api/json`, but a 150×38 sparkline does not fit a KPI tile beside a value, a subtitle and a
 >    comparator chip, and shrinking one to fit would render a rolling overlapping window as a trend
@@ -562,8 +588,9 @@ fell by 3.2" against what baseline? Only the reader knows.
 - Every KPI tile gets a 14-day mean beneath it, computed from the history already loaded, through the
   same `splitDay` human/crawler split the cards use. No new queries for traffic metrics.
 - The `Search CTR` tile gets the position-adjusted expectation from `expectedCtr()`, impression
-  weighted over the stored per-query rows, rendered as `2.1%` with
-  `expected ~1.6% at this position mix` beneath it.
+  weighted over the stored per-query rows — **and the actual it is compared against is those same
+  rows**, with the whole-corpus CTR kept as the headline and labelled as such. See correction 2
+  above for what went wrong the first time.
 - Replace the `Avg search position` tile value. A mean across branded position-1 queries and
   position-90 junk is not a number any decision rests on. Use **median position across queries with
   ≥ `POSITION_MIN_IMPRESSIONS` (10) impressions**, and put `N of M queries in the top 10` in the

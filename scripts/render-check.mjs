@@ -78,7 +78,12 @@ const fixture = {
     gscClicks: 46, gscImpressions: 2200, gscCtr: .0209, gscPosition: 12.4, searchDataDomains: 2,
     // Median across queries clearing the impression floor, plus the position-mix
     // expectation the CTR tile is judged against (spec item 8).
-    gscMedianPosition: 9.4, gscPositionQueries: 18, gscTop10Queries: 11, gscExpectedCtr: .0161,
+    gscMedianPosition: 9.4, gscPositionQueries: 18, gscTop10Queries: 11,
+    // The CTR comparator is stated over ONE population on both sides: the stored
+    // top-query rows. The headline gscCtr above (2.09%) is the whole corpus and is
+    // deliberately a different number, so a tile that mixed the two would show it.
+    gscExpectedCtr: .059, gscSampleCtr: 41 / 900, gscSampleClicks: 41, gscSampleImpressions: 900,
+    gscSampleQueries: 18, gscSampleShare: 900 / 2200,
     opportunities: 2, snippetOpportunities: 1, rankOpportunities: 1,
     // 14-day comparators. GSC ones are counted in SNAPSHOTS, not days: each
     // snapshot covers a rolling three-day window lagging two days, so consecutive
@@ -271,9 +276,14 @@ const required = [
   "clicks a window lost to the snippet, not to the ranking",
   "too deep to be seen",
   // Item 8: comparators on every tile.
-  "Median search position", "9.4", "11 of 18 queries in the top 10",
+  "Median search position", "9.4", "11 of 18 stored top queries in the top 10",
   "1 snippet · 1 rank",
-  "expected ~1.6% at this position mix",
+  // Item 8, correction: both sides of the CTR comparator are the stored top-query
+  // rows and the tile says so. The headline (2.1% here) is the whole corpus, a
+  // visibly different number from the sample's 4.6%, because a top-query
+  // expectation is not a verdict on the corpus.
+  "headline covers every query",
+  "stored top 18 queries: 4.6% vs expected ~5.9% · 40.9% of impressions",
   "14-day mean 96/day", "186/day here",
   "14-snapshot mean 42", "14-snapshot mean 2.0%",
   "rolling windows 2026-06-29–2026-07-01 through 2026-07-12–2026-07-14",
@@ -384,6 +394,27 @@ if (noTrendHtml.includes(`<span class="cmp"`)) {
 }
 if (!html.includes(`<span class="cmp"`)) {
   throw new Error("The comparator chips did not render on the normal fixture");
+}
+
+// ---- The CTR comparator names its population (spec item 8, correction) -----
+// The expectation can only be computed over the stored top-query rows, so the
+// actual it is compared against must be those same rows. A bare
+// "expected ~N% at this position mix" beside a whole-corpus CTR is the bug.
+if (/expected ~[\d.]+% at this position mix/.test(html)) {
+  throw new Error("The CTR expectation renders without naming the population it covers");
+}
+// A sample covering a sliver of the corpus says so in the tile, not only in a
+// tooltip nobody hovers.
+const thinHtml = renderDashboard({
+  ...fixture,
+  totals: { ...fixture.totals,
+    gscSampleImpressions: 200, gscSampleShare: 200 / 2200 },
+});
+if (!thinHtml.includes("9.1% of impressions · thin sample")) {
+  throw new Error("A CTR comparator drawn from 9% of impressions did not declare itself thin");
+}
+if (html.includes("thin sample")) {
+  throw new Error("A comparator covering 41% of impressions was labelled thin");
 }
 
 // ---- Opportunity classes (spec item 7) ------------------------------------

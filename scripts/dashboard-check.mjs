@@ -699,14 +699,42 @@ for (const period of [7, 30]) {
     Object.keys(trend).some((key) => /^gsc.*PerDay$/.test(key)), false);
 
   // The live 0.4%, and the number that says whether 0.4% is bad.
+  //
+  // BOTH SIDES OF A COMPARATOR COME FROM THE SAME ROW SET. This is the second
+  // population mismatch this file has had to catch (item 4's error baseline
+  // counted unmeasured days as zero-error days), so it is asserted rather than
+  // reasoned about. The fixture is built so the two populations disagree on
+  // purpose: `daily_search_summary` says 9 clicks over 2,250 impressions (0.40%)
+  // for the whole corpus, while the stored top-query rows say 7 clicks over 954
+  // impressions (0.73%). Every wrong pairing therefore produces a different
+  // number, and the checks below pin the right one.
   check("search CTR is the live shape", totals.gscCtr.toFixed(3), "0.004");
   const mixImpressions = KEYWORDS.reduce((sum, row) => sum + row.impressions, 0);
+  const mixClicks = KEYWORDS.reduce((sum, row) => sum + row.clicks, 0);
   const mixExpected = KEYWORDS.reduce((sum, row) =>
     sum + row.impressions * expectedCtr(row.position), 0) / mixImpressions;
-  check("...with a position-adjusted expectation beside it",
+  check("the fixture's two populations disagree on CTR, so a mismatch cannot pass",
+    (mixClicks / mixImpressions).toFixed(4) !== totals.gscCtr.toFixed(4), true);
+  check("...the comparator's ACTUAL side is the stored rows",
+    totals.gscSampleCtr.toFixed(5), (mixClicks / mixImpressions).toFixed(5));
+  check("...the comparator's EXPECTED side is the same stored rows",
     totals.gscExpectedCtr.toFixed(5), mixExpected.toFixed(5));
-  check("...that is materially above what the fleet actually earns",
-    totals.gscExpectedCtr > totals.gscCtr, true);
+  check("...so the two sides share one denominator", totals.gscSampleImpressions, mixImpressions);
+  check("...and one click count", totals.gscSampleClicks, mixClicks);
+  check("...over one query count", totals.gscSampleQueries, KEYWORDS.length);
+  // The three ways this has gone wrong, each of which the fixture makes visible.
+  check("the comparator is NOT the corpus actual against a top-query expectation",
+    totals.gscSampleCtr.toFixed(5) === totals.gscCtr.toFixed(5), false);
+  check("...NOT the corpus clicks over the sample's impressions",
+    totals.gscSampleCtr.toFixed(5) === (totals.gscClicks / mixImpressions).toFixed(5), false);
+  check("...and NOT the sample's clicks over the corpus impressions",
+    totals.gscSampleCtr.toFixed(5) === (mixClicks / totals.gscImpressions).toFixed(5), false);
+  // Coverage, so a comparator drawn from a sliver of the corpus can be discounted.
+  check("the sample reports what share of impressions it covers",
+    totals.gscSampleShare.toFixed(4), (mixImpressions / totals.gscImpressions).toFixed(4));
+  check("...and the headline stays the whole corpus", totals.gscImpressions > mixImpressions, true);
+  check("the stored top queries still underperform their own position mix",
+    totals.gscExpectedCtr > totals.gscSampleCtr, true);
 
   // Median, not mean. The 62.0-position stray is exactly what a mean is dragged
   // around by and a median is not.

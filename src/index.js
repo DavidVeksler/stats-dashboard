@@ -360,6 +360,8 @@ async function loadDashboard(env, options = {}) {
         zone: { visits: 0, requests: 0, bytes: 0, sites: 0, hosts: [] },
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
         gscMedianPosition: 0, gscPositionQueries: 0, gscTop10Queries: 0, gscExpectedCtr: 0,
+        gscSampleCtr: 0, gscSampleClicks: 0, gscSampleImpressions: 0, gscSampleQueries: 0,
+        gscSampleShare: 0,
         trend: { window: COMPARATOR_DAYS, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0,
           gscSnapshots: 0, gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
           gscWindowFirst: null, gscWindowLast: null, gscSeries: [] },
@@ -706,11 +708,26 @@ async function loadDashboard(env, options = {}) {
   // weighted. An approximation over an approximation (see expectedCtr's source
   // note) and over the top rows GSC returns rather than every query, so it is
   // rendered with a "~" and one decimal and never as a target.
+  //
+  // TRAP — BOTH SIDES OF A COMPARATOR MUST COME FROM THE SAME ROWS. `expectedCtr`
+  // needs a per-query position, and the only per-query rows stored are GSC's top
+  // ~25 per site: a small, much better positioned sample. `totals.gscCtr` is the
+  // whole corpus out of `daily_search_summary`, deep tail included. The tile
+  // originally printed the corpus actual (0.4% over 58,832 impressions) beside
+  // this top-query expectation (~5.9%) and read as a 15x shortfall; the corpus
+  // mean position of 10.1 expects roughly 2.5%, so the real gap was nearer 6x.
+  // So the comparator is computed on BOTH sides over `latestKeywordRows` —
+  // `gscSampleCtr` and `gscExpectedCtr` share the `mixImpressions` denominator —
+  // and the renderer states which population each figure describes. This is the
+  // second population mismatch on this page (item 4's error baseline counted
+  // unmeasured days as zero-error days); see AGENTS.md.
   const mixImpressions = latestKeywordRows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
+  const mixClicks = latestKeywordRows.reduce((sum, row) => sum + Number(row.clicks || 0), 0);
   const expectedMixCtr = mixImpressions
     ? latestKeywordRows.reduce((sum, row) =>
       sum + Number(row.impressions || 0) * expectedCtr(Number(row.position)), 0) / mixImpressions
     : 0;
+  const sampleCtr = mixImpressions ? mixClicks / mixImpressions : 0;
   const totals = {
     visits: rumSites.reduce((a, s) => a + s.visits, 0),
     views: rumSites.reduce((a, s) => a + s.views, 0),
@@ -757,7 +774,14 @@ async function loadDashboard(env, options = {}) {
     gscMedianPosition: median,
     gscPositionQueries: positionRows.length,
     gscTop10Queries: positionRows.filter((row) => Number(row.position) <= 10).length,
+    // The CTR comparator's two sides, and the coverage that lets the reader weigh
+    // them. All four are the stored top-query rows and nothing else — never mix
+    // one of these with gscClicks/gscImpressions, which are the whole corpus.
     gscExpectedCtr: expectedMixCtr,
+    gscSampleCtr: sampleCtr,
+    gscSampleClicks: mixClicks,
+    gscSampleImpressions: mixImpressions,
+    gscSampleQueries: latestKeywordRows.length,
     trend: {
       window: COMPARATOR_DAYS,
       days: trafficTrend.length,
@@ -787,6 +811,11 @@ async function loadDashboard(env, options = {}) {
   totals.botShare = totals.visits + totals.botVisits
     ? totals.botVisits / (totals.visits + totals.botVisits) : 0;
   totals.gscCtr = totals.gscImpressions ? totals.gscClicks / totals.gscImpressions : 0;
+  // How much of the corpus the CTR comparator's sample actually covers. Reported
+  // on the tile so a comparator drawn from 5% of impressions can be discounted
+  // rather than read as a verdict on the headline.
+  totals.gscSampleShare = totals.gscImpressions
+    ? totals.gscSampleImpressions / totals.gscImpressions : 0;
   // Kept for /api/json continuity. The tile prints gscMedianPosition instead:
   // this mean is dragged around by whichever position-90 stray happens to be in
   // the stored rows, which is why it was never a number to act on.

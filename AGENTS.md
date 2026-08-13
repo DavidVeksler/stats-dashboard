@@ -158,6 +158,26 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   clicks and ~0.94 potential clicks. Every rendered badge reads `snippet` or `rank`; a bare
   `opportunity` badge is a regression, because it names a problem without naming which of two
   unrelated fixes applies.
+- **BOTH SIDES OF A COMPARATOR MUST COME FROM THE SAME POPULATION, and the tile must name it.**
+  This has gone wrong twice, in different shapes, so it is a rule rather than a habit.
+  (1) **The Search CTR tile.** The headline `totals.gscCtr` is the whole corpus out of
+  `daily_search_summary` — every query on every property, deep tail included, 58,832 impressions —
+  but `expectedCtr` needs a per-query position and the only per-query rows stored are GSC's top ~25
+  per site, a small and much better positioned sample. The tile printed `0.4%` beside
+  `expected ~5.9% at this position mix` and asserted a 15× shortfall; the corpus mean position of
+  10.1 expects roughly 2.5%, so the real gap was nearer 6×. The comparator is now computed on both
+  sides over `latestKeywordRows` (`totals.gscSampleCtr` and `totals.gscExpectedCtr` share the
+  `gscSampleImpressions` denominator), the headline is labelled `headline covers every query`, and
+  `totals.gscSampleShare` states the sample's impression coverage — `thin sample` below
+  `THIN_SAMPLE_SHARE`. Same fix in the position tile's subtitle: `N of M **stored top** queries in
+  the top 10`, because `7 of 11 queries` read as though the estate had 11 queries.
+  (2) **The `error-spike` baseline** counted days with no `daily_zone_status` row as 0%-error days,
+  so an unmeasured stretch dragged the mean down and manufactured a spike out of an ordinary day;
+  `errorSeries` now builds the series from measured days only. `dashboard-check.mjs` asserts the CTR
+  comparator's two sides against a fixture whose stored keyword rows deliberately disagree with the
+  `daily_search_summary` totals, so a mismatch fails the check rather than shipping. Before adding
+  any comparator, say out loud which rows each side is drawn from; if the answer differs, it is not
+  a comparison.
 - **`expectedCtr()` is an approximation and the page must never treat it as a target.** The anchors
   are the SISTRIX 2020 CTR study (positions 1, 2, 3, 10 measured over ~80M keywords); positions 4–9
   are log-linear interpolation between them, and everything past 10 is our own estimate of a flat
