@@ -13,6 +13,19 @@
 // A `sc-domain:` property also covers every subdomain, so any row pointing at
 // one needs a `gscPageFilter` whenever a sibling subdomain has its own row here
 // — otherwise the parent row counts the sibling's clicks a second time.
+//
+// Optional `queryDenyPatterns: ["…"]` lists JS regex sources (matched
+// case-insensitively against the query text) for search queries a site will
+// never pursue. A denied query is still shown in that site's query list — the
+// data stays honest — it is only excluded from the snippet/rank opportunity
+// classes and from the headline opportunity count, so the recommendation list
+// stays a list of things somebody actually intends to do. It ships unset on
+// every site: which queries a site declines to chase is an editorial decision,
+// not something this repo should make on the owner's behalf. To populate one,
+// add the field to that site's entry, e.g.
+//   queryDenyPatterns: ["^some phrase$", "another\\s+phrase"],
+// and nothing else changes — `src/opportunities.js` compiles it lazily and a
+// malformed pattern denies nothing rather than breaking the page.
 export const SITES = [
   {
     // objectivismonline.com (and its www alias) is just a landing page in front
@@ -102,9 +115,20 @@ const SEARCH_ENGINES = ["google.", "bing.", "duckduckgo.", "search.brave.", "yan
 const SOCIAL = ["reddit.", "reddit.frontpage", "linkedin.", "facebook.", "x.com", "t.co", "twitter.", "instagram.", "youtube.", "news.ycombinator", "mastodon", "bsky", "t.me", "telegram"];
 
 // Classify a refererHost into a source type for the dashboard tags.
-export function classifyReferrer(refHost) {
+//
+// `selfHost`, when given, is the primary host of the site being measured. A
+// referer that maps back to that same site through HOST_ALIASES is internal
+// navigation between the site's own hostnames (an apex landing page handing off
+// to the forum, say), which is a real and attributable category — it used to be
+// dropped on the floor and reappear as an unattributable residual in the traffic
+// sources panel. Note this kind is frozen into daily_referrers at write time, so
+// it only exists on rows written after 2026-08-13; rows stored before that carry
+// no "internal" at all and the panel treats the channel as absent rather than
+// measured-zero for those days.
+export function classifyReferrer(refHost, selfHost = null) {
   if (!refHost) return "direct";
   const h = refHost.toLowerCase();
+  if (selfHost && HOST_ALIASES.get(refHost) === selfHost) return "internal";
   if (SEARCH_ENGINES.some((s) => h.includes(s))) return "search";
   if (SOCIAL.some((s) => h.includes(s))) return "social";
   return "ref";

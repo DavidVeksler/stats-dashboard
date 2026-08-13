@@ -15,8 +15,10 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
 | Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `runs`), not docs |
-| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1, 2 and 3 implemented; the rest proposed) |
-| What counts as a search "opportunity" | `src/opportunities.js` — one predicate, imported by both `index.js` and `render.js` |
+| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 implemented; 9, 10, 11 proposed) |
+| What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
+| Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
+| Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | Everything else | this file |
 
 ## What this is
@@ -48,8 +50,11 @@ traffic shapes — since a false positive deletes real traffic from the dashboar
 layer above it (`scripts/dashboard-check.mjs` drives `loadDashboard` against a stubbed D1, because
 that is where a flooded day used to erase a whole site card, and where the signal rules are exercised
 end-to-end against the real 2026-08-13 fixtures), and a render smoke test.
-`node scripts/dashboard-check.mjs --signals` prints the signal list those fixtures produce, which is
-the fastest way to see what a rule change does. Beyond that, verification is
+`node scripts/dashboard-check.mjs --signals` prints the signal list those fixtures produce, and
+`--opportunities` prints both ranked opportunity classes; between them they are the fastest way to
+see what a rule, threshold or CTR-curve change does. `npm run preview` writes `.preview/dashboard.html`
+for inspection without deploying (the WAF blocks non-browser user agents on the live host, so parse
+the file rather than curling the site). Beyond that, verification is
 end-to-end: hit `/run` and read the returned `{gscOk, totalVisits, humanVisits, botVisits, notes}`,
 or inspect the `runs` table in D1. `npm run dev` runs
 `wrangler dev` locally, but the data pulls need the real secrets and network.
@@ -82,15 +87,23 @@ are not comparable to them. Summing them produced a headline "pages / session" o
 against a true RUM figure of 1.46 over 953 sessions. Zone-sourced sites are not dropped: zone logs
 are the only instrumentation those hosts have. They are reported in their own units.
 
-The **search-opportunity predicate lives once**, in `src/opportunities.js` (`isOpportunity` plus its
-named thresholds). `loadDashboard` uses it for `totals.opportunities`, `render.js` uses it for the
-badge, and the footer prose interpolates the same constants. It used to exist twice, over different
-row sets, so the headline count could exceed the visible badges with no way to tell that from a bug.
+The **search-opportunity classifier lives once**, in `src/opportunities.js` (`classifyOpportunity`
+plus its named thresholds; `isOpportunity` is the boolean form and `rankOpportunities` the sorted
+form). `loadDashboard` uses it for `site.opportunities` and the headline counts, `render.js` uses it
+for the badge, `signals.js` reads the ranked lists, and the footer prose interpolates the same
+constants. It used to exist twice, over different row sets, so the headline count could exceed the
+visible badges with no way to tell that from a bug.
+
+**Every KPI tile carries a comparator**, built in `loadDashboard` from history it has already read —
+`totals.trend` holds the 14-day means, and no new query was added for any of them. A number that
+answers none of *is this normal? / what changed? / what do I do?* is decoration, so a bare figure on
+a tile is a bug, not a style choice.
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics
 `requestHost`) to its exact GSC property string (`sc-domain:…` or a URL prefix). An optional
-`gscPageFilter` RE2 expression narrows a broad GSC property by result page URL.
+`gscPageFilter` RE2 expression narrows a broad GSC property by result page URL. An optional
+`queryDenyPatterns` array excludes queries from the opportunity classes — see the gotcha below.
 
 ## Non-obvious gotchas (these will bite you)
 
@@ -108,8 +121,73 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   zone errors with "unknown field"). `pullTraffic` queries all `CF_ACCOUNTS` and merges rows by
   `requestHost`, because a host can live on any account.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
-  pageview, so internal navigation (`refererHost === requestHost`) carries `visits: 0` and is
-  intentionally dropped from referrers. Cloudflare's free tier doesn't expose unique visitors.
+  pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and
+  contributes nothing either way. A hop between a site's *own different* hostnames does start a
+  session — see the `internal` kind below. Cloudflare's free tier doesn't expose unique visitors.
+- **`kind: "internal"` in `daily_referrers` is FORWARD-ONLY and cannot be backfilled.** Referrer
+  kinds are frozen into the row at write time by `topReferrers` → `classifyReferrer(ref, selfHost)`,
+  so no row stored before 2026-08-13 carries it and no migration can add one — the referer that
+  would decide it is not in D1 at all. A session arriving from one of a site's own alias hostnames
+  (an apex landing page handing off to the forum) used to be counted in `rec.visits` with its
+  referrer row dropped, so it reappeared as an unattributable residual in the traffic-source panel.
+  Consequences to preserve: `totals.internalMeasured` says whether **any** row *in the selected
+  window and for the selected hosts* carries the kind, and when it does not the channel is **omitted
+  from the panel entirely** rather than drawn as `Internal 0 · 0.0%`. A rendered zero there would
+  assert a measurement nobody took. This matters most in `?period=7` and `?period=30`, which still
+  reach back over pre-change rows — test both, not only the 24h view.
+- **`Unattributed` is a residual, not a channel, and must never be rendered as one.** It is
+  `visits - (direct + search + social + referral + internal)`, so it measures the disagreement
+  between two tables rather than any behavior. It used to be called `Other / unlisted` and rendered
+  as a fifth segment competing with Direct and Search — at which point the largest "channel" on the
+  page (1,060 of 2,012 sessions, 52.7%) was an accounting hole. It now renders **outside** the
+  percentage bar as a footnote with its causes named (top-50-per-host-day referrer truncation, and
+  the pre-`internal` rows above). Do not put it back in the bar, and do not close the gap by
+  inventing an attribution for it.
+- **Two opportunity classes, two remedies, and deliberately TWO SORT METRICS.** `snippet` is a query
+  at position ≤ `SNIPPET_MAX_POSITION` taking under `SNIPPET_CTR_RATIO` of `expectedCtr(position)`:
+  it already ranks, so the fix is the title and meta description, and it is ranked by **lost
+  clicks** = `impressions × (expectedCtr(position) − ctr)`. `rank` is a query between
+  `SNIPPET_MAX_POSITION` and `RANK_MAX_POSITION`: nobody ever saw the snippet, so the fix is content
+  and internal links, and it is ranked by **potential clicks** = `impressions ×
+  expectedCtr(TARGET_POSITION) − clicks`. Past `RANK_MAX_POSITION` a query is neither badged nor
+  counted. **Do not unify the two metrics.** Lost clicks measures what is recoverable *at the current
+  rank*, which is right for a snippet and structurally near-zero for a ranking problem: every
+  ranking-class query in the fixtures scores under `MIN_ACTIONABLE_CLICKS` on lost clicks, so a
+  single lost-clicks gate would not demote that class, it would delete it. The live case is
+  `bitcoin recovery` on walletrecovery.info — 13 impressions, 0 clicks, position 31.2, ~0.07 lost
+  clicks and ~0.94 potential clicks. Every rendered badge reads `snippet` or `rank`; a bare
+  `opportunity` badge is a regression, because it names a problem without naming which of two
+  unrelated fixes applies.
+- **`expectedCtr()` is an approximation and the page must never treat it as a target.** The anchors
+  are the SISTRIX 2020 CTR study (positions 1, 2, 3, 10 measured over ~80M keywords); positions 4–9
+  are log-linear interpolation between them, and everything past 10 is our own estimate of a flat
+  tail. It is a 2020 average across every query intent there is, so branded queries beat it and
+  AI-Overview queries lose to it badly. Hence: nothing derived from it renders with more than one
+  decimal place, it is always prefixed `expected ~`, and no threshold fires on a small shortfall
+  against it (`SNIPPET_CTR_RATIO` is 0.5 for exactly this reason). If you replace the curve, keep the
+  sourced-and-dated comment and keep the measured/interpolated/estimated distinction explicit.
+- **`queryDenyPatterns` exists and ships unset on every site — leave it that way.** It is an optional
+  array of JS regex *sources* (matched case-insensitively against the query text) on a `SITES` entry
+  in `src/config.js`. A matching query still renders in that site's query list, carries no badge, and
+  is excluded from the two classes and the headline count, so the data stays honest while the
+  recommendation list stays usable. To populate one, add the field to that site's entry and change
+  nothing else; a malformed pattern denies nothing rather than throwing. **Which queries a site
+  declines to pursue is the owner's editorial call**, so do not add patterns to any site on your own
+  judgment — surface the query and ask.
+- **GSC rows are a ROLLING WINDOW keyed by snapshot date, not a daily series.** `daily_keywords`,
+  `daily_pages` and `daily_search_summary` are all read over the history window now (widened from
+  latest-day-only for the comparators; read-side only, all three always stored a row per day). Each
+  snapshot asks Google for `date-4 … date-2`, so **consecutive rows overlap by two days out of
+  three** and a day-over-day difference between them is not a like-for-like change. Only trailing
+  means are computed from them, the comparator is stated per *snapshot* rather than per day
+  (`trend.gscClicksPerSnapshot`, never a `PerDay` name — `dashboard-check.mjs` asserts no such field
+  exists), and **any date a human reads comes from `gsc_window`**, which is what Google measured,
+  never from the row's `date`, which is only when we asked.
+- **Search position on the tile is a MEDIAN, not a mean.** Median across queries with at least
+  `POSITION_MIN_IMPRESSIONS` impressions, with the top-10 count in the subtitle. An impression-
+  weighted mean is dragged around by whichever position-60 stray happens to be in the stored rows and
+  stays put when the work lands. `totals.gscPosition` still holds the old mean for `/api/json`
+  continuity; do not put it back on a tile.
 - **Crawlers are counted as humans by RUM, and we do NOT block them.** These sites opt into AI
   training (`Content-Signal: ai-train=yes`); the fix is measurement, not blocking. `src/bots.js`
   classifies each *site-day* and sets aside "floods" (≥90% direct, ≤1.15 pages/session, ≥500
@@ -175,7 +253,9 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
 - **Footer prose is interpolated, not retyped.** The flood thresholds and the opportunity
   thresholds in `render.js`'s footer come from the exported constants in `src/bots.js`
   (`FLOOD_MIN_VISITS`, `FLOOD_MULTIPLE`, `FLAT_PAGES_PER_SESSION`, `DIRECT_SHARE`) and
-  `src/opportunities.js`. `render-check.mjs` asserts the rendered sentence against those same
+  `src/opportunities.js` (`SNIPPET_MAX_POSITION`, `RANK_MAX_POSITION`, `TARGET_POSITION`,
+  `SNIPPET_CTR_RATIO`, `OPPORTUNITY_MIN_IMPRESSIONS`, `MIN_ACTIONABLE_CLICKS`,
+  `POSITION_MIN_IMPRESSIONS`). `render-check.mjs` asserts the rendered sentence against those same
   imports, so changing a threshold and not the prose fails `npm run check`. The prose had already
   drifted once: it claimed flooded days were "excluded whole, from sessions, referrers, and landing
   pages alike" for as long as `splitDay` had been keeping the referred sessions.
@@ -185,7 +265,10 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   signal, it is a different quantity wearing the same words — the live NOTABLE list led with exactly
   that for library.freecapitalists.org. Zone hosts are eligible **only for zone-specific rules**;
   today that is `error-spike`. The gate reads `site.measurement` / `site.zoneSourced`, never a
-  hostname. Adding a rule means deciding which class it belongs to first.
+  hostname. Adding a rule means deciding which class it belongs to first. The two search rules
+  (`snippet-gap`, `rank-gap`) sit inside the RUM branch for the same reason the rest do; they
+  replaced a single generic `search-opportunity` placeholder whose action text ("rewrite the titles
+  and meta descriptions") was correct for only one of the two problems it fired on.
 - **Every ratio rule carries an absolute floor.** A percentage on a single-digit base is noise
   dressed as signal (`whopaysforai.org ↑600%` was 6 sessions to 7). `DELTA_MIN_ABSOLUTE` in
   `src/signals.js` is imported by `deltaBadge` in `src/render.js` so the per-card badge and the

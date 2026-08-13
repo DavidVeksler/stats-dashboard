@@ -48,12 +48,17 @@ export async function pullTraffic(env, startISO, endISO) {
       const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
       rec.views += g.count;
       rec.visits += g.sum.visits;
-      // A session ("visit") is only counted on its first pageview, so internal
-      // navigation (refererHost === host) carries visits: 0 and drops out here.
+      // A session ("visit") is only counted on its first pageview, so navigation
+      // within one hostname carries visits: 0 and contributes nothing here either
+      // way. A hop between a site's own hostnames (landing page -> forum) does
+      // start a session, and used to be dropped entirely: the visits were already
+      // counted in rec.visits but no referrer row was written, so the sessions
+      // reappeared in the traffic-source panel as an unattributable residual.
+      // They are kept now and classified as kind "internal" (topReferrers passes
+      // `host` through to classifyReferrer), which is a real category rather than
+      // a hole.
       const ref = g.dimensions.refererHost || "(direct)";
-      // Compare through the alias map so a hop between a site's own hostnames
-      // (landing page -> forum) counts as internal, not as a referral to itself.
-      if (g.sum.visits > 0 && HOST_ALIASES.get(ref) !== host) {
+      if (g.sum.visits > 0) {
         rec.referrers.set(ref, (rec.referrers.get(ref) ?? 0) + g.sum.visits);
       }
       // Landing pages: summing visits (session-starts) by requestPath tells us
@@ -191,11 +196,18 @@ export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
 }
 
 // Flatten a referrers Map into a sorted, classified, top-N array.
-export function topReferrers(referrers, n = 8) {
+//
+// `selfHost` is the site's primary host. Passing it is what lets a referral from
+// one of the site's own hostnames be stored as kind "internal" instead of being
+// counted as an outside referral to itself. The kind is frozen into
+// daily_referrers here, at write time, so it can never be recovered for rows
+// already stored — see classifyReferrer.
+export function topReferrers(referrers, n = 8, selfHost = null) {
   return [...referrers.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, n)
-    .map(([referrer, visits]) => ({ referrer, visits, kind: classifyReferrer(referrer === "(direct)" ? "" : referrer) }));
+    .map(([referrer, visits]) => ({ referrer, visits,
+      kind: classifyReferrer(referrer === "(direct)" ? "" : referrer, selfHost) }));
 }
 
 // Flatten a pages Map into a sorted, top-N array, ranked by landing sessions.

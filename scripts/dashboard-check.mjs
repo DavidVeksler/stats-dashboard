@@ -7,6 +7,7 @@
 // where a flooded day used to erase a site's traffic, referrers and all.
 import worker from "../src/index.js";
 import { looksMalformed } from "../src/urls.js";
+import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS } from "../src/opportunities.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -125,6 +126,66 @@ const ZONE_STATUSES = [
 // before ensureSchema has created daily_zone_bots.
 let zoneBotsTableExists = true;
 
+// ---- Search Console fixtures (spec items 7 and 8) -------------------------
+// The three queries in the spec's acceptance list, with their real 2026-08-13
+// numbers, plus enough neighbours on each host that "not in the top 5 by its
+// class metric" is a statement about a list rather than about an empty array.
+//
+//   bitcoin recovery        13 imp, 0 clk, pos 31.2  -> must surface as `rank`
+//   incest forum            61 imp, 1 clk, pos 12.8  -> must not make the top 5
+//   frontier ai labs list    6 imp, 2 clk, pos  2.5  -> must not be flagged at all
+//
+// The first two are why the split exists: one metric cannot rank both, because
+// lost clicks measures what is recoverable at the CURRENT rank and that is zero
+// by construction for a query nobody can see.
+const WALLET_HOST = "walletrecovery.info";
+const FORUM_HOST = "forum.objectivismonline.com";
+const SHEETS_HOST = "cheatsheets.davidveksler.com";
+const KEYWORD_DATE = "2026-08-09";
+const KEYWORDS = [
+  // walletrecovery.info — a ranking problem, which is this site's whole shape.
+  { host: WALLET_HOST, query: "bitcoin recovery", clicks: 0, impressions: 13, position: 31.2 },
+  { host: WALLET_HOST, query: "recover lost bitcoin wallet", clicks: 0, impressions: 40, position: 22.4 },
+  { host: WALLET_HOST, query: "crypto wallet recovery service", clicks: 1, impressions: 55, position: 18.7 },
+  { host: WALLET_HOST, query: "forgot my wallet password", clicks: 0, impressions: 9, position: 27.0 },
+  { host: WALLET_HOST, query: "bitcoin private key recovery", clicks: 0, impressions: 25, position: 41.5 },
+  // Past RANK_MAX_POSITION: real, but a content project rather than a task, so
+  // neither badged nor counted.
+  { host: WALLET_HOST, query: "lost seed phrase", clicks: 0, impressions: 30, position: 62.0 },
+  { host: WALLET_HOST, query: "wallet recovery", clicks: 0, impressions: 90, position: 9.2 },
+  // forum.objectivismonline.com — five snippet gaps that all outrank the query
+  // the old mechanical predicate led with.
+  { host: FORUM_HOST, query: "incest forum", clicks: 1, impressions: 61, position: 12.8 },
+  { host: FORUM_HOST, query: "objectivism forum", clicks: 0, impressions: 120, position: 6.4 },
+  { host: FORUM_HOST, query: "ayn rand forum", clicks: 1, impressions: 200, position: 8.1 },
+  { host: FORUM_HOST, query: "objectivism online", clicks: 2, impressions: 150, position: 4.5 },
+  { host: FORUM_HOST, query: "is altruism evil", clicks: 0, impressions: 45, position: 11.0 },
+  { host: FORUM_HOST, query: "rand quotes", clicks: 0, impressions: 30, position: 13.5 },
+  // cheatsheets — one page already performing at its position, one that is not.
+  { host: SHEETS_HOST, query: "frontier ai labs list", clicks: 2, impressions: 6, position: 2.5 },
+  { host: SHEETS_HOST, query: "regex cheatsheet", clicks: 0, impressions: 80, position: 7.7 },
+].map((row) => ({ ...row, date: KEYWORD_DATE, gsc_window: "2026-08-05–2026-08-07" }));
+
+// daily_search_summary stores one row per snapshot per host and always has. The
+// rows are a ROLLING window keyed by snapshot date — each covers date-4..date-2,
+// so consecutive rows overlap by two days out of three — which is why only
+// trailing means are taken from them and why gsc_window, not date, is what a
+// human reads. Latest day: 9 clicks over 2,250 impressions, i.e. the live 0.4%.
+const GSC_WINDOW = {
+  "2026-08-05": "2026-08-01–2026-08-03", "2026-08-06": "2026-08-02–2026-08-04",
+  "2026-08-07": "2026-08-03–2026-08-05", "2026-08-08": "2026-08-04–2026-08-06",
+  "2026-08-09": "2026-08-05–2026-08-07",
+};
+const SEARCH_SUMMARIES = [
+  ["2026-08-05", WALLET_HOST, 2, 400, 25.0], ["2026-08-05", FORUM_HOST, 8, 1400, 15.9], ["2026-08-05", SHEETS_HOST, 3, 300, 9.9],
+  ["2026-08-06", WALLET_HOST, 1, 410, 24.6], ["2026-08-06", FORUM_HOST, 7, 1450, 15.7], ["2026-08-06", SHEETS_HOST, 2, 310, 9.8],
+  ["2026-08-07", WALLET_HOST, 2, 415, 24.4], ["2026-08-07", FORUM_HOST, 5, 1470, 15.5], ["2026-08-07", SHEETS_HOST, 3, 320, 9.6],
+  ["2026-08-08", WALLET_HOST, 1, 418, 24.2], ["2026-08-08", FORUM_HOST, 6, 1490, 15.4], ["2026-08-08", SHEETS_HOST, 2, 325, 9.5],
+  ["2026-08-09", WALLET_HOST, 1, 420, 24.1], ["2026-08-09", FORUM_HOST, 6, 1500, 15.3], ["2026-08-09", SHEETS_HOST, 2, 330, 9.4],
+].map(([date, host, clicks, impressions, position]) => ({
+  date, host, clicks, impressions, ctr: clicks / impressions, position, gsc_window: GSC_WINDOW[date],
+}));
+
 const traffic = [
   ...DAYS.map((day) => ({
     date: day.date, host: HOST, visits: day.visits, views: Math.round(day.visits * day.pps),
@@ -147,6 +208,17 @@ const referrers = [
     { date: day.date, host: WIKI_HOST, referrer: "(direct)", kind: "direct", visits: day.direct },
     { date: day.date, host: WIKI_HOST, referrer: "www.google.com", kind: "search", visits: day.visits - day.direct },
   ]),
+  // 2026-08-08 is a HISTORICAL day, written before kind "internal" existed: the
+  // alias-host sessions it carried were dropped rather than stored, and no
+  // backfill can recover them because the kind is frozen into the row at write
+  // time. 2026-08-09 is written after the change and carries the internal row.
+  // 40 sessions with 38 referrer rows also leaves a 2-session residual, which is
+  // what the top-50-per-host-day truncation looks like in real data.
+  { date: "2026-08-08", host: SMALL_HOST, referrer: "(direct)", kind: "direct", visits: 15 },
+  { date: "2026-08-08", host: SMALL_HOST, referrer: "www.google.com", kind: "search", visits: 12 },
+  { date: "2026-08-09", host: SMALL_HOST, referrer: "(direct)", kind: "direct", visits: 20 },
+  { date: "2026-08-09", host: SMALL_HOST, referrer: "www.google.com", kind: "search", visits: 12 },
+  { date: "2026-08-09", host: SMALL_HOST, referrer: "www.davidveksler.com", kind: "internal", visits: 6 },
 ];
 const nonDirect = (date) =>
   referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
@@ -162,6 +234,12 @@ const db = {
       if (sql.includes("FROM runs")) return { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
       if (sql.includes("daily_traffic")) return { results: between(traffic, binds) };
       if (sql.includes("daily_referrers")) return { results: between(referrers, binds) };
+      // All three GSC reads span the history window now (spec item 8). They were
+      // latest-day-only, which is why no search figure on the page had a
+      // comparator. The date filter here is what proves the panels still narrow
+      // back down to the latest snapshot.
+      if (sql.includes("daily_keywords")) return { results: between(KEYWORDS, binds) };
+      if (sql.includes("daily_search_summary")) return { results: between(SEARCH_SUMMARIES, binds) };
       if (sql.includes("daily_cf_pages")) return { results: between(ZONE_PAGES, binds) };
       // Read over the whole history window now, not just the latest day: the
       // error-spike baseline lives in these rows.
@@ -420,6 +498,25 @@ const load = async (query) => {
   check("looksMalformed tolerates a missing path", looksMalformed(undefined), false);
 }
 
+// `node scripts/dashboard-check.mjs --opportunities` prints both ranked classes
+// across every fixture site. The two lists are ranked by different metrics, so
+// this is the fastest way to see what moving a threshold or the CTR curve does to
+// each of them independently.
+if (process.argv.includes("--opportunities")) {
+  const { data } = await load("period=1");
+  for (const kind of ["snippet", "rank"]) {
+    const rows = data.sites.flatMap((site) =>
+      site.opportunities[kind].map((row) => ({ host: site.host, ...row })));
+    rows.sort((a, b) => b.score - a.score);
+    console.log(`\n${kind.toUpperCase()} — ranked by ${kind === "snippet" ? "lost clicks" : `potential clicks at position ${TARGET_POSITION}`} (${rows.length} total)`);
+    for (const row of rows.slice(0, 5)) {
+      console.log(`  ${row.score.toFixed(2)}  ${row.query} — ${row.host}, ` +
+        `${row.impressions} imp, ${row.clicks} clk, pos ${row.position.toFixed(1)}, ` +
+        `${(row.ctr * 100).toFixed(1)}% CTR vs ~${(row.expectedCtr * 100).toFixed(1)}% expected there`);
+    }
+  }
+}
+
 // `node scripts/dashboard-check.mjs --signals` prints the list these fixtures
 // produce, which is the fastest way to see what a rule change does to it.
 if (process.argv.includes("--signals")) {
@@ -436,6 +533,221 @@ if (process.argv.includes("--signals")) {
   const severityOne = (data.signals ?? []).filter((s) => s.severity === 1);
   check("there is a severity-1 finding for the push to carry", severityOne.length > 0, true);
   check("...and it is the head of the list", data.signals[0].severity, 1);
+}
+
+// 9. Traffic sources (spec item 6). "Other / unlisted" was 1,060 of 2,012
+//    sessions — a channel panel whose largest bucket was an accounting hole.
+//    Item 1 removed the zone host from it; what is checked here is that the
+//    residual is small, is named for what it is, and that internal navigation is
+//    recovered as a real channel instead of falling into it.
+{
+  const { data } = await load("period=1");
+  const mix = data.totals.sourceMix;
+  const small = data.sites.find((s) => s.host === SMALL_HOST);
+
+  check("the residual is named for what it is, not passed off as a channel",
+    "unattributed" in mix && !("other" in mix), true);
+  check("...and is a rounding error rather than the largest bucket",
+    mix.unattributed / data.totals.visits < .05, true);
+  check("...at exactly the sessions no referrer row covers", mix.unattributed, 2);
+  check("self-referrals are recovered as their own channel", mix.internal, 6);
+  check("...on the site they arrived at", small.sources.internal, 6);
+  check("...and are no longer counted as unattributed", small.sources.unattributed, 2);
+  check("every channel plus the residual accounts for every RUM session",
+    mix.direct + mix.search + mix.social + mix.referral + mix.internal + mix.unattributed,
+    data.totals.visits);
+  check("the mix stays RUM-only", mix.direct + mix.search + mix.social + mix.referral + mix.internal
+    <= data.totals.visits, true);
+  check("the internal channel is flagged as measured when a row carries it",
+    data.totals.internalMeasured, true);
+}
+
+// 9b. The historical case, and the reason item 6 needs one. `kind` is frozen into
+//     daily_referrers by classifyReferrer at WRITE time, so no row stored before
+//     the change can ever carry "internal" and no backfill can add it. A window
+//     with no such row must report the channel as absent — a rendered 0% would
+//     assert a measurement nobody took. Checked over 7 and 30 days, not just 24h,
+//     because those are the windows that still reach back over old rows.
+for (const period of [7, 30]) {
+  const { data } = await load(`domain=${HOST}&period=${period}`);
+  check(`a ${period}-day window of pre-change rows reports internal as absent`,
+    data.totals.internalMeasured, false);
+  check(`...rather than as a measured zero (${period}d)`, data.totals.sourceMix.internal, 0);
+  check(`...while still attributing everything it did measure (${period}d)`,
+    data.totals.sourceMix.unattributed, 0);
+  // ...and the site itself still renders its real traffic over that window.
+  const site = data.sites.find((s) => s.host === HOST);
+  check(`...with the historical days intact (${period}d)`, site.visits > 0, true);
+}
+{
+  // The same 30-day window across every site DOES contain a post-change row, so
+  // the channel is measured there. The flag is about the window, not the period.
+  const { data } = await load("period=30");
+  check("a mixed window with one post-change row measures the channel",
+    data.totals.internalMeasured, true);
+  check("...counting only what was actually stored", data.totals.sourceMix.internal, 6);
+}
+
+// 10. The snippet/rank split (spec item 7). One label used to cover two opposite
+//     problems with nothing in common but the word "opportunity", and ranking both
+//     by lost clicks guaranteed that a deep, valuable query lost to a shallow one.
+{
+  const { data } = await load("period=1");
+  const wallet = data.sites.find((s) => s.host === WALLET_HOST);
+  const forum = data.sites.find((s) => s.host === FORUM_HOST);
+  const sheets = data.sites.find((s) => s.host === SHEETS_HOST);
+  const named = (rows) => rows.map((row) => row.query);
+
+  // The query that motivated the item. 13 impressions at position 31.2 fails both
+  // of the spec's original gates (>= 20 impressions, position 16-30) and would
+  // still have been invisible.
+  const bitcoin = wallet.opportunities.rank.find((row) => row.query === "bitcoin recovery");
+  check("`bitcoin recovery` surfaces at all", Boolean(bitcoin), true);
+  check("...as a ranking problem, not a snippet one", bitcoin?.kind, "rank");
+  check("...scored by what it would earn at the target position",
+    bitcoin?.potentialClicks.toFixed(2), (13 * expectedCtr(TARGET_POSITION)).toFixed(2));
+  check("...which is a different metric from lost clicks", bitcoin?.lostClicks, null);
+  check("...and it is not in the snippet class",
+    wallet.opportunities.snippet.some((row) => row.query === "bitcoin recovery"), false);
+
+  // The reason the two classes cannot share one metric. Lost clicks measures what
+  // is recoverable AT THE CURRENT RANK, and at position 31 that is nothing by
+  // construction: every ranking-class query here scores under the actionable
+  // floor on it, so a single lost-clicks gate would not have demoted them, it
+  // would have deleted the whole class.
+  check("no ranking-class query clears the actionable floor on lost clicks",
+    wallet.opportunities.rank.every((row) =>
+      row.impressions * (expectedCtr(row.position) - row.ctr) < MIN_ACTIONABLE_CLICKS), true);
+  check("...including the one this item exists for",
+    (13 * expectedCtr(31.2)) < MIN_ACTIONABLE_CLICKS, true);
+  check("...while it clears the floor comfortably on its own metric",
+    bitcoin?.potentialClicks > MIN_ACTIONABLE_CLICKS, true);
+
+  check("rank opportunities are sorted by potential clicks, descending",
+    wallet.opportunities.rank.every((row, i) =>
+      i === 0 || wallet.opportunities.rank[i - 1].potentialClicks >= row.potentialClicks), true);
+  check("...five of them on this site", wallet.opportunities.rank.length, 5);
+  check("...and a query past RANK_MAX_POSITION is neither badged nor counted",
+    named([...wallet.opportunities.rank, ...wallet.opportunities.snippet]).includes("lost seed phrase"), false);
+
+  // The query the old mechanical predicate led with. It is not merely demoted:
+  // at 1.6% CTR against roughly 1.9% expected at position 12.8, it is performing
+  // close enough to its rank that no rewrite would recover anything.
+  check("`incest forum` is not classified as an opportunity at all",
+    classifyOpportunity({ query: "incest forum", clicks: 1, impressions: 61, position: 12.8 }), null);
+  check("...so it cannot be in the top five by its class metric",
+    named(forum.opportunities.snippet.slice(0, 5)).includes("incest forum"), false);
+  check("...while five real snippet gaps on that site are",
+    forum.opportunities.snippet.length, 5);
+  check("...led by the biggest recoverable loss",
+    forum.opportunities.snippet[0].query, "objectivism online");
+  check("snippet opportunities are sorted by lost clicks, descending",
+    forum.opportunities.snippet.every((row, i) =>
+      i === 0 || forum.opportunities.snippet[i - 1].lostClicks >= row.lostClicks), true);
+
+  // Already performing at its position: 33% CTR at position 2.5 beats the ~13%
+  // the position would ordinarily deliver. Nothing to fix.
+  check("a query beating its position's expected CTR is not flagged",
+    classifyOpportunity({ query: "frontier ai labs list", clicks: 2, impressions: 6, position: 2.5 }), null);
+  check("...and does not appear on its site's lists",
+    named([...sheets.opportunities.snippet, ...sheets.opportunities.rank])
+      .includes("frontier ai labs list"), false);
+  check("...while the site's real snippet gap does", sheets.opportunities.snippet[0]?.query, "regex cheatsheet");
+
+  check("the headline count is the two classes and nothing else",
+    data.totals.opportunities, data.totals.snippetOpportunities + data.totals.rankOpportunities);
+  check("...seven snippet gaps", data.totals.snippetOpportunities, 7);
+  check("...and five ranking gaps", data.totals.rankOpportunities, 5);
+
+  // queryDenyPatterns: built, documented, and shipped unset. Which queries a site
+  // declines to pursue is an editorial call, so the mechanism exists and the
+  // config does not use it.
+  check("queryDenyPatterns is wired through to every site", Array.isArray(wallet.queryDenyPatterns), true);
+  check("...and ships empty on every one of them",
+    data.sites.every((s) => (s.queryDenyPatterns ?? []).length === 0), true);
+  const denied = { query: "objectivism online", clicks: 2, impressions: 150, position: 4.5 };
+  check("a denied query is excluded from the classes",
+    classifyOpportunity(denied, { queryDenyPatterns: ["^objectivism online$"] }), null);
+  check("...and only that query", Boolean(classifyOpportunity(denied, { queryDenyPatterns: ["^nothing$"] })), true);
+}
+
+// 11. Comparators on every metric (spec item 8). A number that answers neither
+//     "is this normal?" nor "what changed?" nor "what do I do?" is decoration.
+{
+  const { data } = await load("period=1");
+  const totals = data.totals;
+  const trend = totals.trend;
+
+  check("the traffic comparator spans 14 daily snapshots", trend.days, 14);
+  check("...averaging human sessions the same way the cards do",
+    trend.visitsPerDay.toFixed(1), "40.2");
+  check("...pageviews from clean days only", trend.viewsPerDay.toFixed(1), "49.9");
+  check("...and search sessions off the same referrer history", trend.searchPerDay.toFixed(1), "15.0");
+
+  // GSC rows are keyed by snapshot date and each covers a three-day window
+  // lagging two days, so consecutive rows overlap: the field is named per
+  // SNAPSHOT, and the ends of the range are named from gsc_window rather than
+  // from the snapshot dates a human would misread as the measurement period.
+  check("the GSC comparator counts snapshots, not days", trend.gscSnapshots, 5);
+  check("...averaged over the rolling windows", trend.gscClicksPerSnapshot.toFixed(1), "10.2");
+  check("...impressions alongside", Math.round(trend.gscImpressionsPerSnapshot), 2192);
+  check("...with CTR aggregated rather than averaged", trend.gscCtr.toFixed(5), (51 / 10958).toFixed(5));
+  check("...and the range labelled by what Google measured, not when we asked",
+    trend.gscWindowFirst, "2026-08-01–2026-08-03");
+  check("...through the latest window", trend.gscWindowLast, "2026-08-05–2026-08-07");
+  check("no GSC field is exposed as a per-day rate",
+    Object.keys(trend).some((key) => /^gsc.*PerDay$/.test(key)), false);
+
+  // The live 0.4%, and the number that says whether 0.4% is bad.
+  check("search CTR is the live shape", totals.gscCtr.toFixed(3), "0.004");
+  const mixImpressions = KEYWORDS.reduce((sum, row) => sum + row.impressions, 0);
+  const mixExpected = KEYWORDS.reduce((sum, row) =>
+    sum + row.impressions * expectedCtr(row.position), 0) / mixImpressions;
+  check("...with a position-adjusted expectation beside it",
+    totals.gscExpectedCtr.toFixed(5), mixExpected.toFixed(5));
+  check("...that is materially above what the fleet actually earns",
+    totals.gscExpectedCtr > totals.gscCtr, true);
+
+  // Median, not mean. The 62.0-position stray is exactly what a mean is dragged
+  // around by and a median is not.
+  check("search position is a median across queries with enough impressions",
+    totals.gscMedianPosition.toFixed(1), "12.8");
+  check("...over the queries that clear the impression floor", totals.gscPositionQueries, 13);
+  check("...and says how many are on page one", totals.gscTop10Queries, 5);
+  check("the impression-weighted mean it replaced is dragged higher by one stray",
+    totals.gscPosition > totals.gscMedianPosition, true);
+
+  // The widened GSC reads are read-side only: the panels are still the latest
+  // snapshot, and the trailing rows exist for the trend.
+  const forum = data.sites.find((s) => s.host === FORUM_HOST);
+  check("panels still show the latest snapshot only", forum.keywords.length,
+    KEYWORDS.filter((row) => row.host === FORUM_HOST).length);
+  check("...and the summary is the latest row, not a sum of the window",
+    forum.searchSummary.impressions, 1500);
+}
+
+// 12. The two opportunity signals that replaced the generic placeholder. Their
+//     remedies differ, so they cannot be one rule: telling someone to rewrite a
+//     title is wrong for a page nobody can see.
+{
+  const { data } = await load("period=1");
+  const of = (host) => (data.signals ?? []).filter((s) => s.host === host);
+  const kinds = (host) => of(host).map((s) => s.kind).sort().join(",");
+
+  check("the generic search-opportunity rule is gone",
+    (data.signals ?? []).some((s) => s.kind === "search-opportunity"), false);
+  check("a site with both classes gets both signals", kinds(WALLET_HOST), "rank-gap,snippet-gap");
+  check("a site with only snippet gaps gets only that one", kinds(FORUM_HOST), "snippet-gap");
+  const snippet = of(FORUM_HOST)[0];
+  check("...at severity 2", snippet.severity, 2);
+  check("...with the remedy that fits the class",
+    snippet.action.includes("Rewrite the title and meta description"), true);
+  check("...naming the query that leads it", snippet.evidence.includes("objectivism online"), true);
+  const rank = of(WALLET_HOST).find((s) => s.kind === "rank-gap");
+  check("the ranking signal prescribes ranking work, not a rewrite",
+    rank.action.includes("Strengthen those pages"), true);
+  check("...and never tells the reader to rewrite a snippet nobody sees",
+    /rewrite/i.test(rank.action), false);
 }
 
 if (failures) {

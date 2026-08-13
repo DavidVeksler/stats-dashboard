@@ -151,7 +151,10 @@ function weigh(kind, site, extra) {
     case "traffic-drop":
     case "traffic-rise": return Math.abs(extra.absolute);
     case "malformed-urls": return extra.count * 10;
-    case "search-opportunity": return extra.count;
+    // Both opportunity classes weigh in clicks, so they rank against each other
+    // on the same axis even though they are found by different metrics.
+    case "snippet-gap":
+    case "rank-gap": return extra.clicks;
     case "no-comparison": return Number(site.visits || 0);
     default: return 0;
   }
@@ -246,21 +249,39 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
       }, weigh("malformed-urls", site, { count: malformed.length }));
     }
 
-    // search-opportunity. Deliberately ONE generic rule off the shared
-    // isOpportunity predicate (counted into site.opportunityCount by
-    // loadDashboard), not the spec's `snippet-gap`: telling the reader to rewrite
-    // a title and description is only correct for a page that already ranks, and
-    // the snippet-vs-rank split that distinguishes those two remedies is spec
-    // item 7 and does not exist yet. Item 7 replaces this rule with two.
-    const opportunities = Number(site.opportunityCount || 0);
-    if (opportunities >= 1) {
+    // snippet-gap / rank-gap. Two rules, not one, because the remedies share
+    // nothing: a page that already ranks needs a rewritten title and description,
+    // a page at position 31 needs content and links, and telling the reader to do
+    // the first when the problem is the second wastes the afternoon. Each is
+    // ranked by its own class's metric (see src/opportunities.js) — lost clicks
+    // for snippet, potential clicks at TARGET_POSITION for rank — so a
+    // deep-ranking business query cannot be crowded out by a shallow trivial one.
+    const snippetRows = site.opportunities?.snippet ?? [];
+    const rankRows = site.opportunities?.rank ?? [];
+    if (snippetRows.length) {
+      const lost = snippetRows.reduce((sum, row) => sum + row.lostClicks, 0);
+      const top = snippetRows[0];
       add({
-        severity: 2, kind: "search-opportunity", host,
-        headline: `${host} has ${opportunities} search ${opportunities === 1 ? "query" : "queries"} ranking without clicks`,
-        evidence: `${opportunities} ${opportunities === 1 ? "query is" : "queries are"} on page one or two with a CTR near zero.`,
-        action: "Open the search panel and rewrite the titles and meta descriptions for those pages.",
+        severity: 2, kind: "snippet-gap", host,
+        headline: `${host} has ${snippetRows.length} ${snippetRows.length === 1 ? "query" : "queries"} ranking well but not clicked`,
+        evidence: `About ${lost.toFixed(1)} clicks a window are going elsewhere, led by "${top.query}" ` +
+          `at position ${top.position.toFixed(1)} with ${pctText(top.ctr, 1)} CTR against roughly ` +
+          `${pctText(top.expectedCtr, 1)} expected there.`,
+        action: "Rewrite the title and meta description for those pages; the ranking is already there.",
         href, recurrence: null,
-      }, weigh("search-opportunity", site, { count: opportunities }));
+      }, weigh("snippet-gap", site, { clicks: lost }));
+    }
+    if (rankRows.length) {
+      const potential = rankRows.reduce((sum, row) => sum + row.potentialClicks, 0);
+      const top = rankRows[0];
+      add({
+        severity: 2, kind: "rank-gap", host,
+        headline: `${host} has ${rankRows.length} ${rankRows.length === 1 ? "query" : "queries"} ranking too deep to be seen`,
+        evidence: `Roughly ${potential.toFixed(1)} clicks a window are out of reach at these ranks, led by ` +
+          `"${top.query}" at position ${top.position.toFixed(1)} on ${num(top.impressions)} impressions.`,
+        action: "Strengthen those pages and link to them from the strongest related page on the site.",
+        href, recurrence: null,
+      }, weigh("rank-gap", site, { clicks: potential }));
     }
 
     // traffic-drop / traffic-rise. Both floored on absolute change, so a

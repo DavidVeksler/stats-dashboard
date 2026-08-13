@@ -2,8 +2,9 @@
 import { APPLE_SPLASH_LINKS } from "./appleSplashLinks.js";
 import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "./bots.js";
 import {
-  isOpportunity, OPPORTUNITY_MIN_IMPRESSIONS, OPPORTUNITY_MIN_POSITION,
-  OPPORTUNITY_MAX_POSITION, OPPORTUNITY_MAX_CTR,
+  classifyOpportunity, OPPORTUNITY_MIN_IMPRESSIONS, POSITION_MIN_IMPRESSIONS,
+  SNIPPET_MAX_POSITION, RANK_MAX_POSITION, SNIPPET_CTR_RATIO, MIN_ACTIONABLE_CLICKS,
+  TARGET_POSITION,
 } from "./opportunities.js";
 import { DELTA_MIN_ABSOLUTE, ERROR_BASELINE_DAYS, cardAnchor } from "./signals.js";
 
@@ -11,7 +12,25 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n) => Number(n || 0).toLocaleString("en-US");
 const pct = (n, digits = 0) => `${(Number(n || 0) * 100).toFixed(digits)}%`;
-const TAG_LABEL = { search: "search", direct: "direct", social: "social", ref: "referral" };
+const TAG_LABEL = { search: "search", direct: "direct", social: "social", ref: "referral",
+  internal: "internal" };
+
+// A muted comparator chip that sits beside a KPI value. Every tile gets one:
+// a number nobody can judge is decoration, and "is this normal?" is the first of
+// the three questions this page is supposed to answer.
+const cmp = (text, title = null) =>
+  `<span class="cmp"${title ? ` title="${esc(title)}"` : ""}>${esc(text)}</span>`;
+
+// "N per day over the last 14 days", plus this period's own per-day rate when the
+// period is longer than a day and the two are not the same quantity.
+function meanNote(value, mean, days, periodDays, unit = "") {
+  if (!mean) return "";
+  const suffix = unit ? ` ${unit}` : "";
+  const perDay = periodDays > 1 && days > 0 ? Number(value || 0) / days : null;
+  const head = perDay === null ? "" : `${fmt(Math.round(perDay))}${suffix}/day here · `;
+  return cmp(`${head}14-day mean ${fmt(Math.round(mean))}${suffix}/day`,
+    "Mean over the last 14 daily snapshots, computed from the same human/crawler split the cards use.");
+}
 
 // `absolute` is the session change behind the ratio. Below DELTA_MIN_ABSOLUTE the
 // percentage is suppressed and the raw change is shown muted instead: a
@@ -110,14 +129,25 @@ function referrerList(site) {
     ? `<div class="scale-note">External bars use their own scale.</div>` : ""}`;
 }
 
-function keywordList(keywords) {
+// Two classes, never one bare "opportunity" badge: a query that ranks and is not
+// clicked needs a rewritten snippet, a query that ranks too deep to be seen needs
+// content and links, and a badge that does not say which is a badge the reader
+// cannot act on. Same classifier that produced totals.snippetOpportunities /
+// totals.rankOpportunities — see src/opportunities.js — including the site's
+// queryDenyPatterns, so a denied query still renders here but carries no badge.
+const OPPORTUNITY_LABEL = { snippet: "snippet", rank: "rank" };
+function keywordList(site) {
+  const keywords = site.keywords ?? [];
   if (!keywords.length) return `<p class="none">No search queries in the latest GSC window.</p>`;
   return `<ol class="metric-list">${keywords.map((keyword) => {
     const ctr = keyword.impressions ? keyword.clicks / keyword.impressions : 0;
-    // Same predicate that produced totals.opportunities — see src/opportunities.js.
-    const opportunity = isOpportunity(keyword);
-    return `<li class="metric-row ${opportunity ? "opportunity" : ""}">
-      <div class="metric-name"><span class="truncate" title="${esc(keyword.query)}">${esc(keyword.query)}</span>${opportunity ? `<span class="opportunity-tag">opportunity</span>` : ""}</div>
+    const found = classifyOpportunity(keyword, site);
+    const why = !found ? ""
+      : found.kind === "snippet"
+        ? `Ranks at ${found.position.toFixed(1)} with ${pct(found.ctr, 1)} CTR against roughly ${pct(found.expectedCtr, 1)} expected there: about ${found.lostClicks.toFixed(1)} clicks a window lost to the snippet, not to the ranking. Rewrite the title and meta description.`
+        : `Ranks at ${found.position.toFixed(1)}, too deep to be seen. Roughly ${found.potentialClicks.toFixed(1)} clicks a window are out of reach at that rank. Strengthen the page and link to it.`;
+    return `<li class="metric-row ${found ? "flagged" : ""}">
+      <div class="metric-name"><span class="truncate" title="${esc(keyword.query)}">${esc(keyword.query)}</span>${found ? `<span class="opportunity-tag ${esc(found.kind)}" title="${esc(why)}">${OPPORTUNITY_LABEL[found.kind]}</span>` : ""}</div>
       <div class="metric-values"><strong>${fmt(keyword.clicks)} clk</strong><span>${fmt(keyword.impressions)} imp · ${pct(ctr, 1)} CTR · pos ${Number(keyword.position || 0).toFixed(1)}</span></div>
     </li>`;
   }).join("")}</ol>`;
@@ -186,7 +216,7 @@ function statusList(statuses) {
   return `<ol class="metric-list">${statuses.map((s) => {
     const share = total ? Number(s.requests || 0) / total : 0;
     const bad = Number(s.status) >= 400;
-    return `<li class="metric-row ${bad ? "opportunity" : ""}">
+    return `<li class="metric-row ${bad ? "flagged" : ""}">
       <div class="metric-name"><span class="truncate">${esc(s.status)}</span></div>
       <div class="metric-values"><strong>${fmt(s.requests)}</strong><span>${pct(share, 1)} of requests</span></div>
     </li>`;
@@ -211,18 +241,43 @@ function searchSummary(summary) {
   </div>`;
 }
 
-function sourceMix(mix, total) {
+// The channel mix, and the one thing it must not do: present its own accounting
+// hole as a channel. "Other / unlisted" used to be the largest bucket on the page
+// (1,060 of 2,012 sessions, 52.7%) and it was never a class at all — it was
+// `visits - (direct + search + social + referral)`, with a zone-log host
+// contributing almost all of it because zone logs carry no referer dimension.
+// Item 1 took the zone hosts out; what is left here is the labelling. The
+// residual is named `Unattributed`, moved out of the bar, and given its causes.
+//
+// `internal` — sessions arriving from one of the site's own hostnames — is a real
+// channel and used to land in that residual. It is frozen into daily_referrers at
+// write time, so rows stored before 2026-08-13 carry none: `internalMeasured`
+// says whether any row in the window has it, and when none does the channel is
+// omitted rather than drawn as a confident zero. That matters in the 7- and
+// 30-day views, which still reach back over rows written before the change.
+function sourceMix(totals) {
+  const total = Number(totals?.visits || 0);
+  const mix = totals?.sourceMix ?? {};
   if (!total) return "";
-  const sources = [
-    ["direct", "Direct"], ["search", "Search"], ["social", "Social"],
-    ["referral", "Referral"], ["other", "Other / unlisted"],
-  ].map(([key, label]) => ({ key, label, value: Number(mix?.[key] || 0) }));
-  const segments = sources.filter((source) => source.value > 0).map((source) =>
-    `<span class="source-segment ${source.key}" style="width:${Math.max(0, source.value / total * 100).toFixed(2)}%" title="${esc(source.label)}: ${fmt(source.value)} sessions (${pct(source.value / total, 1)})"></span>`).join("");
+  const channels = [
+    ["direct", "Direct"], ["search", "Search"], ["social", "Social"], ["referral", "Referral"],
+    ...(totals.internalMeasured ? [["internal", "Internal"]] : []),
+  ].map(([key, label]) => ({ key, label, value: Number(mix[key] || 0) }));
+  const segments = channels.filter((channel) => channel.value > 0).map((channel) =>
+    `<span class="source-segment ${channel.key}" style="width:${Math.max(0, channel.value / total * 100).toFixed(2)}%" title="${esc(channel.label)}: ${fmt(channel.value)} sessions (${pct(channel.value / total, 1)})"></span>`).join("");
+  const unattributed = Number(mix.unattributed || 0);
+  const note = unattributed
+    ? `<p class="source-note"><b>Unattributed: ${fmt(unattributed)} sessions (${pct(unattributed / total, 1)})</b> —
+        not a channel and not in the bar above. It is the gap between sessions the traffic table counted and
+        referrer rows the referrer table stored, and its known causes are: only the top 50 referrers per
+        host-day are persisted, so a long tail of one-session referrers falls off${totals.internalMeasured
+          ? "" : "; and sessions from a site's own alias hostnames were dropped rather than stored as an <i>internal</i> referral on days before that channel existed"}.</p>`
+    : `<p class="source-note">Every measured session in this period is attributed to a channel.</p>`;
   return `<section class="source-overview" aria-labelledby="source-heading">
-    <div class="source-heading"><h2 id="source-heading">Traffic sources</h2><span>selected traffic period</span></div>
+    <div class="source-heading"><h2 id="source-heading">Traffic sources (RUM sites only)</h2><span>selected traffic period</span></div>
     <div class="source-bar" role="img" aria-label="Traffic source mix">${segments}</div>
-    <div class="source-legend">${sources.map((source) => `<div><i class="${source.key}"></i><span>${esc(source.label)}</span><strong>${fmt(source.value)}</strong><small>${pct(source.value / total, 1)}</small></div>`).join("")}</div>
+    <div class="source-legend">${channels.map((channel) => `<div><i class="${channel.key}"></i><span>${esc(channel.label)}</span><strong>${fmt(channel.value)}</strong><small>${pct(channel.value / total, 1)}</small></div>`).join("")}</div>
+    ${note}
   </section>`;
 }
 
@@ -364,7 +419,7 @@ function siteCard(site, index, periodDays) {
       <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>
       <div class="cols">
         <section class="panel"><h3><span class="dot traffic"></span>Top referrers</h3>${referrerList(site)}</section>
-        <section class="panel"><h3><span class="dot search"></span>Search opportunities</h3>${keywordList(site.keywords)}</section>
+        <section class="panel"><h3><span class="dot search"></span>Search opportunities</h3>${keywordList(site)}</section>
       </div>
       <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top landing pages (all traffic)</h3>${cfPageList(site.cfPages, site.host)}</section>
       <section class="panel pages-panel"><h3><span class="dot good"></span>Top landing pages (Google Search)</h3>${pageList(site.pages)}</section>
@@ -415,18 +470,51 @@ export function renderDashboard(data) {
   const pagesPerSession = totals.pagesPerSession ?? (totals.visits ? totals.views / totals.visits : 0);
   const updatedAt = data.dataUpdatedAt || data.run?.run_at;
   const stale = updatedAt ? Date.now() - Date.parse(updatedAt) > 30 * 3600 * 1000 : true;
+  // Comparators, not bare numbers (spec item 8). Traffic tiles compare against a
+  // 14-day daily mean from the history already loaded; search tiles compare
+  // against the trailing GSC snapshots and, for CTR, against what the stored
+  // query mix would earn at its own positions.
+  const trend = totals.trend ?? {};
+  const zoneDomains = totals.zoneDomains ?? 0;
+  // The zone hosts are counted in "Domains shown" and deliberately not in
+  // "Human sessions", which is exactly the pair of tiles that read "12 / 12 with
+  // traffic" beside "11 RUM sites" and looked like a bug. State the split.
+  const domainSplit = zoneDomains
+    ? `${rumDomains} RUM + ${zoneDomains} zone · ${totals.active} with traffic`
+    : `${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${totals.active} with traffic`;
   const stats = [
-    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>`],
-    ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>`],
-    ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>`],
-    [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${totals.active} with traffic</span>`],
+    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}`],
+    ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>${meanNote(totals.views, trend.viewsPerDay, totals.daysAvailable, data.periodDays)}`],
+    ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>${meanNote(totals.search, trend.searchPerDay, totals.daysAvailable, data.periodDays)}`],
+    [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${domainSplit}</span>`],
   ];
   if (totals.searchDataDomains) {
+    // Every GSC figure is a rolling three-day window that lags two days, and
+    // consecutive stored rows overlap by two of those three days. So the
+    // comparator is stated per snapshot, never per day, and the window it spans is
+    // named from gsc_window rather than from the snapshot dates.
+    const rolling = trend.gscSnapshots > 1
+      ? `Mean over the last ${trend.gscSnapshots} GSC snapshots${trend.gscWindowFirst && trend.gscWindowLast
+        ? ` (rolling windows ${trend.gscWindowFirst} through ${trend.gscWindowLast})` : ""}. `
+        + `Each snapshot covers a three-day window lagging two days, so consecutive snapshots overlap and a snapshot-over-snapshot difference is not a like-for-like change.`
+      : null;
+    const gscMean = (value) => (trend.gscSnapshots > 1
+      ? cmp(`14-snapshot mean ${fmt(Math.round(value))}`, rolling) : "");
+    const expected = totals.gscExpectedCtr
+      ? `<span>expected ~${pct(totals.gscExpectedCtr, 1)} at this position mix</span>` : "";
+    const opportunityHost = data.sites
+      .filter((site) => (site.opportunityCount ?? 0) > 0)
+      .sort((a, b) => (b.opportunities?.snippet[0]?.score ?? b.opportunities?.rank[0]?.score ?? 0)
+        - (a.opportunities?.snippet[0]?.score ?? a.opportunities?.rank[0]?.score ?? 0))[0]?.host;
+    const opportunityNote = totals.opportunities
+      ? `<a class="cmp" href="#${cardAnchor(opportunityHost ?? "")}" title="Ranked by lost clicks for snippet gaps and by potential clicks at position ${TARGET_POSITION} for ranking gaps — two classes, two remedies, two metrics.">${fmt(totals.snippetOpportunities ?? 0)} snippet · ${fmt(totals.rankOpportunities ?? 0)} rank</a>`
+      : "";
     stats.push(
-      ["Google clicks", fmt(totals.gscClicks), `<span>latest complete GSC window</span>`],
-      ["Search impressions", fmt(totals.gscImpressions), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}</span>`],
-      ["Search CTR", pct(totals.gscCtr, 1), `<span>clicks / impressions</span>`],
-      ["Avg search position", totals.gscPosition ? totals.gscPosition.toFixed(1) : "—", `<span>${fmt(totals.opportunities)} opportunities in top queries</span>`],
+      ["Google clicks", fmt(totals.gscClicks), `<span>${esc(gscWindow)} · rolling GSC window</span>${gscMean(trend.gscClicksPerSnapshot)}`],
+      ["Search impressions", fmt(totals.gscImpressions), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}</span>${gscMean(trend.gscImpressionsPerSnapshot)}`],
+      ["Search CTR", pct(totals.gscCtr, 1), `${expected}${trend.gscSnapshots > 1 ? cmp(`14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : ""}`],
+      ["Median search position", totals.gscMedianPosition ? totals.gscMedianPosition.toFixed(1) : "—",
+        `<span>${fmt(totals.gscTop10Queries ?? 0)} of ${fmt(totals.gscPositionQueries ?? 0)} queries in the top 10</span>${opportunityNote}`],
     );
   }
 
@@ -472,12 +560,13 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
 .zone-section{margin-top:22px}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
-.source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.other,.source-legend i.other{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}
+.source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.internal,.source-legend i.internal{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.source-note{margin:10px 0 0;padding-top:9px;border-top:1px dashed var(--line);font-size:10.5px;line-height:1.5;color:var(--faint)}.source-note b{color:var(--muted);font-weight:650}
+.cmp{display:inline-flex;align-items:center;font-size:10px;font-weight:650;border-radius:999px;padding:2px 6px;background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);white-space:nowrap;text-decoration:none}a.cmp:hover{color:var(--ink)}
 .actions{margin:0 0 18px}.action-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}.action{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);border-radius:var(--radius);box-shadow:var(--shadow);padding:11px 14px;font-size:12px;line-height:1.5;color:var(--muted)}.action.sev1{border-left-color:var(--danger)}.action.sev2{border-left-color:var(--search)}.action-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:3px}.action-head b{color:var(--ink);font-weight:650;font-size:13px}.sev-tag{font-size:8.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;border-radius:4px;padding:2px 5px;background:var(--line);color:var(--muted);flex:none}.action.sev1 .sev-tag{background:var(--danger-soft);color:var(--danger)}.action.sev2 .sev-tag{background:var(--search-soft);color:var(--search)}.sev-run{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;color:var(--faint)}.action-why{color:var(--muted)}.action-do{margin-top:4px;color:var(--ink)}.action-do a{color:var(--traffic);font-weight:650;text-decoration:none;white-space:nowrap}.action-do a:hover{text-decoration:underline}.action-none{margin:0;padding:11px 14px;background:var(--card);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:var(--radius);box-shadow:var(--shadow);font-size:12px;color:var(--muted)}
 .delta.small{background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);font-weight:650}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}
-.ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
-.search-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:color-mix(in srgb,var(--search-soft) 55%,transparent);border-radius:8px;padding:8px 10px}.search-summary>div{display:flex;flex-direction:column;min-width:0}.search-summary strong{font-size:13px;color:var(--search);line-height:1.2}.search-summary span{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);white-space:nowrap}.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.opportunity{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px 6px;min-width:0;font-size:11.5px;flex-wrap:wrap}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name .truncate{flex:1 1 120px;min-width:70px}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
+.ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.tag.internal{background:color-mix(in srgb,var(--faint) 16%,transparent);color:var(--faint)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
+.search-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:color-mix(in srgb,var(--search-soft) 55%,transparent);border-radius:8px;padding:8px 10px}.search-summary>div{display:flex;flex-direction:column;min-width:0}.search-summary strong{font-size:13px;color:var(--search);line-height:1.2}.search-summary span{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);white-space:nowrap}.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.flagged{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px 6px;min-width:0;font-size:11.5px;flex-wrap:wrap}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name .truncate{flex:1 1 120px;min-width:70px}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none;cursor:help}.opportunity-tag.rank{color:var(--traffic);border-color:color-mix(in srgb,var(--traffic) 35%,transparent)}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
 footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:5px}footer b{color:var(--ink);font-weight:650}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media (max-width:940px){.grid{grid-template-columns:1fr}.card{max-width:760px;width:100%;margin-inline:auto}}
 @media (max-width:700px){.toolbar{align-items:stretch;flex-direction:column}.filters{display:grid;grid-template-columns:1fr 1fr auto}.field select{width:100%}.totals{grid-template-columns:repeat(2,1fr)}.source-legend{grid-template-columns:repeat(2,1fr)}}
@@ -513,7 +602,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     </section>
     ${zoneStrip(data.sites)}
     ${crawlerNote(totals, data.sites)}
-    ${sourceMix(totals.sourceMix, totals.visits)}
+    ${sourceMix(totals)}
     <div class="grid">${rumSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
     ${hasZoneSite ? `<section class="zone-section" aria-labelledby="zone-section-heading">
       <h2 class="section-heading" id="zone-section-heading">Zone-log measurement</h2>
@@ -521,10 +610,12 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     </section>` : ""}
   </main>
   <footer>
-    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable.</div>
+    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable. Each KPI tile carries a <b>14-day mean</b> beside it, computed from the same daily snapshots and the same human/crawler split the cards use, so every figure can be read against what normal looks like.</div>
+    <div><b>Traffic sources</b> covers RUM sites only, and <b>Unattributed is a residual, not a channel</b>: it is the arithmetic gap between the sessions the traffic table counted and the referrer rows the referrer table stored, so it sits outside the mix bar with its causes named rather than competing with Direct and Search. <b>Internal</b> is sessions arriving from one of a site's own hostnames — an apex landing page handing off to the forum, say. Those were dropped rather than stored and reappeared inside the residual; they are recorded from 2026-08-13 forward. The channel is frozen into each stored row at write time, so it cannot be backfilled: over a window that reaches back before that date the channel is simply absent rather than shown as a measured zero.</div>
     <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count, which is why such a day's sessions read as a floor (≥) rather than a count, why pages/session divides by clean sessions only, and why a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
     <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. Flooded days are called out as "no like-for-like comparison" rather than quietly dropping off the list.</div>
-    <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows; opportunity rows have at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions, average position ${OPPORTUNITY_MIN_POSITION}–${OPPORTUNITY_MAX_POSITION}, and CTR below ${pct(OPPORTUNITY_MAX_CTR, 0)}.</div>
+    <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows. <b>Median search position</b> is the median across queries with at least ${fmt(POSITION_MIN_IMPRESSIONS)} impressions, not a mean: a mean across a branded position-1 query and a position-90 stray moves when the junk moves and stays put when the work lands. <b>GSC figures are a rolling window, not a daily series</b> — each nightly snapshot asks Google for a three-day window that lags two days, so consecutive snapshots overlap by two days out of three; only trailing averages are taken from them, a snapshot-over-snapshot difference is never presented as a change, and every date shown here is the window Google measured rather than the night we asked.</div>
+    <div><b>Search opportunities come in two classes with two different remedies, ranked by two different metrics.</b> A <b>snippet</b> gap is a query at position ${SNIPPET_MAX_POSITION} or better taking under ${pct(SNIPPET_CTR_RATIO, 0)} of the click-through its rank would ordinarily deliver: the ranking is already there, so the fix is the title and meta description, and these are ranked by <b>lost clicks</b> — impressions × (expected CTR − actual CTR) — which is what is recoverable without moving at all. A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}, where nobody ever saw the snippet, so the fix is content and internal links, and these are ranked by <b>potential clicks</b> — what the query would earn at position ${TARGET_POSITION}, less what it earns now. Ranking both classes by lost clicks would guarantee that a deep, valuable query always lost to a shallow trivial one. Both classes need at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions and at least ${MIN_ACTIONABLE_CLICKS} clicks of gain over the window; past position ${RANK_MAX_POSITION} a query is neither badged nor counted. Expected CTR by position is approximated from the SISTRIX 2020 CTR study (~80M keywords; positions 1, 2, 3 and 10 measured, the rest interpolated and the tail past 10 estimated), so it is a comparator and never a target — that is why no number derived from it is shown to more than one decimal place. Where a site sets <code>queryDenyPatterns</code> in <code>src/config.js</code>, matching queries still appear in the list and carry no badge.</div>
     ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other. The crawler-flood classifier cannot run on them either — it needs a referrer dimension the zone log does not have — so each zone card carries its own two-lens accounting instead: <b>verified crawlers</b>, from the categories Cloudflare cryptographically verifies, which is a floor on crawler volume rather than a bot/human split (this plan does not expose bot scores, so unverified crawlers are unmeasurable and sit in the same bucket as real readers), and <b>non-content requests</b>, meaning crawler-protocol and asset paths plus every response ≥ 400. The two overlap, so they are never added, and no human count is claimed for a zone host at all.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>
   </footer>

@@ -3,6 +3,10 @@ import { renderDashboard } from "../src/render.js";
 // Imported, never retyped: the footer prose that explains these rules is
 // asserted against the constants themselves, so the two cannot drift.
 import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "../src/bots.js";
+import {
+  SNIPPET_MAX_POSITION, RANK_MAX_POSITION, TARGET_POSITION, SNIPPET_CTR_RATIO,
+  OPPORTUNITY_MIN_IMPRESSIONS, MIN_ACTIONABLE_CLICKS, POSITION_MIN_IMPRESSIONS,
+} from "../src/opportunities.js";
 
 const today = new Date().toISOString();
 const fixture = {
@@ -44,10 +48,10 @@ const fixture = {
       href: "#site-davidveksler-freecapitalists-org", recurrence: null,
     },
     {
-      severity: 2, kind: "search-opportunity", host: "example.com",
-      headline: "example.com has 4 search queries ranking without clicks",
-      evidence: "4 queries are on page one or two with a CTR near zero.",
-      action: "Open the search panel and rewrite the titles and meta descriptions for those pages.",
+      severity: 2, kind: "snippet-gap", host: "example.com",
+      headline: "example.com has 1 query ranking well but not clicked",
+      evidence: "About 5.2 clicks a window are going elsewhere, led by \"high impression opportunity\" at position 8.4 with 0.0% CTR against roughly 3.7% expected there.",
+      action: "Rewrite the title and meta description for those pages; the ranking is already there.",
       href: "#site-example-com", recurrence: null,
     },
     {
@@ -63,12 +67,25 @@ const fixture = {
   // would read 2,359 sessions over 21,276 "pageviews" — 9.0 pages/session, an
   // artifact of dividing HTTP requests by RUM sessions.
   totals: { visits: 1300, views: 1770, pagesPerSession: 1770 / 1300, search: 260,
-    domains: 4, rumDomains: 3, active: 4, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
+    domains: 6, rumDomains: 4, zoneDomains: 2, active: 4, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
     botVisits: 42000, botViews: 42350, previousBotVisits: 0, botShare: .97, floodedSiteDays: 3, floodedSites: 1,
     partialVisits: 120, partialSites: 1,
-    sourceMix: { direct: 700, search: 260, social: 80, referral: 60, other: 200 },
+    // The residual is `unattributed` and is rendered outside the bar; `internal`
+    // is a real channel that used to fall into it.
+    sourceMix: { direct: 700, search: 260, social: 80, referral: 60, internal: 120, unattributed: 80 },
+    internalMeasured: true,
     zone: { visits: 1059, requests: 19506, bytes: 76658000000, sites: 1, hosts: ["library.example"] },
-    gscClicks: 46, gscImpressions: 2200, gscCtr: .0209, gscPosition: 7.8, searchDataDomains: 2, opportunities: 1 },
+    gscClicks: 46, gscImpressions: 2200, gscCtr: .0209, gscPosition: 12.4, searchDataDomains: 2,
+    // Median across queries clearing the impression floor, plus the position-mix
+    // expectation the CTR tile is judged against (spec item 8).
+    gscMedianPosition: 9.4, gscPositionQueries: 18, gscTop10Queries: 11, gscExpectedCtr: .0161,
+    opportunities: 2, snippetOpportunities: 1, rankOpportunities: 1,
+    // 14-day comparators. GSC ones are counted in SNAPSHOTS, not days: each
+    // snapshot covers a rolling three-day window lagging two days, so consecutive
+    // ones overlap and the ends of the range are named from gsc_window.
+    trend: { window: 14, days: 14, visitsPerDay: 96.4, viewsPerDay: 131.2, searchPerDay: 19.6,
+      gscSnapshots: 14, gscClicksPerSnapshot: 41.5, gscImpressionsPerSnapshot: 2050, gscCtr: .0202,
+      gscWindowFirst: "2026-06-29–2026-07-01", gscWindowLast: "2026-07-12–2026-07-14", gscSeries: [] } },
   sites: [
     {
       host: "example.com", visits: 1100, views: 1500, previousVisits: 800, delta: .375,
@@ -83,10 +100,25 @@ const fixture = {
         { referrer: "www.google.com", kind: "search", visits: 250 },
         { referrer: "www.reddit.com", kind: "social", visits: 80 },
       ],
+      // One of each class plus one query that is already performing at its
+      // position. Every badge must say which of the two problems it is: "rewrite
+      // the title" and "the page ranks too deep to be seen" are not the same
+      // instruction, and a bare "opportunity" badge told the reader neither.
       keywords: [
         { query: "high impression opportunity", clicks: 0, impressions: 140, ctr: 0, position: 8.4 },
+        { query: "deep ranking query", clicks: 0, impressions: 60, ctr: 0, position: 24 },
         { query: "strong query", clicks: 12, impressions: 70, ctr: .171, position: 2.1 },
+        // Below OPPORTUNITY_MIN_IMPRESSIONS: CTR is not a measurement here.
+        { query: "one impression stray", clicks: 0, impressions: 3, ctr: 0, position: 11 },
       ],
+      opportunities: {
+        snippet: [{ query: "high impression opportunity", kind: "snippet", position: 8.4,
+          impressions: 140, clicks: 0, ctr: 0, expectedCtr: .0371, lostClicks: 5.2,
+          potentialClicks: null, score: 5.2 }],
+        rank: [{ query: "deep ranking query", kind: "rank", position: 24, impressions: 60,
+          clicks: 0, ctr: 0, expectedCtr: .0083, lostClicks: null, potentialClicks: 4.32, score: 4.32 }],
+      },
+      opportunityCount: 2, queryDenyPatterns: [],
       pages: [
         { page: "https://example.com/guides/analytics", clicks: 14, impressions: 180, ctr: .078, position: 5.4 },
       ],
@@ -226,7 +258,29 @@ const required = [
   "Open wiki.example &rarr;", `href="#site-wiki-example"`,
   "library.example error responses are 12.9% of requests",
   "davidveksler.freecapitalists.org is serving 8 malformed URLs",
-  "Google clicks", "Search impressions", "Traffic sources", "Avg search position",
+  "Google clicks", "Search impressions",
+  // Item 6: the panel is RUM-only, the residual is named and moved out of the bar.
+  "Traffic sources (RUM sites only)",
+  "<b>Unattributed: 80 sessions (6.2%)</b>",
+  "only the top 50 referrers per\n        host-day are persisted",
+  `<i class="internal"></i><span>Internal</span><strong>120</strong>`,
+  // Item 7: two classes, each named on the badge, each with its own remedy in the
+  // tooltip. Neither says the bare word "opportunity".
+  `<span class="opportunity-tag snippet"`, `>snippet</span>`,
+  `<span class="opportunity-tag rank"`, `>rank</span>`,
+  "clicks a window lost to the snippet, not to the ranking",
+  "too deep to be seen",
+  // Item 8: comparators on every tile.
+  "Median search position", "9.4", "11 of 18 queries in the top 10",
+  "1 snippet · 1 rank",
+  "expected ~1.6% at this position mix",
+  "14-day mean 96/day", "186/day here",
+  "14-snapshot mean 42", "14-snapshot mean 2.0%",
+  "rolling windows 2026-06-29–2026-07-01 through 2026-07-12–2026-07-14",
+  "consecutive snapshots overlap",
+  // Item 6, correction 4: the two tiles used to read "12 / 12 with traffic" beside
+  // "11 RUM sites" and contradict each other about how many sites exist.
+  "4 RUM + 2 zone · 4 with traffic",
   "min-height:44px", "Use \" + target + \" color theme",
   "if (matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
   // Crawler traffic must stay visible and named rather than silently dropped.
@@ -240,7 +294,7 @@ const required = [
   "Human figures above cover the 4 clean days, plus 120 referred sessions that survived the flooded days.",
   // Measurement classes are separated: the headline is RUM-only and the zone
   // host's request counts are reported beside it, in their own units.
-  "Zone-log measurement", `class="card card--zone`, "3 RUM sites",
+  "Zone-log measurement", `class="card card--zone`, "4 RUM sites",
   "1.4 pages / session · RUM only",
   "19,506 requests · 1,059 zone visits · 71.4 GB",
   "Counted from zone HTTP request logs (no RUM tag on this site).",
@@ -263,6 +317,144 @@ for (const marker of required) {
 }
 if (html.includes("Total visitors")) throw new Error("Legacy visitor terminology remains in the rendered dashboard");
 
+// ---- Traffic sources (spec item 6) ----------------------------------------
+// "Other / unlisted" was the largest bucket on the page (1,060 of 2,012, 52.7%)
+// and was never a class at all. It must not come back as a channel: not in the
+// bar, not in the legend, not under that name anywhere.
+const mixAt = html.indexOf(`class="source-overview"`);
+const mixBlock = html.slice(mixAt, html.indexOf("</section>", mixAt));
+if (mixBlock.includes("Other / unlisted") || /class="source-segment other"/.test(mixBlock)) {
+  throw new Error("The unattributable residual must not render as a channel in the mix");
+}
+if (mixBlock.indexOf("Unattributed") < mixBlock.indexOf(`class="source-legend"`)) {
+  throw new Error("Unattributed must render below the bar and legend, as a footnote");
+}
+if (!/class="source-note"/.test(mixBlock)) {
+  throw new Error("The residual must render as a labelled footnote with its causes");
+}
+// `internal` is frozen into each stored row at write time, so a window reaching
+// back before the change has no such row and the channel is ABSENT, not zero. A
+// rendered "Internal 0 · 0.0%" would assert a measurement nobody took.
+const historicalHtml = renderDashboard({
+  ...fixture,
+  totals: { ...fixture.totals, internalMeasured: false,
+    sourceMix: { ...fixture.totals.sourceMix, internal: 0, unattributed: 200 } },
+});
+if (/<i class="internal"><\/i>/.test(historicalHtml)) {
+  throw new Error("A window with no stored internal rows must omit the channel, not render a zero");
+}
+if (!historicalHtml.includes("were dropped rather than stored as an <i>internal</i> referral")) {
+  throw new Error("With the internal channel absent, the residual note must name that as a cause");
+}
+if (!historicalHtml.includes("<b>Unattributed: 200 sessions (15.4%)</b>")) {
+  throw new Error("The historical residual must still be quantified");
+}
+// The multi-day views are the ones that reach back over pre-change rows, so they
+// are rendered too rather than trusting the 7-day fixture to cover it.
+for (const periodDays of [1, 7, 30]) {
+  const periodHtml = renderDashboard({ ...fixture, periodDays });
+  if (!periodHtml.includes("Traffic sources (RUM sites only)")) {
+    throw new Error(`The sources panel did not render at period=${periodDays}`);
+  }
+  if (periodHtml.includes("Other / unlisted")) {
+    throw new Error(`The residual rendered as a channel at period=${periodDays}`);
+  }
+  // At 24h the tile value IS a daily figure, so the "N/day here" prefix would be
+  // the same number twice; past that it is the period's own rate.
+  const wantsPerDay = periodDays > 1;
+  if (periodHtml.includes("/day here") !== wantsPerDay) {
+    throw new Error(`period=${periodDays} rendered the wrong comparator form`);
+  }
+  if (!periodHtml.includes("14-day mean 96/day")) {
+    throw new Error(`period=${periodDays} lost its 14-day comparator`);
+  }
+}
+// A fixture with no history yet must not print an empty comparator chip.
+const noTrendHtml = renderDashboard({
+  ...fixture,
+  totals: { ...fixture.totals,
+    trend: { window: 14, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0, gscSnapshots: 0,
+      gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
+      gscWindowFirst: null, gscWindowLast: null, gscSeries: [] } },
+});
+// Every comparator chip is a <span class="cmp">; the opportunity link is an
+// <a class="cmp"> and is not a comparator.
+if (noTrendHtml.includes(`<span class="cmp"`)) {
+  throw new Error("With no history loaded the comparators must be absent, not rendered as zero");
+}
+if (!html.includes(`<span class="cmp"`)) {
+  throw new Error("The comparator chips did not render on the normal fixture");
+}
+
+// ---- Opportunity classes (spec item 7) ------------------------------------
+// Every badge names its class. A bare "opportunity" told the reader that
+// something was wrong and nothing about which of two unrelated fixes applies.
+if (/>opportunity<\/span>/.test(html)) {
+  throw new Error("A bare `opportunity` badge remains; every badge must read snippet or rank");
+}
+const badges = html.match(/class="opportunity-tag[^"]*"[^>]*>([a-z]+)</g) || [];
+if (!badges.length) throw new Error("No opportunity badges rendered at all");
+for (const badge of badges) {
+  if (!/>(snippet|rank)</.test(badge)) {
+    throw new Error(`An opportunity badge reads something other than snippet/rank: ${badge}`);
+  }
+}
+// A query already earning its position's CTR, and one with too few impressions
+// for CTR to be a measurement, both stay unbadged.
+const keywordPanelAt = html.indexOf("Search opportunities");
+const keywordPanel = html.slice(keywordPanelAt, html.indexOf("</section>", keywordPanelAt));
+for (const query of ["strong query", "one impression stray"]) {
+  const rowAt = keywordPanel.indexOf(query);
+  if (rowAt < 0) throw new Error(`${query} did not render in the query list`);
+  const row = keywordPanel.slice(rowAt, keywordPanel.indexOf("</li>", rowAt));
+  if (row.includes("opportunity-tag")) {
+    throw new Error(`${query} must not be badged: it is performing at its position`);
+  }
+}
+// The two remedies are different sentences, and the badge tooltip carries the one
+// that applies.
+if (!keywordPanel.includes("Rewrite the title and meta description.")) {
+  throw new Error("A snippet badge must carry the snippet remedy");
+}
+if (!keywordPanel.includes("Strengthen the page and link to it.")) {
+  throw new Error("A rank badge must carry the ranking remedy");
+}
+
+// ---- Footer prose, interpolated from src/opportunities.js ------------------
+// Computed here from the same imports, never typed, so changing a threshold
+// fails this check until the prose follows (the same discipline the flood
+// thresholds are held to below).
+const opportunityProse = `A <b>snippet</b> gap is a query at position ${SNIPPET_MAX_POSITION} or better ` +
+  `taking under ${(SNIPPET_CTR_RATIO * 100).toFixed(0)}% of the click-through its rank would ordinarily deliver`;
+if (!html.includes(opportunityProse)) {
+  throw new Error(`Footer snippet-class prose does not match src/opportunities.js: expected "${opportunityProse}"`);
+}
+const rankProse = `A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}`;
+if (!html.includes(rankProse)) {
+  throw new Error(`Footer rank-class prose does not match src/opportunities.js: expected "${rankProse}"`);
+}
+for (const prose of [
+  `what the query would earn at position ${TARGET_POSITION}`,
+  `at least ${OPPORTUNITY_MIN_IMPRESSIONS} impressions and at least ${MIN_ACTIONABLE_CLICKS} clicks of gain`,
+  `at least ${POSITION_MIN_IMPRESSIONS} impressions, not a mean`,
+]) {
+  if (!html.includes(prose)) {
+    throw new Error(`Footer prose does not match the exported constants: expected "${prose}"`);
+  }
+}
+// The GSC rolling-window caveat, and the sourcing of the CTR curve, are both
+// claims the page has to make out loud rather than leaving to the reader.
+for (const prose of [
+  "GSC figures are a rolling window, not a daily series",
+  "consecutive snapshots overlap by two days out of three",
+  "SISTRIX 2020 CTR study",
+  "it is a comparator and never a target",
+  "Internal</b> is sessions arriving from one of a site's own hostnames",
+  "it cannot be backfilled",
+]) {
+  if (!html.includes(prose)) throw new Error(`Footer is missing the required caveat: "${prose}"`);
+}
+
 // ---- "Today's actions" (spec item 5) --------------------------------------
 // The block is the first thing in <main>, above the KPI tiles: it is the answer
 // to "what do I do", and the tiles are the answer to "what happened".
@@ -280,7 +472,7 @@ if ((actionsBlockHtml.match(/<li class="action /g) || []).length !== 3) {
 if (actionsBlockHtml.includes("no like-for-like comparison")) {
   throw new Error("A severity-3 signal must not appear in Today's actions");
 }
-if (actionsBlockHtml.includes("example.com has 4 search queries")) {
+if (actionsBlockHtml.includes("example.com has 1 query ranking well but not clicked")) {
   throw new Error("Today's actions is capped at three; the fourth signal leaked in");
 }
 // Every rendered action carries all four parts. A headline with no action is the

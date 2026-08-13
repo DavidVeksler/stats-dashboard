@@ -3,9 +3,14 @@ import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudfla
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
-import { isOpportunity } from "./opportunities.js";
+import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
 import { computeSignals } from "./signals.js";
 import { renderDashboard } from "./render.js";
+
+// How many trailing days every KPI comparator averages over. One number, so the
+// tiles cannot each claim a different window, and the renderer reads it back off
+// totals.trend rather than restating it.
+const COMPARATOR_DAYS = 14;
 
 // Which instrumentation a site's numbers come from. RUM sites carry the Web
 // Analytics beacon and are measured in sessions; zone sites have no HTML page to
@@ -130,7 +135,7 @@ async function runDaily(env, now = new Date()) {
     );
     // Keep enough rows for accurate source-mix totals; the dashboard still
     // renders only the top eight referrers per domain.
-    for (const r of topReferrers(rec.referrers, 50)) {
+    for (const r of topReferrers(rec.referrers, 50, host)) {
       stmts.push(
         env.DB.prepare(
           `INSERT INTO daily_referrers (date,host,referrer,kind,visits) VALUES (?,?,?,?,?)`
@@ -337,6 +342,7 @@ async function loadDashboard(env, options = {}) {
   const domain = SITES.some((site) => site.host === options.domain) ? options.domain : null;
   const sort = ["traffic", "change", "name"].includes(options.sort) ? options.sort : "traffic";
   const selectedSites = domain ? SITES.filter((site) => site.host === domain) : SITES;
+  const selectedHosts = new Set(selectedSites.map((site) => site.host));
   const latest = await env.DB.prepare(`SELECT MAX(date) AS d FROM daily_traffic`).first();
   const date = latest?.d;
   if (!date) {
@@ -345,13 +351,19 @@ async function loadDashboard(env, options = {}) {
       totals: { visits: 0, views: 0, pagesPerSession: 0, search: 0,
         domains: selectedSites.length, active: 0,
         rumDomains: selectedSites.filter((s) => measurementOf(s) === "rum").length,
+        zoneDomains: selectedSites.filter((s) => measurementOf(s) === "zone").length,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
         botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
         partialVisits: 0, partialSites: 0,
-        sourceMix: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
+        sourceMix: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 },
+        internalMeasured: false,
         zone: { visits: 0, requests: 0, bytes: 0, sites: 0, hosts: [] },
         gscClicks: 0, gscImpressions: 0, gscCtr: 0, gscPosition: 0, searchDataDomains: 0,
-        opportunities: 0 },
+        gscMedianPosition: 0, gscPositionQueries: 0, gscTop10Queries: 0, gscExpectedCtr: 0,
+        trend: { window: COMPARATOR_DAYS, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0,
+          gscSnapshots: 0, gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
+          gscWindowFirst: null, gscWindowLast: null, gscSeries: [] },
+        opportunities: 0, snippetOpportunities: 0, rankOpportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         partialVisits: 0, partialDays: 0,
@@ -361,7 +373,10 @@ async function loadDashboard(env, options = {}) {
         measurement: measurementOf(s),
         zoneBots: measurementOf(s) === "zone" ? summarizeVerifiedBots([]) : null,
         zoneNonContent: measurementOf(s) === "zone" ? summarizeNonContent([], []) : null,
-        sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 }, spark: [] })) };
+        opportunities: { snippet: [], rank: [] }, opportunityCount: 0,
+        queryDenyPatterns: s.queryDenyPatterns ?? [],
+        sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 },
+        spark: [] })) };
   }
   const start = addDays(date, -(periodDays - 1));
   const previousEnd = addDays(start, -1);
@@ -370,12 +385,25 @@ async function loadDashboard(env, options = {}) {
   // looks like, and it has to reach back over the comparison period too — a
   // flooded "previous period" would otherwise poison every delta on the page.
   const historyStart = [previousStart, addDays(date, -29)].sort()[0];
+  // The three Search Console reads cover the history window rather than the
+  // latest day, which is what gives the search tiles a comparator instead of a
+  // bare number. All three tables have always stored one row per snapshot day, so
+  // this is purely read-side. The panels still render the latest day only — every
+  // consumer below filters on `r.date === date` — and the trailing rows exist for
+  // the trend.
+  //
+  // ROLLING WINDOW, NOT A DAILY SERIES. These rows are keyed by the date the
+  // snapshot was taken, not by the period they measure: runDaily asks GSC for
+  // `date-4 .. date-2`, so consecutive rows overlap by two days out of three and
+  // a day-over-day difference between them is not a like-for-like change. Only
+  // trailing averages are computed from them, and any date a human reads comes
+  // from `gsc_window`, never from `date`.
   const pagesQuery = env.DB.prepare(
-    `SELECT host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date=? ORDER BY clicks DESC, impressions DESC`
-  ).bind(date).all().catch(() => ({ results: [] }));
+    `SELECT date,host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date BETWEEN ? AND ? ORDER BY clicks DESC, impressions DESC`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
   const searchSummaryQuery = env.DB.prepare(
-    `SELECT host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date=?`
-  ).bind(date).all().catch(() => ({ results: [] }));
+    `SELECT date,host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date BETWEEN ? AND ?`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
   // Referrers and landing pages keep their date so flooded days can be dropped;
   // otherwise the detail panels would still show the crawler's millions of
   // direct hits under a headline that had already excluded them.
@@ -408,7 +436,7 @@ async function loadDashboard(env, options = {}) {
       `SELECT date,host,referrer,kind,SUM(visits) AS visits FROM daily_referrers
        WHERE date BETWEEN ? AND ? GROUP BY date,host,referrer,kind`
     ).bind(start, date).all(),
-    env.DB.prepare(`SELECT host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
+    env.DB.prepare(`SELECT date,host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date BETWEEN ? AND ? ORDER BY clicks DESC, impressions DESC`).bind(historyStart, date).all(),
     pagesQuery,
     searchSummaryQuery,
     cfPagesQuery,
@@ -447,14 +475,22 @@ async function loadDashboard(env, options = {}) {
     return acc;
   }, { visits: 0, views: 0, partialVisits: 0, partialDays: 0,
        botVisits: 0, botViews: 0, botDays: 0, cleanDays: 0 });
+  // `unattributed` is a residual, never a channel: it is the gap between sessions
+  // the traffic table counted and referrer rows the referrer table stored. It was
+  // called "other" and rendered as a fifth segment in the mix bar, which invited
+  // exactly the reading it cannot support — the largest "channel" on the page was
+  // an accounting hole. It is now named for what it is and rendered outside the
+  // bar. `internal` is a real channel: sessions arriving from one of the site's
+  // own hostnames (see classifyReferrer). Those used to fall into this residual.
+  const emptyMix = () => ({ direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 });
   const summarizeSources = (rows, visits) => {
-    const result = { direct: 0, search: 0, social: 0, referral: 0, other: 0 };
+    const result = emptyMix();
     for (const row of rows) {
       const key = row.kind === "ref" ? "referral" : row.kind;
-      if (key in result && key !== "other") result[key] += Number(row.visits || 0);
+      if (key in result && key !== "unattributed") result[key] += Number(row.visits || 0);
     }
-    const attributed = result.direct + result.search + result.social + result.referral;
-    result.other = Math.max(0, visits - attributed);
+    const attributed = result.direct + result.search + result.social + result.referral + result.internal;
+    result.unattributed = Math.max(0, visits - attributed);
     return result;
   };
   // Re-aggregate date-keyed rows once the flooded days are dropped.
@@ -474,8 +510,15 @@ async function loadDashboard(env, options = {}) {
     const days = classified.get(s.host);
     const t = sumTraffic(byHost(tr, s.host), days);
     const previous = sumTraffic(byHost(previousTr, s.host), days);
-    const kwRows = byHost(kws, s.host);
-    const pageRows = byHost(pages, s.host);
+    // The GSC reads now span the history window for the trend below; the panels
+    // are still a latest-snapshot view, so they filter back down to `date`.
+    const kwRows = byHost(kws, s.host).filter((r) => r.date === date);
+    const pageRows = byHost(pages, s.host).filter((r) => r.date === date);
+    // Both opportunity classes, each ranked by its own metric, over every stored
+    // keyword row rather than the twelve the card shows. The renderer re-derives
+    // each visible row's class from the same classifier, so a badge and this
+    // count can differ in coverage but never in verdict.
+    const opportunities = rankOpportunities(kwRows, s);
     // Landing-page rows carry no referer dimension, so a flooded day's are the
     // crawler's and stay excluded whole.
     const cfPageRows = mergeBy(byHost(cfPages, s.host).filter((r) => !floods.has(r.date)),
@@ -486,7 +529,7 @@ async function loadDashboard(env, options = {}) {
     // which is why they stay excluded whole.
     const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
       (r) => `${r.referrer}\u0000${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
-    const summaryRow = byHost(searchSummaries, s.host)[0] ?? null;
+    const summaryRow = byHost(searchSummaries, s.host).find((r) => r.date === date) ?? null;
     // Zone-sourced hosts only: bandwidth sums plainly over the period (bytes
     // carries no crawler-flood signal to split against), country/status rows
     // are the latest-day snapshot, same treatment as keywords/pages above.
@@ -554,7 +597,12 @@ async function loadDashboard(env, options = {}) {
       zoneBots: zoneRoute ? summarizeVerifiedBots(zoneBotRows) : null,
       zoneNonContent: zoneRoute
         ? summarizeNonContent(latestCfPageRows, latestZoneStatusRows) : null,
-      opportunityCount: kwRows.filter(isOpportunity).length,
+      opportunities,
+      opportunityCount: opportunities.snippet.length + opportunities.rank.length,
+      // Carried onto the shaped row so render.js can re-run the same classifier
+      // over the visible keywords with the same deny list. Strings, not RegExp
+      // objects, so /api/json does not serialize them to `{}`.
+      queryDenyPatterns: s.queryDenyPatterns ?? [],
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
       // The sparkline plots what was measured, flooded days included, but marks
       // them — hiding them would turn a crawler event into a mysterious gap.
@@ -583,8 +631,86 @@ async function loadDashboard(env, options = {}) {
   const sourceMix = rumSites.reduce((acc, site) => {
     for (const key of Object.keys(acc)) acc[key] += site.sources[key];
     return acc;
-  }, { direct: 0, search: 0, social: 0, referral: 0, other: 0 });
+  }, emptyMix());
+  const rumHosts = new Set(rumSites.map((site) => site.host));
+  // `internal` is frozen into daily_referrers at write time by classifyReferrer,
+  // so no row stored before 2026-08-13 can ever carry it. A zero here therefore
+  // means one of two completely different things — "measured, and nobody arrived
+  // from an alias host" or "this channel did not exist when these rows were
+  // written" — and rendering a confident 0% for the second would be a claim the
+  // data cannot support. The flag says which, and the panel omits the channel
+  // entirely when it was never recorded. It matters most in the 7- and 30-day
+  // views, where the window still reaches back over rows written before the
+  // change.
+  // Scoped to the sites on screen: the referrer read carries every host (the host
+  // filter is applied in JS, not in SQL), and a domain-filtered view must not
+  // borrow another site's evidence that the channel exists.
+  const internalMeasured = (refs.results ?? [])
+    .some((row) => row.kind === "internal" && rumHosts.has(row.host));
   const searchSites = sites.filter((site) => site.searchSummary);
+
+  // ---- 14-day comparators (spec item 8) -----------------------------------
+  // Every one of these comes out of history loadDashboard has already read. No
+  // metric on this page should be a bare number the reader cannot judge.
+  const dailyRum = new Map();
+  for (const row of hist.results ?? []) {
+    if (!rumHosts.has(row.host)) continue;
+    // The same split the cards use: a flooded day contributes its referred
+    // sessions and no pageviews, so the baseline is built from the same quantity
+    // it is compared against.
+    const part = splitDay(classified.get(row.host)?.get(row.date));
+    const rec = dailyRum.get(row.date) ?? { date: row.date, visits: 0, views: 0, search: 0 };
+    rec.visits += part.human;
+    rec.views += part.views;
+    dailyRum.set(row.date, rec);
+  }
+  for (const row of histRefs.results ?? []) {
+    if (row.kind !== "search" || !rumHosts.has(row.host)) continue;
+    const rec = dailyRum.get(row.date);
+    if (rec) rec.search += Number(row.visits || 0);
+  }
+  const trafficTrend = [...dailyRum.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-COMPARATOR_DAYS);
+  const meanOf = (rows, pick) => (rows.length
+    ? rows.reduce((sum, row) => sum + pick(row), 0) / rows.length : 0);
+
+  // GSC rows are a ROLLING WINDOW keyed by snapshot date (see the read above), so
+  // only trailing averages are taken from them and never a day-over-day delta.
+  const gscByDate = new Map();
+  for (const row of searchSummaries.results ?? []) {
+    if (!selectedHosts.has(row.host)) continue;
+    const rec = gscByDate.get(row.date)
+      ?? { date: row.date, clicks: 0, impressions: 0, gscWindow: null };
+    rec.clicks += Number(row.clicks || 0);
+    rec.impressions += Number(row.impressions || 0);
+    rec.gscWindow = rec.gscWindow || row.gsc_window || null;
+    gscByDate.set(row.date, rec);
+  }
+  const gscTrend = [...gscByDate.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-COMPARATOR_DAYS);
+  const gscTrendClicks = gscTrend.reduce((sum, row) => sum + row.clicks, 0);
+  const gscTrendImpressions = gscTrend.reduce((sum, row) => sum + row.impressions, 0);
+
+  // Median position, not mean. A mean across a branded position-1 query and a
+  // position-90 stray is not a number any decision rests on; it moves when the
+  // junk moves and stays put when the work lands.
+  const latestKeywordRows = (kws.results ?? [])
+    .filter((row) => row.date === date && selectedHosts.has(row.host) && Number(row.position || 0) > 0);
+  const positionRows = latestKeywordRows
+    .filter((row) => Number(row.impressions || 0) >= POSITION_MIN_IMPRESSIONS);
+  const positions = positionRows.map((row) => Number(row.position)).sort((a, b) => a - b);
+  const median = positions.length
+    ? (positions.length % 2
+      ? positions[(positions.length - 1) / 2]
+      : (positions[positions.length / 2 - 1] + positions[positions.length / 2]) / 2)
+    : 0;
+  // What the stored query mix would earn at its own positions, impression
+  // weighted. An approximation over an approximation (see expectedCtr's source
+  // note) and over the top rows GSC returns rather than every query, so it is
+  // rendered with a "~" and one decimal and never as a target.
+  const mixImpressions = latestKeywordRows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
+  const expectedMixCtr = mixImpressions
+    ? latestKeywordRows.reduce((sum, row) =>
+      sum + Number(row.impressions || 0) * expectedCtr(Number(row.position)), 0) / mixImpressions
+    : 0;
   const totals = {
     visits: rumSites.reduce((a, s) => a + s.visits, 0),
     views: rumSites.reduce((a, s) => a + s.views, 0),
@@ -601,6 +727,10 @@ async function loadDashboard(env, options = {}) {
     },
     domains: sites.length,
     rumDomains: rumSites.length,
+    // Named separately so the "Domains shown" tile can state the split. It read
+    // "12 / 12 with traffic" beside a sessions tile saying "11 RUM sites", which
+    // is two tiles contradicting each other about how many sites there are.
+    zoneDomains: zoneSites.length,
     active: sites.filter((s) => s.visits > 0).length,
     previousVisits: rumSites.reduce((a, s) => a + s.previousVisits, 0),
     // Crawler traffic is reported, never hidden — it just does not get to sit in
@@ -618,6 +748,36 @@ async function loadDashboard(env, options = {}) {
     gscImpressions: searchSites.reduce((sum, site) => sum + site.searchSummary.impressions, 0),
     searchDataDomains: searchSites.length,
     opportunities: sites.reduce((sum, site) => sum + site.opportunityCount, 0),
+    snippetOpportunities: sites.reduce((sum, site) => sum + site.opportunities.snippet.length, 0),
+    rankOpportunities: sites.reduce((sum, site) => sum + site.opportunities.rank.length, 0),
+    internalMeasured,
+    // Median across queries with enough impressions to have a position worth
+    // reading, plus how many of them are on page one. Both replace the
+    // impression-weighted mean the tile used to print.
+    gscMedianPosition: median,
+    gscPositionQueries: positionRows.length,
+    gscTop10Queries: positionRows.filter((row) => Number(row.position) <= 10).length,
+    gscExpectedCtr: expectedMixCtr,
+    trend: {
+      window: COMPARATOR_DAYS,
+      days: trafficTrend.length,
+      visitsPerDay: meanOf(trafficTrend, (row) => row.visits),
+      viewsPerDay: meanOf(trafficTrend, (row) => row.views),
+      searchPerDay: meanOf(trafficTrend, (row) => row.search),
+      // Snapshots, not days: consecutive GSC rows overlap by two days out of
+      // three, so this is "the average of the last N overlapping windows" and the
+      // renderer is required to label it as one.
+      gscSnapshots: gscTrend.length,
+      gscClicksPerSnapshot: meanOf(gscTrend, (row) => row.clicks),
+      gscImpressionsPerSnapshot: meanOf(gscTrend, (row) => row.impressions),
+      gscCtr: gscTrendImpressions ? gscTrendClicks / gscTrendImpressions : 0,
+      // Human-readable ends of the trend, taken from gsc_window (what GSC
+      // measured) rather than from the row's date (when we asked).
+      gscWindowFirst: gscTrend[0]?.gscWindow ?? null,
+      gscWindowLast: gscTrend[gscTrend.length - 1]?.gscWindow ?? null,
+      gscSeries: gscTrend.map((row) => ({ date: row.date, gscWindow: row.gscWindow,
+        clicks: row.clicks, impressions: row.impressions })),
+    },
   };
   totals.delta = totals.previousVisits ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
   // RUM pageviews over RUM sessions. Meaningful only because both sides now come
@@ -627,6 +787,9 @@ async function loadDashboard(env, options = {}) {
   totals.botShare = totals.visits + totals.botVisits
     ? totals.botVisits / (totals.visits + totals.botVisits) : 0;
   totals.gscCtr = totals.gscImpressions ? totals.gscClicks / totals.gscImpressions : 0;
+  // Kept for /api/json continuity. The tile prints gscMedianPosition instead:
+  // this mean is dragged around by whichever position-90 stray happens to be in
+  // the stored rows, which is why it was never a number to act on.
   totals.gscPosition = totals.gscImpressions ? searchSites.reduce((sum, site) =>
     sum + site.searchSummary.position * site.searchSummary.impressions, 0) / totals.gscImpressions : 0;
 
