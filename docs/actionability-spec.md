@@ -2,7 +2,8 @@
 
 Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
 `e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
-(2026-08-13). Items 9, 10 and 11 proposed.
+(2026-08-13), with item 8's comparator corrected in `c629dfa` and its stored-keyword coverage
+fixed in `3bd0838` (both 2026-08-13). Items 9, 10 and 11 proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -574,7 +575,7 @@ impressions, position 2.5) is not flagged for the same reason; and every rendere
 >    these two back to the latest day. **Narrowed in the follow-up below** — item 11 has not been
 >    built, and the cost stopped being theoretical.
 >
-> ### Follow-up (2026-08-13): the comparator was drawn from 1.1% of the corpus
+> ### Follow-up (2026-08-13, `3bd0838`): the comparator was drawn from 1.1% of the corpus
 >
 > Correction 2 above made both sides of the CTR comparator come from the same rows, which was the
 > right fix and left a second problem standing: **those rows were a sliver.** At a stored-keyword cap
