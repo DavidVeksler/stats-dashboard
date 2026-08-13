@@ -1,7 +1,7 @@
 # Spec: make the dashboard actionable
 
-Status: **items 1, 2, 3, 4 and 5 implemented** (`bd7e14d`, `b774260`, `ce541c1`, `e28f6ba`, 2026-08-12;
-items 4 and 5 2026-08-13); everything else proposed.
+Status: **items 1, 2, 3, 4 and 5 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
+`e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13). Everything else proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -209,7 +209,7 @@ constants, computed rather than typed.
 
 # P1. Turn observations into decisions
 
-## 4. Replace NOTABLE with a ranked signal engine — IMPLEMENTED
+## 4. Replace NOTABLE with a ranked signal engine — IMPLEMENTED (`c7eefc5`)
 
 > Landed as `src/signals.js` (all rules), `src/urls.js` (the malformed-URL predicate), a widened
 > `daily_zone_status` read in `loadDashboard`, an absolute-change floor on `deltaBadge`, and signal
@@ -321,7 +321,7 @@ library.freecapitalists.org produces no session-delta or pages-per-session signa
 davidveksler.com (40 sessions from 27, +48%, +13) produces no signal and renders `+13` muted rather
 than a percentage. forum-style fully flooded hosts produce `no-comparison` instead of vanishing.
 
-## 5. "Today's actions" block — IMPLEMENTED
+## 5. "Today's actions" block — IMPLEMENTED (`c7eefc5`)
 
 > Landed as `actionsBlock` in `src/render.js`, rendered first inside `<main>` above the KPI tiles,
 > with `.action` styling and `render-check.mjs` coverage. The `<h2>` id doubles as nothing — the
