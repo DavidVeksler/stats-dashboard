@@ -1,6 +1,6 @@
 # Spec: make the dashboard actionable
 
-Status: **items 1 and 3 implemented** (`bd7e14d`, 2026-08-12); everything else proposed.
+Status: **items 1, 2 and 3 implemented** (`bd7e14d`, `b774260`, 2026-08-12); everything else proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -101,26 +101,69 @@ every `zoneSourced` site. `scripts/render-check.mjs` asserts the zone card rende
 `Zone-log measurement` heading and that the string `human sessions` never appears inside a
 `card--zone` block.
 
-## 2. Give zone-sourced sites their own crawler accounting
+## 2. Give zone-sourced sites their own crawler accounting — IMPLEMENTED (`b774260`)
+
+> Landed with both lenses rather than one, because the spike's result made the choice between them
+> false. Three corrections to what this section originally said:
+>
+> 1. The spike expected `verifiedBotCategory` to "report verified-bot vs likely-human requests
+>    directly" and "end the item". It does not and cannot: the dimension labels only what Cloudflare
+>    cryptographically verifies, so the unlabelled 84.6% is readers and unverified crawlers mixed
+>    together, not a human bucket. Verified bots are a **floor** on crawler volume. The fallback lens
+>    was therefore built too, and both ship, with an explicit rendered note that they overlap and
+>    must not be added.
+> 2. The fallback's "report the card's primary number as content requests" was dropped. Subtracting
+>    non-content from the headline would imply the remainder is content requested by people, which is
+>    exactly the assertion this item exists to prevent. The headline stays the zone-visit figure item
+>    1 made honest; both lenses render beside it as decomposition.
+> 3. Non-content is reported as **two components** (paths, and responses `>= 400`) with no combined
+>    total, because they overlap each other as well — a 404 on `/favicon.ico` is in both — and the
+>    `(path, status)` pair needed to measure that overlap does not exist until item 9.
+>
+> Shipped: `verifiedBotCategory` pulled in `pullZoneTraffic` with both `count` and `sum { visits }`;
+> new table `daily_zone_bots(date, host, category, requests, visits)` in `schema.sql` **and**
+> `ensureSchema`; `crawlerAccounting`, `summarizeVerifiedBots`, `summarizeNonContent` and
+> `isNonContentPath` in `src/bots.js`; `zoneCrawlerPanel` in `src/render.js`. The RUM flood
+> classifier is untouched.
+
+### Spike result (2026-08-12) — do not re-run
+
+Against zone `066e5342a1531be2638029c2f1dde5f6` (library.freecapitalists.org), on
+`httpRequestsAdaptiveGroups`:
+
+| Dimension | Result |
+| --- | --- |
+| `botScore`, `botScoreSrcName` | **Plan-gated.** `"zone … does not have access to the field 'botscore'"`, `code: "authz"`. No workaround. Do not build on them. |
+| `clientRequestUserAgent` | **Not a valid dimension** on this dataset (`unknown field`). Do not chase it. |
+| `verifiedBotCategory` | **Works.** Real data, see below. |
+| `{ clientRequestPath, edgeResponseStatus }` | **Two dimensions in one call work**: filtered `edgeResponseStatus_geq: 400`, 1,376 rows, no cap hit. The one-dimension-per-call comment at `src/cloudflare.js:73-79` is a row-cap workaround, not an API ceiling. |
+
+24h sample, 21,929 requests: empty/unverified 18,538 (84.6%), Archiver 936, Search Engine Crawler
+867, AI Crawler 696, Search Engine Optimization 446, AI Search 405, Page Preview 21, Monitoring &
+Analytics 10, Accessibility 8. Verified-bot total 3,389 (15.4%).
+
+**The critical interpretation, and the whole point of this item:** that 84.6% is not a human bucket.
+It is every request Cloudflare did not verify — real people *and* unverified or spoofing crawlers,
+inseparable on this plan. Verified bots are a floor on crawler volume, never a total, and the zone
+card must never assert a human count for the host: no subtracting the floor and calling the
+remainder human, no interpolation, no adding the two lenses together.
 
 **Symptom.** The flood classifier structurally cannot fire on a zone host (see Problem statement,
 item 2), so library's crawler volume is silently counted as human.
 
 **Change.** Zone hosts get a separate, honest decomposition instead of a flood verdict.
 
-- **Spike task first (30 minutes, do this before writing the heuristic):** check whether this zone's
-  plan exposes bot dimensions on `httpRequestsAdaptiveGroups` (`botScore`, `botScoreSrcName`,
-  `verifiedBotCategory`). If available, add a dimensioned query in `pullZoneTraffic`
-  (`src/cloudflare.js:122-165`) and report verified-bot vs likely-human requests directly. That is
-  strictly better than any heuristic and ends the item.
-- **Fallback if unavailable:** split requests deterministically from data already pulled, into
-  `content` vs `non-content`, where non-content = requests to `/robots.txt`, `/favicon.ico`,
-  `/sitemap*`, `/.well-known/*`, `/cdn-cgi/*`, plus all responses `>= 400`. Report the card's
-  primary number as **content requests**, with non-content shown beside it. Today that reclassifies
-  at least 684 + 42 + 230 (`/cdn-cgi/*`) + 2,514 (4xx) requests out of the headline figure.
-- Either way, the zone card must never assert a human-session count it cannot support. If neither
-  path yields a defensible human estimate, the card shows requests and sessions with the explicit
-  note that crawler share is unknown for this host, which is honest and still useful.
+- **Verified crawlers (a floor).** A `verifiedBotCategory` query in `pullZoneTraffic`
+  (`src/cloudflare.js`), requesting **both** `count` and `sum { visits }`, persisted per category
+  with the empty label stored explicitly as `(unverified)`. Rendered with `≥` framing consistent
+  with flooded RUM days, stating plainly that unverified crawlers are not included and cannot be
+  measured on this plan.
+- **Non-content requests.** Requests to `/robots.txt`, `/favicon.ico`, `/sitemap*`,
+  `/.well-known/*`, `/cdn-cgi/*`, plus all responses `>= 400` — from `daily_cf_pages` and
+  `daily_zone_status`, so no new query. Today that is 684 + 42 + 230 (`/cdn-cgi/*`) of paths and
+  2,514 of 4xx. A separate lens that overlaps the first.
+- The zone card must never assert a human-session count it cannot support, and says outright that
+  the remainder cannot be characterized.
 
 **Acceptance.** `scripts/bots-check.mjs` gains a case asserting that a zone-sourced host is routed
 to the zone decomposition and never returned as `flood: false, human: <all visits>` by implication.
@@ -325,17 +368,20 @@ host, status, requests)` and `daily_cf_pages(date, host, page, visits, views)`. 
 
 **Change.**
 
-- Add a fifth query to `pullZoneTraffic` (`src/cloudflare.js:122-165`) dimensioned on
-  `clientRequestPath` with an `edgeResponseStatus >= 400` filter, or on the dimension pair if the
-  row cap allows (the existing one-dimension-per-call convention at `src/cloudflare.js:73-79` is
-  about the 5,000-row cap, not a hard API limit, so verify before assuming).
+- Add a query to `pullZoneTraffic` (`src/cloudflare.js`) dimensioned on the **pair**
+  `{ clientRequestPath, edgeResponseStatus }` with an `edgeResponseStatus_geq: 400` filter. Item 2's
+  spike settled the open question here: two dimensions in one call work, and that exact query
+  returned 1,376 rows on this zone with no cap hit. The one-dimension-per-call convention at
+  `src/cloudflare.js:73-79` is about the 5,000-row cap, not a hard API limit; the `>= 400` filter is
+  what keeps the product small enough.
 - New table `daily_zone_errors(date, host, path, status, requests)`, PK `(date, host, path,
   status)`, added to `schema.sql` and to the idempotent `ensureSchema` batch (`src/index.js:16` onward).
   Note the D1 gotcha in `AGENTS.md`: `schema.sql` cannot be applied with the deploy token. Rely on
   `ensureSchema`, or apply via the D1 console or the MCP connector.
 - Render a `Top failing paths` list in the zone details block, above TOP FILES, grouped by status.
-- Split TOP FILES into `Content` and `Assets and crawler noise` (same predicate as item 2) so real
-  file demand is visible instead of being crowded out by `robots.txt`.
+- Split TOP FILES into `Content` and `Assets and crawler noise` using `isNonContentPath` from
+  `src/bots.js` (shipped in item 2 — do not write a second predicate) so real file demand is visible
+  instead of being crowded out by `robots.txt`.
 - Feed the `error-spike` signal from item 4 off `daily_zone_status` history, which already stores a
   row per day and therefore already supports a 14-day baseline with no ingest work.
 
