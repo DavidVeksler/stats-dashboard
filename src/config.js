@@ -1,6 +1,14 @@
 // The domains to track. `host` is the Cloudflare Web Analytics requestHost;
 // `gsc` is the exact Search Console property string (sc-domain: or URL-prefix).
 // `gscPageFilter`, when present, limits a broader property to matching page URLs.
+//
+// `gsc` must be a property string that already exists in Search Console and has
+// the service account added as a user — Search Console 403s on any other string,
+// including a `sc-domain:` form for a domain property that was never verified.
+// A URL-prefix property is protocol-exact and does not cover subdomains, so it
+// cannot be swapped for the `sc-domain:` form on the assumption that the domain
+// property exists. Verify with sites.list (or the `search-console` MCP's
+// list_sites) before editing one of these, never by pattern.
 export const SITES = [
   {
     // objectivismonline.com (and its www alias) is just a landing page in front
@@ -15,7 +23,7 @@ export const SITES = [
   },
   {
     host: "cheatsheets.davidveksler.com",
-    gsc: "sc-domain:cheatsheets.davidveksler.com",
+    gsc: "https://cheatsheets.davidveksler.com/",
     // /history.php is hit almost entirely by bots crawling revision links, not
     // real users; drop it from traffic so sessions/views reflect actual readers.
     excludePaths: ["/history.php"],
@@ -30,18 +38,20 @@ export const SITES = [
     gscPageFilter: "^https?://(?:www\\.)?davidveksler\\.com/",
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
-  { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org" },
-  { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
-  { host: "davidveksler.freecapitalists.org", gsc: "sc-domain:davidveksler.freecapitalists.org" },
+  { host: "freecapitalists.org", gsc: "https://freecapitalists.org/" },
+  { host: "wiki.freecapitalists.org", gsc: "https://wiki.freecapitalists.org/" },
+  // http://, not https:// — the Search Console property was registered on the
+  // http prefix, and URL-prefix properties are protocol-exact. Querying the
+  // https form 403s, which silently zeroed this site's search data every run.
+  { host: "davidveksler.freecapitalists.org", gsc: "http://davidveksler.freecapitalists.org/" },
   { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
   { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
   // File-host subdomain (PDF/EPUB/MP3/MP4 payloads, no HTML pages), so the Web
-  // Analytics RUM beacon never fires here. trafficSource: "zone" routes traffic
-  // to Cloudflare's zone-level HTTP request log (httpRequestsAdaptiveGroups)
-  // instead — see pullZoneTraffic in cloudflare.js. gsc is independent of
-  // trafficSource and still queries Search Console for keyword/page data.
-  { host: "library.freecapitalists.org", trafficSource: "zone", zoneTag: "066e5342a1531be2638029c2f1dde5f6",
-    gsc: "sc-domain:library.freecapitalists.org" },
+  // Analytics RUM beacon never fires here and there is no Search Console
+  // property to query. trafficSource: "zone" routes it to Cloudflare's
+  // zone-level HTTP request log (httpRequestsAdaptiveGroups) instead — see
+  // pullZoneTraffic in cloudflare.js.
+  { host: "library.freecapitalists.org", trafficSource: "zone", zoneTag: "066e5342a1531be2638029c2f1dde5f6" },
   { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
 ];
 

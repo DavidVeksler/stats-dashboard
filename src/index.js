@@ -151,6 +151,12 @@ async function runDaily(env, now = new Date()) {
 
   // 2. Keywords (Google Search Console) — freshest full window, GSC lags ~2 days
   let gscOk = false;
+  // Hosts whose Search Console property errored, named so the ntfy push can say
+  // which sites lost their search data. A per-host 403 (property string doesn't
+  // match a property the service account can read) otherwise shows up only as
+  // one truncated note in the runs table, which is how five sites sat with no
+  // keyword data from 2026-08-11 until it was noticed by eye.
+  const gscFailedHosts = new Set();
   if (env.GSC_SA_KEY) {
     try {
       const sa = JSON.parse(env.GSC_SA_KEY);
@@ -168,16 +174,19 @@ async function runDaily(env, now = new Date()) {
           rows = await queryKeywords(token, gsc, gStart, gEnd, 25, gscPageFilter);
         } catch (e) {
           notes.push(`gsc queries ${host}: ${e.message}`.slice(0, 140));
+          gscFailedHosts.add(host);
         }
         try {
           pages = await queryPages(token, gsc, gStart, gEnd, 15, gscPageFilter);
         } catch (e) {
           notes.push(`gsc pages ${host}: ${e.message}`.slice(0, 140));
+          gscFailedHosts.add(host);
         }
         try {
           summary = await querySearchSummary(token, gsc, gStart, gEnd, gscPageFilter);
         } catch (e) {
           notes.push(`gsc summary ${host}: ${e.message}`.slice(0, 140));
+          gscFailedHosts.add(host);
         }
         for (const k of rows) {
           stmts.push(
@@ -221,9 +230,9 @@ async function runDaily(env, now = new Date()) {
   //    so the daily phone alert reports the human audience rather than whatever a
   //    crawler happened to do that night.
   const summary = await summarizeToday(env, date).catch(() => null);
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary);
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts);
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
-    botVisits: summary?.botVisits ?? null, gscOk, notes };
+    botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts], notes };
 }
 
 // Re-read the last 30 days and split today into human vs crawler traffic.
@@ -252,7 +261,7 @@ async function summarizeToday(env, date) {
   return { humanVisits, botVisits, perHost, flooded };
 }
 
-async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary) {
+async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set()) {
   if (!env.NTFY_TOPIC) return;
   const ranked = summary
     ? [...summary.perHost.entries()].sort((a, b) => b[1] - a[1])
@@ -261,7 +270,14 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary) {
   const headline = summary ? `${summary.humanVisits} visitors (24h)` : `${totalVisits} visitors (24h)`;
   const crawlers = summary?.botVisits
     ? `\n🤖 ${summary.botVisits} crawler sessions excluded (${summary.flooded.join(", ")})` : "";
-  const body = `${headline}\n${top}${crawlers}${gscOk ? "" : "\n⚠ keywords: " + (notes[0] || "skipped")}`;
+  // Name the sites that lost search data. The raw note is a truncated Google
+  // error body, which reads as noise; the host list is what says "go fix that
+  // property in Search Console".
+  const gscWarn = gscOk ? ""
+    : gscFailedHosts.size
+      ? `\n⚠ no search data: ${[...gscFailedHosts].join(", ")}`.slice(0, 300)
+      : `\n⚠ keywords: ${notes[0] || "skipped"}`;
+  const body = `${headline}\n${top}${crawlers}${gscWarn}`;
   try {
     await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
       method: "POST",
