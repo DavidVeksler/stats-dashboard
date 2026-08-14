@@ -104,6 +104,9 @@ const fixture = {
         { referrer: "(direct)", kind: "direct", visits: 700 },
         { referrer: "www.google.com", kind: "search", visits: 250 },
         { referrer: "www.reddit.com", kind: "social", visits: 80 },
+        // An AI-answer-engine referrer: a per-row badge, not its own mix-bar
+        // channel — see the AI_ANSWER_ENGINES note in config.js.
+        { referrer: "chatgpt.com", kind: "ai", visits: 55 },
       ],
       // One of each class plus one query that is already performing at its
       // position. Every badge must say which of the two problems it is: "rewrite
@@ -506,6 +509,15 @@ for (const prose of [
   "it cannot be backfilled",
 ]) {
   if (!html.includes(prose)) throw new Error(`Footer is missing the required caveat: "${prose}"`);
+}
+
+// ---- AI-answer-engine referrer badge ---------------------------------------
+// A per-row badge on the referrer list, not a mix-bar channel or a KPI tile —
+// see the AI_ANSWER_ENGINES note in config.js for why. Just confirm it renders
+// with its own tag class and label, same as the other referrer kinds.
+if (!html.includes("chatgpt.com")) throw new Error("The ai-kind referrer row is missing from the rendered card");
+if (!/class="tag ai"[^>]*>AI</.test(html)) {
+  throw new Error("The ai-kind referrer must render with a \"tag ai\" class and an AI label");
 }
 
 // ---- "Today's actions" (spec item 5) --------------------------------------

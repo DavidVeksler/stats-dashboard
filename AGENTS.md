@@ -143,6 +143,18 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   from the panel entirely** rather than drawn as `Internal 0 · 0.0%`. A rendered zero there would
   assert a measurement nobody took. This matters most in `?period=7` and `?period=30`, which still
   reach back over pre-change rows — test both, not only the 24h view.
+- **`kind: "ai"` is a per-row badge, not a mix-bar channel, because it is known to undercount.**
+  `classifyReferrer` recognizes a short list of AI chat/answer-engine referrer hosts
+  (`AI_ANSWER_ENGINES` in `src/config.js`) and tags matching rows `ai` — same write-time-frozen,
+  forward-only rule as `internal` above. It is deliberately **not** added to `totals.sourceMix`:
+  `summarizeSources` in `src/index.js` folds `ai` into `referral` for every aggregate, so the KPI
+  tiles and the traffic-source bar are unaffected. Reason: most AI chat surfaces don't reliably send
+  a `Referer` at all (`noreferrer` links, JS-driven navigation), and Google's AI Overviews and Bing
+  Copilot pass their parent engine's own referrer (`google.`/`bing.`), indistinguishable from
+  ordinary search — so this list only ever catches a fraction of real AI-driven traffic. Promoting
+  it to a headline channel would imply a completeness the data can't back up. If that changes (a
+  reliable way to separate AI Overview / Copilot clicks turns up), reconsider promoting it — until
+  then it stays a badge on `referrerList`'s per-row tags only.
 - **`Unattributed` is a residual, not a channel, and must never be rendered as one.** It is
   `visits - (direct + search + social + referral + internal)`, so it measures the disagreement
   between two tables rather than any behavior. It used to be called `Other / unlisted` and rendered

@@ -114,6 +114,15 @@ export const CF_ACCOUNTS = [
 const SEARCH_ENGINES = ["google.", "bing.", "duckduckgo.", "search.brave.", "yandex.", "ecosia.", "search.marginalia", "yahoo."];
 const SOCIAL = ["reddit.", "reddit.frontpage", "linkedin.", "facebook.", "x.com", "t.co", "twitter.", "instagram.", "youtube.", "news.ycombinator", "mastodon", "bsky", "t.me", "telegram"];
 
+// AI chat / answer-engine referrers that click straight through to a page. This
+// is necessarily partial: most of these surfaces don't reliably send a Referer
+// header at all (noreferrer links, JS-driven navigation), and Google's AI
+// Overviews and Bing Copilot pass their parent engine's own referrer
+// (google./bing.), which is indistinguishable from ordinary search — those stay
+// classified as "search" and can't be split out from this list. Checked before
+// SEARCH_ENGINES because gemini.google.com would otherwise match "google.".
+const AI_ANSWER_ENGINES = ["chatgpt.com", "chat.openai.com", "claude.ai", "perplexity.ai", "gemini.google.com", "copilot.microsoft.com", "you.com", "poe.com"];
+
 // Classify a refererHost into a source type for the dashboard tags.
 //
 // `selfHost`, when given, is the primary host of the site being measured. A
@@ -125,10 +134,19 @@ const SOCIAL = ["reddit.", "reddit.frontpage", "linkedin.", "facebook.", "x.com"
 // it only exists on rows written after 2026-08-13; rows stored before that carry
 // no "internal" at all and the panel treats the channel as absent rather than
 // measured-zero for those days.
+//
+// "ai" is the same kind of write-time-frozen classification, added later still:
+// rows stored before this shipped keep whatever they were classified as then
+// (usually "ref"). Unlike "internal" it isn't promoted to its own channel in the
+// traffic-source mix — see summarizeSources in index.js, which folds "ai" into
+// "referral" for the aggregate and only exposes it as a badge on individual
+// referrer rows, because the undercount above is too large to headline as a
+// measured channel.
 export function classifyReferrer(refHost, selfHost = null) {
   if (!refHost) return "direct";
   const h = refHost.toLowerCase();
   if (selfHost && HOST_ALIASES.get(refHost) === selfHost) return "internal";
+  if (AI_ANSWER_ENGINES.some((s) => h.includes(s))) return "ai";
   if (SEARCH_ENGINES.some((s) => h.includes(s))) return "search";
   if (SOCIAL.some((s) => h.includes(s))) return "social";
   return "ref";

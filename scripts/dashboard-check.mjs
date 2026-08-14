@@ -218,9 +218,13 @@ const referrers = [
   // what the top-50-per-host-day truncation looks like in real data.
   { date: "2026-08-08", host: SMALL_HOST, referrer: "(direct)", kind: "direct", visits: 15 },
   { date: "2026-08-08", host: SMALL_HOST, referrer: "www.google.com", kind: "search", visits: 12 },
-  { date: "2026-08-09", host: SMALL_HOST, referrer: "(direct)", kind: "direct", visits: 20 },
+  { date: "2026-08-09", host: SMALL_HOST, referrer: "(direct)", kind: "direct", visits: 18 },
   { date: "2026-08-09", host: SMALL_HOST, referrer: "www.google.com", kind: "search", visits: 12 },
   { date: "2026-08-09", host: SMALL_HOST, referrer: "www.davidveksler.com", kind: "internal", visits: 6 },
+  // An AI-answer-engine referrer: folded into "referral" for every aggregate
+  // (sourceMix, totals) but carries its own "ai" kind on the row itself, which
+  // is all this per-row badge is — see the AI_ANSWER_ENGINES note in config.js.
+  { date: "2026-08-09", host: SMALL_HOST, referrer: "chatgpt.com", kind: "ai", visits: 2 },
 ];
 const nonDirect = (date) =>
   referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
@@ -582,6 +586,11 @@ if (process.argv.includes("--signals")) {
     <= data.totals.visits, true);
   check("the internal channel is flagged as measured when a row carries it",
     data.totals.internalMeasured, true);
+  // An AI-answer-engine referrer (kind "ai") is a per-row badge, not a mix
+  // channel: see the AI_ANSWER_ENGINES note in config.js for why it's folded
+  // into "referral" here rather than counted separately or left unattributed.
+  check("an ai-kind referrer is folded into referral, not given its own mix key",
+    mix.referral, 2);
 }
 
 // 9b. The historical case, and the reason item 6 needs one. `kind` is frozen into

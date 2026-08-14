@@ -542,7 +542,11 @@ async function loadDashboard(env, options = {}) {
   const summarizeSources = (rows, visits) => {
     const result = emptyMix();
     for (const row of rows) {
-      const key = row.kind === "ref" ? "referral" : row.kind;
+      // "ai" (an AI chat/answer-engine referrer, see classifyReferrer) is folded
+      // into "referral" here rather than given its own mix key: it's a badge on
+      // individual referrer rows, not a headline channel — see the comment above
+      // AI_ANSWER_ENGINES in config.js for why.
+      const key = row.kind === "ref" || row.kind === "ai" ? "referral" : row.kind;
       if (key in result && key !== "unattributed") result[key] += Number(row.visits || 0);
     }
     const attributed = result.direct + result.search + result.social + result.referral + result.internal;
