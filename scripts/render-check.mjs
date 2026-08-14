@@ -292,7 +292,7 @@ const required = [
   // "11 RUM sites" and contradict each other about how many sites exist.
   "4 RUM + 2 zone · 4 with traffic",
   "min-height:44px", "Use \" + target + \" color theme",
-  "if (matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
+  "if (detail.classList.contains(\"detail\") && matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
   // Crawler traffic must stay visible and named rather than silently dropped.
   "42,000 crawler sessions excluded", "3 flooded site-days", "example.com (42,000)",
   "spark-flood", "crawler flood, direct traffic excluded", "Human vs crawler",
