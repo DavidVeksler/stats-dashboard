@@ -63,6 +63,7 @@ export const SITES = [
   { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
     gscPageFilter: "^https?://(?:www\\.)?freecapitalists\\.org/" },
   { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
+  { host: "wiki.objectivismonline.com", gsc: "sc-domain:wiki.objectivismonline.com" },
   // Reads the parent domain property filtered to the subdomain. A dedicated
   // sc-domain:davidveksler.freecapitalists.org property was created 2026-08-12
   // and is readable, but Search Console has not backfilled it yet: it returns
