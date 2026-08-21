@@ -251,6 +251,21 @@ const fixture = {
       spark: [{ date: "2026-07-15", visits: 80, flood: false }, { date: "2026-07-16", visits: 88, flood: false }],
     },
   ],
+  forums: [
+    {
+      host: "forum.example", name: "Example Forum",
+      usersCount: 59639, activeToday: 3, active7d: 3, active30d: 3,
+      newToday: 0, new7d: 0, new30d: 0, postsToday: 0, postsCount: 398996, topicsCount: 26291,
+      meanActiveToday: 2.4,
+      spark: [{ date: "2026-07-15", visits: 2, flood: false }, { date: "2026-07-16", visits: 3, flood: false }],
+      hasData: true,
+    },
+    // Newly added forum with no snapshot yet — the card must say so rather than
+    // render a confident zero (same rule as the pre-migration zone card above).
+    { host: "forum2.example", name: "Second Forum", usersCount: 0, activeToday: 0, active7d: 0,
+      active30d: 0, newToday: 0, new7d: 0, new30d: 0, postsToday: 0, postsCount: 0, topicsCount: 0,
+      meanActiveToday: 0, spark: [], hasData: false },
+  ],
 };
 
 const html = renderDashboard(fixture);
@@ -324,11 +339,43 @@ const required = [
   "This card reports no human count for library.example",
   // The pre-migration card renders without inventing a zero.
   "Verified-crawler figures appear after the next daily pull.",
+  // Forum activity: its own section, its own card, sourced from about.json
+  // rather than re-derived from the paginated admin user list.
+  "Forum activity (Discourse)", "Example Forum",
+  "https://forum.example/admin/users/list/active",
+  "active users today", "14-day mean 2",
 ];
 for (const marker of required) {
   if (!html.includes(marker)) throw new Error(`Rendered dashboard is missing: ${marker}`);
 }
 if (html.includes("Total visitors")) throw new Error("Legacy visitor terminology remains in the rendered dashboard");
+
+// ---- Forum activity (Discourse) --------------------------------------------
+// Its own section, below the zone-log section, never merged into either grid —
+// active users and RUM/zone sessions are different quantities from different
+// sources and must never share a card.
+const forumSectionAt = html.indexOf("Forum activity (Discourse)");
+if (forumSectionAt < 0) throw new Error("Forum activity section did not render");
+if (html.indexOf("Zone-log measurement") > forumSectionAt) {
+  throw new Error("Forum activity section must render below Zone-log measurement, never above it");
+}
+const forumBlock = html.slice(forumSectionAt);
+// The forum sparkline reuses the site-card sparkline function but must relabel
+// its unit — "sessions" is a Cloudflare RUM quantity this data never measured.
+if (!forumBlock.includes("active users for forum.example")) {
+  throw new Error("Forum sparkline must be labelled in active users, not sessions");
+}
+if (/\d-day sessions for forum/.test(forumBlock)) {
+  throw new Error("Forum sparkline must not borrow the RUM sparkline's \"sessions\" label");
+}
+// A forum with no snapshot yet says so rather than rendering a confident zero
+// (same rule the pre-migration zone card enforces above).
+const secondForumAt = forumBlock.indexOf("Second Forum");
+if (secondForumAt < 0) throw new Error("The no-data forum fixture did not render");
+const secondForumCard = forumBlock.slice(secondForumAt, forumBlock.indexOf("</section>", secondForumAt));
+if (!secondForumCard.includes("No snapshot yet")) {
+  throw new Error("A forum with no stored snapshot must say so, not render a zero");
+}
 
 // ---- Traffic sources (spec item 6) ----------------------------------------
 // "Other / unlisted" was the largest bucket on the page (1,060 of 2,012, 52.7%)
@@ -383,12 +430,16 @@ for (const periodDays of [1, 7, 30]) {
   }
 }
 // A fixture with no history yet must not print an empty comparator chip.
+// Forum activity is read from its own table, on its own timeline, so "no
+// history loaded" is spelled out for it too rather than left to carry over
+// the traffic fixture's real 14-day mean.
 const noTrendHtml = renderDashboard({
   ...fixture,
   totals: { ...fixture.totals,
     trend: { window: 14, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0, gscSnapshots: 0,
       gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
       gscWindowFirst: null, gscWindowLast: null, gscSeries: [] } },
+  forums: fixture.forums.map((f) => ({ ...f, hasData: false, meanActiveToday: 0, spark: [] })),
 });
 // Every comparator chip is a <span class="cmp">; the opportunity link is an
 // <a class="cmp"> and is not a comparator.

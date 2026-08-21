@@ -1,5 +1,6 @@
-import { SITES } from "./config.js";
+import { SITES, FORUMS } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
+import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, KEYWORD_ROW_LIMIT } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
@@ -115,6 +116,18 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, category)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host)`),
+    // Forum user login/activity stats (see discourse.js). Independent of the
+    // CF/GSC tables above — sourced from each Discourse forum's /about.json.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_forum_activity (
+      date TEXT NOT NULL, host TEXT NOT NULL,
+      users_count INTEGER NOT NULL DEFAULT 0, active_today INTEGER NOT NULL DEFAULT 0,
+      active_7d INTEGER NOT NULL DEFAULT 0, active_30d INTEGER NOT NULL DEFAULT 0,
+      new_today INTEGER NOT NULL DEFAULT 0, new_7d INTEGER NOT NULL DEFAULT 0,
+      new_30d INTEGER NOT NULL DEFAULT 0, posts_today INTEGER NOT NULL DEFAULT 0,
+      posts_count INTEGER NOT NULL DEFAULT 0, topics_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_forum_activity_dh ON daily_forum_activity(date, host)`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -215,6 +228,31 @@ async function runDaily(env, now = new Date()) {
           `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
         ).bind(date, host, p.page, p.visits, p.views),
       );
+    }
+  }
+
+  // 1c. Forum user login/activity stats (Discourse). Independent of the CF pull
+  // above and of each other — one forum's about.json erroring must not stop the
+  // rest of the night's write, so each pull is its own try/catch and a failure
+  // becomes a note rather than an exception.
+  for (const { host } of FORUMS) {
+    try {
+      const f = await pullForumStats(host);
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_forum_activity
+           (date,host,users_count,active_today,active_7d,active_30d,new_today,new_7d,new_30d,posts_today,posts_count,topics_count)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(date,host) DO UPDATE SET
+             users_count=excluded.users_count, active_today=excluded.active_today,
+             active_7d=excluded.active_7d, active_30d=excluded.active_30d,
+             new_today=excluded.new_today, new_7d=excluded.new_7d, new_30d=excluded.new_30d,
+             posts_today=excluded.posts_today, posts_count=excluded.posts_count, topics_count=excluded.topics_count`
+        ).bind(date, host, f.usersCount, f.activeToday, f.active7d, f.active30d,
+          f.newToday, f.new7d, f.new30d, f.postsToday, f.postsCount, f.topicsCount),
+      );
+    } catch (e) {
+      notes.push(`forum activity ${host}: ${e.message}`.slice(0, 140));
     }
   }
 
@@ -390,6 +428,9 @@ async function loadDashboard(env, options = {}) {
   if (!date) {
     return { date: null, coverageStart: null, generatedAt: new Date().toISOString(), dataUpdatedAt: null, run: null,
       periodDays, domain, sort, allDomains: SITES.map((site) => site.host), signals: [],
+      forums: FORUMS.map(({ name, host }) => ({ host, name, usersCount: 0, activeToday: 0, active7d: 0,
+        active30d: 0, newToday: 0, new7d: 0, new30d: 0, postsToday: 0, postsCount: 0, topicsCount: 0,
+        meanActiveToday: 0, spark: [], hasData: false })),
       totals: { visits: 0, views: 0, pagesPerSession: 0, search: 0,
         domains: selectedSites.length, active: 0,
         rumDomains: selectedSites.filter((s) => measurementOf(s) === "rum").length,
@@ -482,7 +523,14 @@ async function loadDashboard(env, options = {}) {
   const zoneBotsQuery = env.DB.prepare(
     `SELECT host,category,requests,visits FROM daily_zone_bots WHERE date=? ORDER BY requests DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, zoneBots, hist, histRefs, run] = await Promise.all([
+  // Forum activity read over the same history window as the traffic sparkline
+  // (14 days back from `historyStart`'s wider span, trimmed to COMPARATOR_DAYS
+  // below) so its own trend line and mean use identically-shaped history.
+  const forumActivityQuery = env.DB.prepare(
+    `SELECT date,host,users_count,active_today,active_7d,active_30d,new_today,new_7d,new_30d,posts_today,posts_count,topics_count
+     FROM daily_forum_activity WHERE date BETWEEN ? AND ? ORDER BY date ASC`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -499,6 +547,7 @@ async function loadDashboard(env, options = {}) {
     zoneCountriesQuery,
     zoneStatusQuery,
     zoneBotsQuery,
+    forumActivityQuery,
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
@@ -897,9 +946,38 @@ async function loadDashboard(env, options = {}) {
     floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
   });
 
+  // Forum activity: independent of the RUM/zone measurement split above, so it
+  // gets its own small shaping step rather than joining `sites`. Each row is a
+  // rolling-window snapshot (see discourse.js), not a daily delta, so — same
+  // rule as the GSC trend — only a trailing mean is computed from history, never
+  // a day-over-day change.
+  const forums = FORUMS.map(({ name, host }) => {
+    const rows = (forumActivity.results ?? []).filter((r) => r.host === host);
+    const latestRow = rows.find((r) => r.date === date) ?? null;
+    const trailing = rows.slice(-COMPARATOR_DAYS);
+    const meanActiveToday = trailing.length
+      ? trailing.reduce((sum, r) => sum + Number(r.active_today || 0), 0) / trailing.length : 0;
+    return {
+      host, name,
+      usersCount: Number(latestRow?.users_count || 0),
+      activeToday: Number(latestRow?.active_today || 0),
+      active7d: Number(latestRow?.active_7d || 0),
+      active30d: Number(latestRow?.active_30d || 0),
+      newToday: Number(latestRow?.new_today || 0),
+      new7d: Number(latestRow?.new_7d || 0),
+      new30d: Number(latestRow?.new_30d || 0),
+      postsToday: Number(latestRow?.posts_today || 0),
+      postsCount: Number(latestRow?.posts_count || 0),
+      topicsCount: Number(latestRow?.topics_count || 0),
+      meanActiveToday,
+      spark: rows.slice(-14).map((r) => ({ date: r.date, visits: Number(r.active_today || 0), flood: false })),
+      hasData: rows.length > 0,
+    };
+  });
+
   return { date, start, coverageStart: availableDates[0] || date, previousStart, previousEnd, generatedAt: new Date().toISOString(),
     dataUpdatedAt: run?.run_at || `${date}T00:00:00Z`, run, periodDays, domain, sort,
-    allDomains: SITES.map((site) => site.host), signals, totals, sites };
+    allDomains: SITES.map((site) => site.host), signals, totals, sites, forums };
 }
 
 // Internal, WAF-gated dashboard: tell compliant crawlers and AI agents to stay

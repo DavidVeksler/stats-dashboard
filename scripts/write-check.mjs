@@ -20,7 +20,7 @@
 // here rather than fixtured, because gsc.js signs a real JWT with it.
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
 import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
-import { SITES } from "../src/config.js";
+import { SITES, FORUMS } from "../src/config.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -72,6 +72,14 @@ globalThis.fetch = async (input, init = {}) => {
         ctr: 0, position: 5 + (i % 60),
       })),
     });
+  }
+
+  if (FORUMS.some((f) => url === `https://${f.host}/about.json`)) {
+    return json({ about: { stats: {
+      users_count: 59180, active_users_last_day: 3, active_users_7_days: 3, active_users_30_days: 3,
+      users_last_day: 0, users_7_days: 0, users_30_days: 0,
+      posts_last_day: 0, posts_count: 398996, topics_count: 26291,
+    } } });
   }
 
   if (url.includes("api.cloudflare.com")) {
@@ -204,6 +212,14 @@ const run = async (env) => {
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_traffic")).length, SITES.length);
   check("...and is never deleted",
     flat.some((s) => s.sql.includes("DELETE FROM daily_traffic")), false);
+
+  // Forum activity (Discourse) is an independent pull from the CF/GSC ones
+  // above: one upsert row per configured forum, no delete/insert pattern (there
+  // are no per-forum child rows to keep in step with a delete).
+  check("daily_forum_activity is written as an upsert, one row per forum",
+    flat.filter((s) => s.sql.startsWith("INSERT INTO daily_forum_activity")).length, FORUMS.length);
+  check("...and is never deleted",
+    flat.some((s) => s.sql.includes("DELETE FROM daily_forum_activity")), false);
 }
 
 // ---- 2. No GSC key: traffic refreshes, keywords survive -------------------

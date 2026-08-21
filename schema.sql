@@ -100,6 +100,25 @@ CREATE TABLE IF NOT EXISTS daily_zone_bots (
   PRIMARY KEY (date, host, category)
 );
 
+-- Forum user login/activity stats (see src/discourse.js). One row per
+-- (date, host) snapshot, same shape as daily_traffic, sourced from each
+-- Discourse forum's own /about.json rather than Cloudflare or GSC.
+CREATE TABLE IF NOT EXISTS daily_forum_activity (
+  date         TEXT NOT NULL,
+  host         TEXT NOT NULL,
+  users_count  INTEGER NOT NULL DEFAULT 0, -- total registered users
+  active_today INTEGER NOT NULL DEFAULT 0, -- distinct users seen in the last 24h
+  active_7d    INTEGER NOT NULL DEFAULT 0, -- rolling 7-day window
+  active_30d   INTEGER NOT NULL DEFAULT 0, -- rolling 30-day window
+  new_today    INTEGER NOT NULL DEFAULT 0, -- new signups, rolling 24h
+  new_7d       INTEGER NOT NULL DEFAULT 0,
+  new_30d      INTEGER NOT NULL DEFAULT 0,
+  posts_today  INTEGER NOT NULL DEFAULT 0,
+  posts_count  INTEGER NOT NULL DEFAULT 0, -- lifetime total
+  topics_count INTEGER NOT NULL DEFAULT 0, -- lifetime total
+  PRIMARY KEY (date, host)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,
@@ -116,3 +135,4 @@ CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, h
 CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host);
+CREATE INDEX IF NOT EXISTS idx_forum_activity_dh ON daily_forum_activity(date, host);

@@ -14,13 +14,14 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `runs`), not docs |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `daily_forum_activity`, `runs`), not docs |
 | Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 implemented; 9, 10, 11 proposed) |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
+| Forum user login/activity stats | `src/discourse.js` + `FORUMS` in `src/config.js` — no API key, see the note below |
 | Everything else | this file |
 
 ## What this is
@@ -106,6 +107,25 @@ visible badges with no way to tell that from a bug.
 `totals.trend` holds the 14-day means, and no new query was added for any of them. A number that
 answers none of *is this normal? / what changed? / what do I do?* is decoration, so a bare figure on
 a tile is a bug, not a style choice.
+
+**Forum activity (Discourse) is a third, independent pull**, alongside Cloudflare/RUM and GSC —
+`FORUMS` in `src/config.js`, pulled by `src/discourse.js`, stored in `daily_forum_activity`,
+rendered as its own "Forum activity (Discourse)" section below the zone-log section rather than
+folded into `sites`. It answers "how many people logged in / signed up," which SITES (traffic +
+search) has no notion of. **No API key**: `pullForumStats` reads each forum's public
+`/about.json`, whose `about.stats` object already carries the exact rolling-window counters
+(`active_users_last_day/7_days/30_days`, `users_count`, `users_last_day/7_days/30_days`) Discourse's
+own admin dashboard shows, served to anonymous requests on both live forums as of 2026-08-21. This
+was a deliberate choice over paginating the admin-only `/admin/users/list/active.json` (which the
+admin UI links to) — that endpoint needs an Admin API key and, at up to 59,639 users, would need
+many paginated requests to answer the same three numbers about.json gives in one anonymous call.
+Two read-only (`global:read`, GET-only) API keys were created and then revoked the same day once
+the about.json approach proved sufficient — if `/admin/users/list/active.json` or
+`/admin/reports/*.json` (visits, signups, dau_by_mau) are ever needed for a richer forum card, the
+Rails-runner recipe for minting a scoped key lives in this session's history, not in this repo.
+If a forum ever sets `login_required` or otherwise hides its about stats, the pull starts failing
+loudly (a note in the `runs` table) rather than silently zeroing — see `parseAboutStats` in
+`discourse.js` and `scripts/discourse-check.mjs`.
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics

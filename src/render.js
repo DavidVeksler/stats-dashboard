@@ -80,7 +80,7 @@ function actionsBlock(signals) {
   </section>`;
 }
 
-function sparkline(points, host) {
+function sparkline(points, host, unit = "sessions") {
   const vals = points.map((point) => Number(point.visits || 0));
   if (vals.length < 2) return `<div class="spark-empty">Trend appears after two daily snapshots.</div>`;
   const w = 150, h = 38, pad = 3;
@@ -98,11 +98,11 @@ function sparkline(points, host) {
   // The line plots every measured day, crawler floods included — a flood is a
   // real event worth seeing — but the flooded points are marked so the spike
   // never reads as an audience the site does not have.
-  const label = `${points.length}-day sessions for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}` +
+  const label = `${points.length}-day ${unit} for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}` +
     (floodCount ? `; ${floodCount} day${floodCount === 1 ? "" : "s"} crawler-flooded` : "");
   const pointsWithTitles = coords.map(({ x, y }, index) =>
     `<circle class="spark-hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4">
-      <title>${esc(points[index].date)}: ${fmt(vals[index])} sessions${points[index].flood ? " — crawler flood, direct traffic excluded" : ""}</title>
+      <title>${esc(points[index].date)}: ${fmt(vals[index])} ${unit}${points[index].flood ? " — crawler flood, direct traffic excluded" : ""}</title>
     </circle>`).join("");
   const floodMarks = coords.map(({ x, y }, index) => points[index].flood
     ? `<circle class="spark-flood" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4"/>` : "").join("");
@@ -453,6 +453,60 @@ function siteCard(site, index, periodDays) {
   </section>`;
 }
 
+// One card per Discourse forum, reading data.forums (see loadDashboard's
+// `forums` shaping step — independent of the RUM/zone `sites` cards above).
+// The two stat grids reuse the `.search-summary` layout the search-panel cards
+// already use rather than introducing a new component for four-number rows.
+function forumCard(f) {
+  const id = `forum-${f.host.replace(/[^a-z0-9]/gi, "-")}`;
+  if (!f.hasData) {
+    return `<section class="card empty" aria-labelledby="${id}">
+      <div class="chead"><div class="hostwrap">
+        <h2 class="host" id="${id}"><a href="https://${esc(f.host)}/admin/users/list/active" target="_blank" rel="noopener">${esc(f.name)}</a></h2>
+      </div></div>
+      <p class="none">No snapshot yet — the next nightly pull will populate this.</p>
+    </section>`;
+  }
+  return `<section class="card" aria-labelledby="${id}">
+    <div class="chead">
+      <div class="hostwrap">
+        <h2 class="host" id="${id}"><a href="https://${esc(f.host)}/admin/users/list/active" target="_blank" rel="noopener">${esc(f.name)}</a></h2>
+        ${sparkline(f.spark, f.host, "active users")}
+      </div>
+      <div class="nums"><div class="big">${fmt(f.activeToday)}</div><div class="lbl">active users today</div>
+        <div class="pv">${f.meanActiveToday
+          ? cmp(`14-day mean ${fmt(Math.round(f.meanActiveToday))}`, "Mean daily active-user count over the last 14 daily snapshots.")
+          : ""}</div></div>
+    </div>
+    <div class="cols">
+      <section class="panel"><h3><span class="dot traffic"></span>Active users</h3>
+        <div class="search-summary">
+          <div><strong>${fmt(f.activeToday)}</strong><span>today</span></div>
+          <div><strong>${fmt(f.active7d)}</strong><span>7 days</span></div>
+          <div><strong>${fmt(f.active30d)}</strong><span>30 days</span></div>
+          <div><strong>${fmt(f.usersCount)}</strong><span>registered</span></div>
+        </div>
+      </section>
+      <section class="panel"><h3><span class="dot good"></span>New signups</h3>
+        <div class="search-summary">
+          <div><strong>${fmt(f.newToday)}</strong><span>today</span></div>
+          <div><strong>${fmt(f.new7d)}</strong><span>7 days</span></div>
+          <div><strong>${fmt(f.new30d)}</strong><span>30 days</span></div>
+          <div><strong>${fmt(f.postsToday)}</strong><span>posts today</span></div>
+        </div>
+      </section>
+    </div>
+  </section>`;
+}
+
+function forumSection(forums) {
+  if (!forums?.length) return "";
+  return `<section class="zone-section" aria-labelledby="forum-section-heading">
+    <h2 class="section-heading" id="forum-section-heading">Forum activity (Discourse)</h2>
+    <div class="grid">${forums.map(forumCard).join("")}</div>
+  </section>`;
+}
+
 function withQuery(data, changes) {
   const values = { period: data.periodDays, domain: data.domain || "", sort: data.sort || "traffic", ...changes };
   const params = new URLSearchParams();
@@ -650,6 +704,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
       <h2 class="section-heading" id="zone-section-heading">Zone-log measurement</h2>
       <div class="grid">${zoneSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
     </section>` : ""}
+    ${forumSection(data.forums)}
   </main>
   <footer>
     <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable. Each KPI tile carries a <b>14-day mean</b> beside it, computed from the same daily snapshots and the same human/crawler split the cards use, so every figure can be read against what normal looks like.</div>
@@ -657,6 +712,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count, which is why such a day's sessions read as a floor (≥) rather than a count, why pages/session divides by clean sessions only, and why a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
     <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. Flooded days are called out as "no like-for-like comparison" rather than quietly dropping off the list.</div>
     <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows. <b>Median search position</b> is the median across queries with at least ${fmt(POSITION_MIN_IMPRESSIONS)} impressions, not a mean: a mean across a branded position-1 query and a position-90 stray moves when the junk moves and stays put when the work lands. <b>Two populations, never mixed:</b> the <b>Search CTR</b> headline is every query on every property, tail included, but expected CTR needs a per-query position and the only per-query rows stored are the top queries Google returns per site. So the CTR comparison states both of its sides over those stored rows and reports what share of impressions they cover, and the position tile counts stored top queries rather than the whole estate. Comparing a top-query expectation against a whole-corpus actual made a roughly 6× gap read as 15×. <b>GSC figures are a rolling window, not a daily series</b> — each nightly snapshot asks Google for a three-day window that lags two days, so consecutive snapshots overlap by two days out of three; only trailing averages are taken from them, a snapshot-over-snapshot difference is never presented as a change, and every date shown here is the window Google measured rather than the night we asked.</div>
+    <div><b>Forum activity</b> is read from each Discourse forum's own <code>/about.json</code>, the same rolling-window counters its admin dashboard shows (active users today / 7 days / 30 days, new signups on the same three windows) — not re-derived from the paginated admin user list. These are Discourse's own counts, not this dashboard's; no comparator or crawler-flood logic applies to them.</div>
     <div><b>Search opportunities come in two classes with two different remedies, ranked by two different metrics.</b> A <b>snippet</b> gap is a query at position ${SNIPPET_MAX_POSITION} or better taking under ${pct(SNIPPET_CTR_RATIO, 0)} of the click-through its rank would ordinarily deliver: the ranking is already there, so the fix is the title and meta description, and these are ranked by <b>lost clicks</b> — impressions × (expected CTR − actual CTR) — which is what is recoverable without moving at all. A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}, where nobody ever saw the snippet, so the fix is content and internal links, and these are ranked by <b>potential clicks</b> — what the query would earn at position ${TARGET_POSITION}, less what it earns now. Ranking both classes by lost clicks would guarantee that a deep, valuable query always lost to a shallow trivial one. Both classes need at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions and at least ${MIN_ACTIONABLE_CLICKS} clicks of gain over the window; past position ${RANK_MAX_POSITION} a query is neither badged nor counted. Expected CTR by position is approximated from the SISTRIX 2020 CTR study (~80M keywords; positions 1, 2, 3 and 10 measured, the rest interpolated and the tail past 10 estimated), so it is a comparator and never a target — that is why no number derived from it is shown to more than one decimal place. Where a site sets <code>queryDenyPatterns</code> in <code>src/config.js</code>, matching queries still appear in the list and carry no badge.</div>
     ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other. The crawler-flood classifier cannot run on them either — it needs a referrer dimension the zone log does not have — so each zone card carries its own two-lens accounting instead: <b>verified crawlers</b>, from the categories Cloudflare cryptographically verifies, which is a floor on crawler volume rather than a bot/human split (this plan does not expose bot scores, so unverified crawlers are unmeasurable and sit in the same bucket as real readers), and <b>non-content requests</b>, meaning crawler-protocol and asset paths plus every response ≥ 400. The two overlap, so they are never added, and no human count is claimed for a zone host at all.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics and Google Search Console.</div>

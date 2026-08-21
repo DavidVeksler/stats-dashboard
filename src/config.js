@@ -88,6 +88,15 @@ export const SITES = [
   { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
 ];
 
+// Discourse forums tracked for user login/activity stats — a separate pull
+// from SITES above (Cloudflare RUM/zone + GSC), read from each forum's own
+// public /about.json rather than Cloudflare or Search Console. See
+// src/discourse.js for why no API key is needed for this.
+export const FORUMS = [
+  { name: "Mises Community", host: "forum.freecapitalists.org" },
+  { name: "Objectivism Online", host: "forum.objectivismonline.com" },
+];
+
 // Map<anyHost, primaryHost>. A site can span several hostnames (an apex landing
 // page in front of a forum, a www alias); every alias rolls up into the site's
 // primary `host` so the dashboard shows one row per site and D1 stays keyed on
