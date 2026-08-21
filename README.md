@@ -1,6 +1,16 @@
 # stats-dashboard
 
-Daily traffic + search dashboard for all my domains, at **https://stats.davidveksler.com**.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-f38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![Cloudflare D1](https://img.shields.io/badge/Cloudflare-D1-f38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/d1/)
+
+A serverless **Cloudflare Worker** that aggregates **Cloudflare Web Analytics** (RUM
+traffic + referrers), **Google Search Console** (keywords, CTR, ranking position), and
+**Discourse forum activity** for a portfolio of domains into one self-hosted daily
+dashboard — no external analytics SaaS, no client-side tracking script. A **Cron
+Trigger** pulls everything nightly, writes a snapshot per domain into **D1** (SQLite at
+the edge), and renders instantly from stored history with 14-day sparklines, anomaly
+detection, and ranked SEO opportunities. Live example: **https://stats.davidveksler.com**.
 
 ![stats-dashboard screenshot](docs/dashboard.png)
 
