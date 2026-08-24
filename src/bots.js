@@ -13,6 +13,20 @@
 
 export const FLOOD_MIN_VISITS = 500;   // below this, a "flood" is indistinguishable from noise
 export const FLOOD_MULTIPLE = 3;       // ...and must be this many times a normal day
+// How far back classifyTraffic's caller reads to find clean-baseline candidate
+// days — independent of the 14/30-day windows the rest of the dashboard uses.
+// A flood that runs long enough to dominate whatever window it's judged against
+// makes its own baseline: forum.objectivismonline.com ran flooded (2,300-56,000
+// visits/day against a true ~600-800/day baseline) for 26 of the 30 days in the
+// then-current window, so both the median-of-clean-days path (too few clean days
+// left) and the 25th-percentile-of-everything fallback (built from the same
+// flood) were computed from flood days, and the flood went undetected from
+// 2026-08-19 onward even though nothing about its shape had changed. Reaching
+// back further finds the 12+ genuinely clean days near project inception that a
+// fixed 30-day window had already aged out. Cheap to widen: these are one row a
+// day per host (daily_traffic) plus a handful per host (daily_referrers grouped
+// by kind), nothing like the per-keyword cost KEYWORD_ROW_LIMIT guards against.
+export const BASELINE_LOOKBACK_DAYS = 180;
 // Exported so the footer prose that explains these rules can interpolate them
 // rather than restate them as literals that drift out of sync with the code.
 export const FLAT_PAGES_PER_SESSION = 1.15;   // humans click through; crawlers hit one URL and leave

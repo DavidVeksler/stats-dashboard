@@ -3,7 +3,7 @@ import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudfla
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, KEYWORD_ROW_LIMIT } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay,
-  crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
+  crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
 import { computeSignals } from "./signals.js";
 import { renderDashboard } from "./render.js";
@@ -360,14 +360,19 @@ async function runDaily(env, now = new Date()) {
     notes };
 }
 
-// Re-read the last 30 days and split today into human vs crawler traffic.
+// Re-read the trailing history and split today into human vs crawler traffic.
+// Same BASELINE_LOOKBACK_DAYS as loadDashboard's read (see the comment on that
+// constant in bots.js) — this used to be a hardcoded 30 days, an independent
+// copy of the same window that let forum.objectivismonline.com's flood corrupt
+// the nightly ntfy push's baseline too, not just the dashboard's.
 async function summarizeToday(env, date) {
   const [hist, histRefs] = await Promise.all([
-    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date >= date(?, '-29 days')`).bind(date).all(),
+    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date >= date(?, ?)`)
+      .bind(date, `-${BASELINE_LOOKBACK_DAYS - 1} days`).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
-       WHERE date >= date(?, '-29 days') GROUP BY date,host,kind`
-    ).bind(date).all(),
+       WHERE date >= date(?, ?) GROUP BY date,host,kind`
+    ).bind(date, `-${BASELINE_LOOKBACK_DAYS - 1} days`).all(),
   ]);
   const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
   let humanVisits = 0, botVisits = 0;
@@ -470,6 +475,12 @@ async function loadDashboard(env, options = {}) {
   // looks like, and it has to reach back over the comparison period too — a
   // flooded "previous period" would otherwise poison every delta on the page.
   const historyStart = [previousStart, addDays(date, -29)].sort()[0];
+  // The flood classifier's own baseline read reaches back further still — see
+  // BASELINE_LOOKBACK_DAYS in bots.js for why the 30-day floor above isn't
+  // enough once a flood outlasts it. Only the two queries that feed
+  // classifyTraffic (`hist`, `histRefs` below) use this; every other read keeps
+  // `historyStart` so its cost and its trailing-mean windows are unaffected.
+  const baselineStart = [historyStart, addDays(date, -(BASELINE_LOOKBACK_DAYS - 1))].sort()[0];
   // THE THREE SEARCH CONSOLE READS ARE DELIBERATELY NOT THE SAME WIDTH.
   //
   // `daily_search_summary` spans the history window, because the search tiles'
@@ -548,11 +559,11 @@ async function loadDashboard(env, options = {}) {
     zoneStatusQuery,
     zoneBotsQuery,
     forumActivityQuery,
-    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
+    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(baselineStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
        WHERE date BETWEEN ? AND ? GROUP BY date,host,kind`
-    ).bind(historyStart, date).all(),
+    ).bind(baselineStart, date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
   ]);
   const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);

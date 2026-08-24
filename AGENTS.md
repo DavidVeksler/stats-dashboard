@@ -300,6 +300,22 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   remain, the baseline falls back to the **25th percentile**, not the median — a median inside a
   sustained flood blesses the flood as normal, which is exactly how the Aug 2026
   forum.objectivismonline.com flood went unflagged for eight days.
+- **The baseline window itself can run out of clean days, not just the fallback percentile.**
+  Both percentile paths in `classifyTraffic` are computed over whatever window the caller reads —
+  and by 2026-08-24 the forum.objectivismonline.com flood (started 2026-07-30, a true baseline of
+  ~618/day) had been running for 26 of the 30 days in the then-current read, so the 25th-percentile
+  fallback from the fix above was itself built almost entirely from flood days. The flood settled
+  into an elevated "new normal" (10k-30k/day, matching its own shape day over day) that never
+  tripped `FLOOD_MULTIPLE` against that inflated baseline, so every day from 2026-08-19 on rendered
+  as clean "human sessions" — the same failure mode recurring in a form the 25th-percentile fix
+  didn't reach. `BASELINE_LOOKBACK_DAYS` (`src/bots.js`, 180 days) is a second, wider window read
+  *only* for the two queries that feed `classifyTraffic` (`hist`/`histRefs` in `loadDashboard`, and
+  the equivalent pair in `summarizeToday` for the nightly ntfy push — these were two independent
+  30-day windows, both had the bug, both needed the fix). Every other read keeps the narrower
+  `historyStart`/`-29 days` window, so this costs nothing beyond a few hundred extra
+  one-row-a-day-per-host `daily_traffic` rows and a handful of grouped `daily_referrers` rows — see
+  the comment on `BASELINE_LOOKBACK_DAYS` for why that's cheap. If a flood ever outlasts 180 days
+  too, the same fix applies again: widen further, don't add a third window.
 - **A flooded day is partially recoverable — only the direct bucket is lost.** The flood test is
   largely a test for direct traffic (crawlers arrive with no referer), so the *referred* sessions
   on a flooded day are still a real measurement and are counted (`splitDay` in `src/bots.js`).

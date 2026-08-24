@@ -920,6 +920,64 @@ for (const period of [7, 30]) {
   }
 }
 
+// 15. The baseline window itself can be entirely flood, not just the 25th-
+//     percentile fallback within it. This is the real forum.objectivismonline.com
+//     incident (2026-08-24): a flood that started 2026-07-30 against a true
+//     ~618/day baseline was still running 26 days later, so a 30-day read never
+//     contained enough (or any) clean days — every fallback computed inside that
+//     window was itself built from flood, and the flood read as "human sessions"
+//     from 2026-08-19 on. BASELINE_LOOKBACK_DAYS widens only the two reads that
+//     feed classifyTraffic, independent of the 30-day floor every other read
+//     keeps; this section proves that widening is actually wired in, not just
+//     that classifyTraffic behaves correctly when handed a wide window (bots-
+//     check.mjs already covers that).
+//
+//     FORUM_HOST gets its own traffic/referrer rows here — nowhere else in this
+//     file gives it any, so this cannot perturb the opportunity-classifier
+//     checks above that use the same host for keywords/search-summary fixtures.
+{
+  const FLOOD_TODAY = "2026-08-09"; // matches DAYS.at(-1).date, i.e. MAX(date)
+  // 21 genuinely clean days, entirely outside the 30-day floor (`date - 29` =
+  // 2026-07-11): real browsing shape, well under FLOOD_MIN_VISITS.
+  const cleanDays = Array.from({ length: 21 }, (_, i) => ({
+    date: dayAfter("2026-06-20", i), visits: 700 + (i % 3) * 40,
+  }));
+  // 30 flood days filling the entire 30-day floor, including today: matches the
+  // flood signature (>=90% direct, <=1.15 pages/session) throughout, so the
+  // narrow window has zero clean days to build a baseline from.
+  const floodDays = Array.from({ length: 30 }, (_, i) => ({
+    date: dayAfter("2026-07-11", i), visits: i === 29 ? 8000 : 20000,
+  }));
+  for (const day of [...cleanDays, ...floodDays]) {
+    const direct = day.visits >= 5000 ? Math.round(day.visits * .98) : Math.round(day.visits * .7);
+    const pps = day.visits >= 5000 ? 1.05 : 1.35;
+    traffic.push({ date: day.date, host: FORUM_HOST, visits: day.visits, views: Math.round(day.visits * pps) });
+    referrers.push({ date: day.date, host: FORUM_HOST, referrer: "(direct)", kind: "direct", visits: direct });
+    referrers.push({ date: day.date, host: FORUM_HOST, referrer: "www.google.com", kind: "search", visits: day.visits - direct });
+  }
+  // Sanity on the fixture itself: with only the narrow 30-day window (no clean
+  // days in range), the flood's own 25th percentile is 20000, so 8000 must NOT
+  // clear FLOOD_MULTIPLE x that on its own — otherwise this test would pass for
+  // the wrong reason.
+  check("fixture check: today's volume is below 3x the flood's own 25th percentile",
+    8000 < 3 * 20000, true);
+
+  readWidths = [];
+  const { data } = await load(`domain=${FORUM_HOST}&period=1`);
+  const site = data.sites.find((s) => s.host === FORUM_HOST);
+  check("the classifier still finds today a bot flood despite 29 flood-shaped days in the 30-day window",
+    site.botVisits > 0, true);
+  check("...specifically the crawler volume computed against the true, older baseline",
+    site.botVisits, 7840); // 8000 - round(8000*.98)=160 human, rest crawler
+  check("...leaving only the referred sessions as human",
+    site.visits, 160);
+  check("...marked partial, not a clean day",
+    site.partialDays, 1);
+  check("the daily_traffic read for the classifier reaches back past the 30-day floor",
+    readWidths.some((r) => r.table === "daily_traffic" && r.binds[0] <= "2026-03-01"), true);
+  readWidths = [];
+}
+
 if (failures) {
   console.error(`\n${failures} dashboard aggregation check(s) failed`);
   process.exit(1);
