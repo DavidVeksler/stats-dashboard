@@ -78,8 +78,13 @@ async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLi
   return body.rows ?? [];
 }
 
-// Aggregate totals for the window. Keeping this separate from ranked
-// query/page rows avoids under-counting when Search Console truncates those lists.
+// Aggregate totals for the window. Kept separate from ranked query/page rows
+// as its own Search Console request, ONLY for the case that separation exists
+// for: a `queryKeywords` pull that came back truncated at KEYWORD_ROW_LIMIT,
+// where summing the stored rows would under-count. When the pull is NOT
+// truncated, callers should use `summarizeKeywordRows` on those rows instead
+// of calling this — see the comment there for why that is exact, not an
+// approximation, and why it exists (the Worker's own subrequest budget).
 export async function querySearchSummary(token, siteUrl, start, end, pageFilter = null) {
   const rows = await querySearchAnalytics(token, siteUrl, start, end, null, 1, pageFilter);
   const row = rows[0] ?? {};
@@ -88,6 +93,35 @@ export async function querySearchSummary(token, siteUrl, start, end, pageFilter 
     impressions: row.impressions ?? 0,
     ctr: row.ctr ?? 0,
     position: row.position ?? 0,
+  };
+}
+
+// Derive the same shape `querySearchSummary` returns, from `queryKeywords`
+// rows already pulled for the same window — no extra Search Console request.
+// Only valid when those rows are NOT truncated (rows.length < the rowLimit
+// they were requested with): in that case they already ARE the whole
+// per-query corpus for the window, so summing clicks/impressions and taking
+// the impression-weighted mean position exactly reproduces what a separate
+// dimensionless query would return (GSC's own `position` is itself an
+// impression-weighted average — see the Search API reference). Call
+// `querySearchSummary` instead when the pull came back truncated.
+//
+// Why this exists: 12 sites x 3 GSC calls (keywords, pages, summary) a night,
+// plus the RUM/zone/forum pulls, was landing the Worker's single invocation
+// right at Cloudflare's subrequest ceiling — vellum.capital, last in SITES,
+// lost its summary call to "Too many subrequests by single Worker invocation"
+// on 2026-08-26 even though its own GSC pull (9 rows, nowhere near
+// KEYWORD_ROW_LIMIT) succeeded. Every site currently stores well under the
+// limit, so this removes one GSC call per site per night with no loss of
+// accuracy, not just for vellum.capital.
+export function summarizeKeywordRows(rows) {
+  const clicks = rows.reduce((sum, r) => sum + r.clicks, 0);
+  const impressions = rows.reduce((sum, r) => sum + r.impressions, 0);
+  return {
+    clicks,
+    impressions,
+    ctr: impressions > 0 ? clicks / impressions : 0,
+    position: impressions > 0 ? rows.reduce((sum, r) => sum + r.position * r.impressions, 0) / impressions : 0,
   };
 }
 

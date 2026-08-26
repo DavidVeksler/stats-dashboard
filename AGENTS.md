@@ -249,6 +249,21 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   500), so nothing may assume a fixed count; and the median-position tile now sees the deep tail,
   which is what `POSITION_MIN_IMPRESSIONS` is for — the median got worse and more honest, it did not
   regress. Do **not** "fix" a surviving `thin sample` label by moving `THIN_SAMPLE_SHARE`.
+- **The Worker's own subrequest budget is a real ceiling, and it was already close.** One `runDaily`
+  invocation makes roughly 4 (RUM, one per `CF_ACCOUNTS`) + 5 (zone, for `library.freecapitalists.org`)
+  + up to 3 × `SITES.length` (GSC: keywords, pages, summary) + `FORUMS.length` + 1 (ntfy) fetches — with
+  12 GSC sites that is up to 36 GSC calls alone. On 2026-08-26 vellum.capital, last in `SITES`, lost its
+  summary call to Cloudflare's own `Too many subrequests by single Worker invocation` error, even though
+  its keyword and page calls (earlier in the loop) succeeded — a site's data can go missing from being
+  late in the array, not from anything wrong with that site. The fix: `runDaily` now calls
+  `querySearchSummary` (a 3rd GSC request) only when `queryKeywords` came back **truncated** at
+  `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
+  `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
+  is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
+  removes ~1 GSC call per site per night. If the estate grows enough that this stops being enough
+  headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
+  Workers plan's subrequest ceiling itself, not another code trim — that is a billing decision, David's
+  call.
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB

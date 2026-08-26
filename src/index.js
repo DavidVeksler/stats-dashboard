@@ -1,7 +1,8 @@
 import { SITES, FORUMS } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
-import { getAccessToken, queryKeywords, queryPages, querySearchSummary, KEYWORD_ROW_LIMIT } from "./gsc.js";
+import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
+  KEYWORD_ROW_LIMIT } from "./gsc.js";
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
@@ -283,8 +284,10 @@ async function runDaily(env, now = new Date()) {
         stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
         stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
         let rows = [], pages = [], summary = null;
+        let keywordsOk = false;
         try {
           rows = await queryKeywords(token, gsc, gStart, gEnd, KEYWORD_ROW_LIMIT, gscPageFilter);
+          keywordsOk = true;
         } catch (e) {
           notes.push(`gsc queries ${host}: ${e.message}`.slice(0, 140));
           gscFailedHosts.add(host);
@@ -295,11 +298,21 @@ async function runDaily(env, now = new Date()) {
           notes.push(`gsc pages ${host}: ${e.message}`.slice(0, 140));
           gscFailedHosts.add(host);
         }
-        try {
-          summary = await querySearchSummary(token, gsc, gStart, gEnd, gscPageFilter);
-        } catch (e) {
-          notes.push(`gsc summary ${host}: ${e.message}`.slice(0, 140));
-          gscFailedHosts.add(host);
+        // Skip the separate summary request when the keyword pull already came
+        // back complete (not truncated at KEYWORD_ROW_LIMIT) — those rows already
+        // are the whole per-query corpus, so summing them is exact. See
+        // summarizeKeywordRows in gsc.js for why, and why this call is worth
+        // saving. Falls back to the real summary request when truncated, or when
+        // the keyword pull itself failed.
+        if (keywordsOk && rows.length < KEYWORD_ROW_LIMIT) {
+          summary = summarizeKeywordRows(rows);
+        } else {
+          try {
+            summary = await querySearchSummary(token, gsc, gStart, gEnd, gscPageFilter);
+          } catch (e) {
+            notes.push(`gsc summary ${host}: ${e.message}`.slice(0, 140));
+            gscFailedHosts.add(host);
+          }
         }
         for (const k of rows) {
           stmts.push(
