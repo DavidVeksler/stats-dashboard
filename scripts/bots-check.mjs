@@ -3,8 +3,8 @@
 // be verified directly — and it is the piece most worth verifying, since a false
 // positive silently deletes real traffic from the dashboard.
 import {
-  classifyTraffic, splitDay, crawlerAccounting, summarizeVerifiedBots, summarizeNonContent,
-  isNonContentPath, UNVERIFIED_CATEGORY,
+  classifyTraffic, splitDay, directRatioStats, crawlerAccounting, summarizeVerifiedBots,
+  summarizeNonContent, isNonContentPath, UNVERIFIED_CATEGORY, RATIO_MIN_CLEAN_DAYS,
 } from "../src/bots.js";
 
 let failures = 0;
@@ -191,6 +191,103 @@ check("a clean day is not partial", cleanDay.partial, false);
   for (const field of ["requests", "total", "nonContentRequests", "contentRequests"]) {
     check(`the two components are never merged into a ${field} total`, field in nonContent, false);
   }
+}
+
+// 11. The ratio estimator. A flooded day's direct bucket used to be discarded
+//     whole; with enough clean-day history it now gets a point estimate (that
+//     host's own typical direct/referred ratio on ordinary days) instead,
+//     always alongside a spread so it is never shown with more precision than
+//     it has. See the comment above splitDay and directRatioStats in bots.js.
+{
+  // A host with exactly RATIO_MIN_CLEAN_DAYS clean days at a fixed 1.5 ratio
+  // (visits: 100, 60 direct / 40 referred, every day), then one 3x flood.
+  const RATIO_HOST = "ratio";
+  const ratioDays = [
+    ...Array.from({ length: RATIO_MIN_CLEAN_DAYS }, () => ({ visits: 100, pps: 1.4, direct: .6 })),
+    { visits: 1000, pps: 1.0, direct: .99 },
+  ];
+  const { traffic: rTraffic, referrers: rReferrers } = rows(RATIO_HOST, ratioDays);
+  const rClassified = classifyTraffic(rTraffic, rReferrers);
+  const rStats = directRatioStats(rClassified, RATIO_HOST);
+  check("enough clean days produces a ratio", rStats?.sampleDays, RATIO_MIN_CLEAN_DAYS);
+  check("...median matches the fixed clean-day ratio (60/40)", rStats?.median, 1.5);
+  check("...MAD is zero when every clean day agrees", rStats?.mad, 0);
+
+  const rFlood = [...rClassified.get(RATIO_HOST).values()].at(-1);
+  check("fixture check: the last day is the flood", rFlood.flood, true);
+  const rEstimated = splitDay(rFlood, rStats);
+  // nonDirect=10, direct=990: estimatedDirect = min(990, 10*1.5=15) = 15.
+  check("estimated human is referred plus the ratio-scaled direct share", rEstimated.human, 25);
+  check("...crawler is whatever the estimate leaves over", rEstimated.crawler, 975);
+  check("...flagged as an estimate, not a bare floor", rEstimated.estimated, true);
+  check("...with zero spread when the clean-day ratio never varied", rEstimated.spread, 0);
+  check("...and the estimated-direct portion is exposed for the source mix", rEstimated.estimatedDirect, 15);
+
+  // Below RATIO_MIN_CLEAN_DAYS, the same host falls back to the floor-only
+  // split — omitting ratioStats entirely, exactly like the pre-estimator
+  // callers in test 7 above, must behave identically.
+  const thinDays = [
+    ...Array.from({ length: RATIO_MIN_CLEAN_DAYS - 1 }, () => ({ visits: 100, pps: 1.4, direct: .6 })),
+    { visits: 1000, pps: 1.0, direct: .99 },
+  ];
+  const { traffic: tTraffic, referrers: tReferrers } = rows("thin", thinDays);
+  const tClassified = classifyTraffic(tTraffic, tReferrers);
+  check("one day short of the minimum yields no ratio at all",
+    directRatioStats(tClassified, "thin"), null);
+  const tFlood = [...tClassified.get("thin").values()].at(-1);
+  const tFloor = splitDay(tFlood, directRatioStats(tClassified, "thin"));
+  check("...so splitDay falls back to the floor", tFloor.human, tFlood.nonDirect);
+  check("...not flagged as an estimate", tFloor.estimated, false);
+  check("a host absent from the classified map has no ratio", directRatioStats(rClassified, "nobody"), null);
+
+  // The estimate can never claim more direct humans than were measured as
+  // direct at all: a ratio built from a very different (low-direct-share) clean
+  // history must not blow past the flooded day's own direct count.
+  const capDay = { visits: 1000, direct: 20, nonDirect: 980, flood: true };
+  const capStats = { median: 5, mad: 0, sampleDays: 10 };
+  const capped = splitDay(capDay, capStats);
+  check("the estimate is capped at the day's own measured direct count", capped.estimatedDirect, 20);
+  check("...so human can reach the full visit count but never exceed it", capped.human, 1000);
+  check("...leaving zero crawler volume, not a negative one", capped.crawler, 0);
+
+  // The displayed spread is clamped into [nonDirect, visits] — a noisy ratio
+  // (large MAD) must not print a margin wider than the hard counts allow.
+  const spreadDay = { visits: 100, direct: 90, nonDirect: 10, flood: true };
+  const noisyStats = { median: 1, mad: 50, sampleDays: 10 };
+  const clamped = splitDay(spreadDay, noisyStats);
+  // estimatedDirect = min(90, 10*1=10) = 10, human = 20; raw spread would be
+  // 10*50=500, clamped to min(500, human-nonDirect=10, visits-human=80) = 10.
+  check("a noisy ratio's spread is clamped, not printed raw", clamped.spread, 10);
+
+  // Median resists a single outlier clean day the way a mean would not — the
+  // same reason the flood baseline itself uses median over mean (see the
+  // comment on `baseline` in classifyTraffic).
+  const outlierDays = new Map([
+    ["d1", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d2", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d3", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d4", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d5", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d6", { signature: false, nonDirect: 10, direct: 100 }], // ratio 10, the outlier
+  ]);
+  const outlierStats = directRatioStats(new Map([["outlier", outlierDays]]), "outlier");
+  check("the median ignores a single outlier clean day", outlierStats.median, 1);
+  check("...but the outlier is still counted in the sample size", outlierStats.sampleDays, 6);
+
+  // A signature-shaped "clean" day (i.e. one that looks like a flood but never
+  // crossed the volume floor) must not contaminate the ratio pool, and neither
+  // should a day with zero referred sessions (undefined ratio).
+  const mixedDays = new Map([
+    ["d1", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d2", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d3", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d4", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d5", { signature: false, nonDirect: 40, direct: 40 }],
+    ["d6", { signature: true, nonDirect: 1, direct: 999 }],   // flood-shaped, excluded
+    ["d7", { signature: false, nonDirect: 0, direct: 0 }],    // no referred traffic at all
+  ]);
+  const mixedStats = directRatioStats(new Map([["mixed", mixedDays]]), "mixed");
+  check("a flood-shaped day never joins the clean-day ratio pool", mixedStats.sampleDays, 5);
 }
 
 if (failures) {

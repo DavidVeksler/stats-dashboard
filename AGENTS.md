@@ -316,18 +316,45 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   one-row-a-day-per-host `daily_traffic` rows and a handful of grouped `daily_referrers` rows — see
   the comment on `BASELINE_LOOKBACK_DAYS` for why that's cheap. If a flood ever outlasts 180 days
   too, the same fix applies again: widen further, don't add a third window.
-- **A flooded day is partially recoverable — only the direct bucket is lost.** The flood test is
+- **A flooded day is partially recoverable — only the direct bucket is uncertain.** The flood test is
   largely a test for direct traffic (crawlers arrive with no referer), so the *referred* sessions
   on a flooded day are still a real measurement and are counted (`splitDay` in `src/bots.js`).
-  What can't be recovered is the direct bucket, where crawler and human are mixed beyond
-  separation, and pageviews, which carry no referer dimension at all. Consequences to preserve:
-  a flooded-day total is a **floor**, rendered with `≥`; pages/session divides clean views by
-  **clean** sessions only; deltas are suppressed when either side of the comparison is partial
-  (a floor vs a full count is not a like-for-like change); `daily_cf_pages` rows on flooded days
-  stay excluded whole. Don't "improve" any of this by interpolating the missing direct traffic —
-  it is reported as crawler volume, not estimated.
-  Before this split existed, a site whose only day in view was flooded rendered a completely
+  What can't be recovered **by counting** is the direct bucket, where crawler and human are mixed
+  beyond separation, and pageviews, which carry no referer dimension at all and stay a hard
+  exclusion always. The direct bucket itself has two outcomes — see the next bullet for the second
+  one. Consequences to preserve either way: pages/session divides clean views by **clean** sessions
+  only; deltas are suppressed when either side of the comparison is partial (a floor/estimate vs a
+  full count is not a like-for-like change); `daily_cf_pages` rows on flooded days stay excluded
+  whole. Before this split existed, a site whose only day in view was flooded rendered a completely
   blank card (freecapitalists.org, 2026-08-09).
+- **The direct bucket gets a ratio estimate once a host has enough clean-day history, and a bare
+  floor otherwise — never anything in between.** `directRatioStats` (`src/bots.js`) builds a
+  host's typical direct/referred visit ratio from its own clean (non-flood-shaped) days —
+  median and MAD, for the same reason the flood baseline uses them (a handful of high-traffic
+  clean days should not dominate a ratio meant to describe an ordinary one). Below
+  `RATIO_MIN_CLEAN_DAYS` (5) clean days, `directRatioStats` returns `null` and `splitDay` falls
+  back to the original floor-only split (`human = nonDirect`), rendered `≥`. At or above it, the
+  flooded day's direct bucket is estimated as `referred × that ratio's median`, capped at the
+  day's own measured direct count so the estimate can never claim more direct humans than there
+  were total direct visits, rendered `~` with a `±spread` (the ratio's MAD, itself clamped into
+  `[nonDirect, visits]` so the printed margin can never exceed the hard counts on either side of
+  it). This is a deliberate, bounded exception to "never interpolate": it does not invent a number
+  with no basis, it asks what this specific host's own referred traffic implies about its direct
+  traffic on an ordinary day, and it always ships with a margin so it is never shown with more
+  precision than it has. **The estimated-direct amount must be credited into the `direct` bucket of
+  `sources`/`sourceMix`, never left uncredited** — `summarizeSources` in `src/index.js` takes an
+  `estimatedDirect` param for exactly this; without it, the estimate has no referrer row to sit in
+  and balloons `unattributed` into the largest slice of the mix, which is what happened the first
+  time this was wired up and is why the fix is called out here rather than left to be rediscovered.
+  A host either has enough clean-day history to estimate every one of its flooded days or none —
+  the gate is per-host, not per-day, so a site's own days are never a mix of floor and estimate.
+  A 2026-08-26 pull across the live estate found the ratio's dispersion (MAD/median) ranges from
+  ~14% on the tightest sites to 100%+ on ones with almost no clean-day sample — which is exactly
+  why there is no second gate on CV: the spread is what communicates trustworthiness, a fixed
+  cutoff would just relocate the floor/estimate discontinuity rather than remove it, and a
+  99%-direct small personal site's *normal* daily shape already looks identical to a flood's
+  shape (see the two-out-of-three-signals-agree design above) — the ratio, not the shape, is what
+  is being trusted here.
 - **A zone-sourced host can never be flagged as flooded, so it must never sit in a session total.**
   `classifyTraffic` derives `directShare` from `daily_referrers` rows, and a zone host writes none
   (zone logs carry no referer dimension), so `direct = 0`, `signature` is always false, and no

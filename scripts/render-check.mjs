@@ -69,7 +69,7 @@ const fixture = {
   totals: { visits: 1300, views: 1770, pagesPerSession: 1770 / 1300, search: 260,
     domains: 6, rumDomains: 4, zoneDomains: 2, active: 4, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
     botVisits: 42000, botViews: 42350, previousBotVisits: 0, botShare: .97, floodedSiteDays: 3, floodedSites: 1,
-    partialVisits: 120, partialSites: 1,
+    partialVisits: 120, partialSites: 1, estimatedSites: 1, estimatedDirect: 13,
     // The residual is `unattributed` and is rendered outside the bar; `internal`
     // is a real channel that used to fall into it.
     sourceMix: { direct: 700, search: 260, social: 80, referral: 60, internal: 120, unattributed: 80 },
@@ -179,12 +179,14 @@ const fixture = {
     },
     // The freecapitalists.org case: every day in view was flooded, so there is no
     // clean day at all. The card must still show the referred sessions it did
-    // measure rather than going blank.
+    // measure rather than going blank — and this host has enough clean-day
+    // history (see ratioSampleDays) that the direct bucket is a ratio estimate
+    // (~30, ±5) rather than the older bare floor (17 referred only).
     {
-      host: "flooded.example", visits: 17, views: 0, previousVisits: 0, delta: null,
-      botVisits: 1672, botViews: 1828, botDays: 1, previousBotVisits: 3428, cleanDays: 0,
-      partialVisits: 17, partialDays: 1,
-      anomaly: "99% direct, 1.1 pages/session, 65x a normal day",
+      host: "flooded.example", visits: 30, views: 0, previousVisits: 0, delta: null,
+      botVisits: 1659, botViews: 1828, botDays: 1, previousBotVisits: 3428, cleanDays: 0,
+      partialVisits: 30, partialDays: 1, estimatedVisits: true, spread: 5, estimatedDirect: 13, ratioSampleDays: 6,
+      anomaly: "99% direct, 1.1 pages/session, 65x a normal day — direct bucket estimated from 6 clean days",
       pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
       searchSummary: { clicks: 3, impressions: 100, ctr: .03, position: 39.8 },
       gscWindow: "2026-07-12–2026-07-14",
@@ -314,9 +316,17 @@ const required = [
   // Crawler traffic must stay visible and named rather than silently dropped.
   "42,000 crawler sessions excluded", "3 flooded site-days", "example.com (42,000)",
   "spark-flood", "crawler flood, direct traffic excluded", "Human vs crawler",
-  // A fully flooded site keeps the sessions it could still measure, marked as a
-  // floor, instead of rendering a blank card.
-  "&ge;&nbsp;17", "The figure above is the 17 referred sessions that survived the flooded day.",
+  // The dashboard-wide aside: the "still count" figure excludes the estimated
+  // share (107 = totals.partialVisits 120 minus totals.estimatedDirect 13), and
+  // a separate sentence names how many sites got a ratio estimate and how much.
+  "referred sessions still count (107 of them here)", "13 more sessions, with its own margin",
+  // A fully flooded site keeps the sessions it could still measure, and with
+  // enough clean-day history the direct bucket is a ratio estimate (not a bare
+  // floor) instead of rendering a blank card.
+  "&sim;&nbsp;30", `<span class="spread"`, "&plusmn;5",
+  "The figure above is the 17 referred sessions that survived the flooded day.",
+  "Its direct bucket on those days adds an estimated 13 more",
+  "ratio over 6 clean days", `total above is "~" a figure, plus or minus about 5`,
   "pageviews not separable on flooded days",
   // ...and the mixed case, where clean days and recovered days both contribute.
   "Human figures above cover the 4 clean days, plus 120 referred sessions that survived the flooded days.",

@@ -31,6 +31,14 @@ export const BASELINE_LOOKBACK_DAYS = 180;
 // rather than restate them as literals that drift out of sync with the code.
 export const FLAT_PAGES_PER_SESSION = 1.15;   // humans click through; crawlers hit one URL and leave
 export const DIRECT_SHARE = 0.9;              // crawlers send no referer
+// Minimum clean days (see directRatioStats) needed before a flooded day's direct
+// bucket gets a ratio estimate instead of the floor-only split. This gates on
+// data availability, not on how tight the ratio turns out to be — the spread
+// carried alongside every estimate is what communicates trustworthiness, so
+// there is deliberately no second gate on CV. Below this count the ratio is
+// too thin to trust at all (a two-point median has no real spread to report),
+// so splitDay falls back to floor-only rather than showing a number.
+export const RATIO_MIN_CLEAN_DAYS = 5;
 
 const quantile = (sorted, q) =>
   sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))] : 0;
@@ -88,6 +96,34 @@ export function classifyTraffic(trafficRows, referrerRows) {
   return byHost;
 }
 
+// A host's typical direct/referred visit ratio on its own clean (non-flood-
+// shaped) days, for estimating how much of a flooded day's direct bucket was
+// still human instead of discarding it outright.
+//
+// Built once per host over every clean day `classified` has in view, not per
+// call to splitDay — the estimate needs the host's whole clean-day history, not
+// just the one day being split. median/MAD for the same reason the flood
+// baseline uses them (see the comment on `baseline` above): a handful of
+// high-traffic clean days should not dominate a ratio meant to describe an
+// ordinary one, and MAD stays meaningful even when the ratio series itself has
+// a fat-tailed outlier.
+//
+// Returns null when there is not enough clean-day history to trust a ratio at
+// all — callers must treat that as "no estimate available", not as a ratio of
+// zero.
+export function directRatioStats(classified, host) {
+  const days = classified.get(host);
+  if (!days) return null;
+  const ratios = [...days.values()]
+    .filter((day) => !day.signature && day.nonDirect > 0)
+    .map((day) => day.direct / day.nonDirect)
+    .sort((a, b) => a - b);
+  if (ratios.length < RATIO_MIN_CLEAN_DAYS) return null;
+  const median = quantile(ratios, .5);
+  const mad = quantile(ratios.map((r) => Math.abs(r - median)).sort((a, b) => a - b), .5);
+  return { median, mad, sampleDays: ratios.length };
+}
+
 // Split one classified day into the part that is still creditable to people and
 // the part that is crawler noise.
 //
@@ -96,26 +132,50 @@ export function classifyTraffic(trafficRows, referrerRows) {
 // for *direct* traffic (>=90% of sessions carry no referer, because that is how
 // crawlers arrive), so the referred sessions on a flooded day are still a real,
 // measured human signal — a referral from Google or Reddit is not something the
-// crawler produces. Those sessions are reported as a floor ("at least N"), which
-// is a measurement, not the interpolation the docs rightly warn against.
+// crawler produces. Those sessions are reported as a floor ("at least N").
 //
-// What genuinely cannot be recovered is the direct bucket, where the crawler and
-// real direct visitors are mixed beyond separation, and pageviews, which carry no
-// referer dimension at all. Both are reported as crawler volume rather than split.
-export function splitDay(day) {
-  if (!day) return { human: 0, crawler: 0, views: 0, crawlerViews: 0, partial: false };
+// What genuinely cannot be recovered by counting is the direct bucket, where the
+// crawler and real direct visitors are mixed beyond separation, and pageviews,
+// which carry no referer dimension at all. Pageviews stay a hard floor always.
+// The direct bucket gets a second option: when `ratioStats` carries enough
+// clean-day history for this host (see directRatioStats), estimate the human
+// share of it as referred x that host's own typical direct/referred ratio,
+// capped at the day's actual direct count so the estimate can never claim more
+// direct humans than there were total direct visits. This is a deliberate,
+// bounded exception to "never interpolate": it is not filling in a number with
+// no basis, it is asking what this specific host's own referred traffic implies
+// about its direct traffic on an ordinary day, and it always ships with a
+// `spread` so the estimate is never presented with more precision than it has.
+// Without enough history, or without a ratioStats argument at all, this falls
+// back to the original floor-only split — existing callers that omit the second
+// argument keep exactly the old behavior.
+export function splitDay(day, ratioStats = null) {
+  if (!day) return { human: 0, crawler: 0, views: 0, crawlerViews: 0, partial: false, estimated: false, spread: 0, estimatedDirect: 0 };
   if (!day.flood) {
-    return { human: day.visits, crawler: 0, views: day.views, crawlerViews: 0, partial: false };
+    return { human: day.visits, crawler: 0, views: day.views, crawlerViews: 0, partial: false, estimated: false, spread: 0, estimatedDirect: 0 };
+  }
+  if (ratioStats) {
+    const estimatedDirect = Math.round(Math.min(day.direct, day.nonDirect * ratioStats.median));
+    const human = day.nonDirect + estimatedDirect;
+    // Clamped into [nonDirect, visits] — the measured floor and the measured
+    // total — so the displayed range can never claim more certainty than the
+    // hard counts on either side of it.
+    const spread = Math.round(Math.min(day.nonDirect * ratioStats.mad,
+      human - day.nonDirect, day.visits - human));
+    return { human, crawler: day.visits - human, views: 0, crawlerViews: day.views,
+      partial: true, estimated: true, spread, estimatedDirect };
   }
   return { human: day.nonDirect, crawler: day.visits - day.nonDirect, views: 0,
-    crawlerViews: day.views, partial: true };
+    crawlerViews: day.views, partial: true, estimated: false, spread: 0, estimatedDirect: 0 };
 }
 
 // Human-readable explanation for a flooded day, for the card callout.
-export function floodReason(day) {
+export function floodReason(day, ratioStats = null) {
   if (!day?.flood) return null;
-  return `${Math.round(day.directShare * 100)}% direct, ${day.pagesPerSession.toFixed(1)} pages/session, ` +
+  const shape = `${Math.round(day.directShare * 100)}% direct, ${day.pagesPerSession.toFixed(1)} pages/session, ` +
     `${Math.round(day.visits / Math.max(day.baseline, 1))}x a normal day`;
+  if (!ratioStats) return shape;
+  return `${shape} — direct bucket estimated from ${ratioStats.sampleDays} clean days`;
 }
 
 // Dates (per host) that were crawler-flooded, for filtering referrer and

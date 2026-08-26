@@ -6,6 +6,7 @@
 // how classified days turn into the numbers the page prints — because that is
 // where a flooded day used to erase a site's traffic, referrers and all.
 import worker from "../src/index.js";
+import { classifyTraffic, splitDay, directRatioStats } from "../src/bots.js";
 import { looksMalformed } from "../src/urls.js";
 import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS,
   POSITION_MIN_IMPRESSIONS, RANK_MAX_POSITION, OPPORTUNITY_MIN_IMPRESSIONS } from "../src/opportunities.js";
@@ -228,6 +229,15 @@ const referrers = [
 ];
 const nonDirect = (date) =>
   referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
+// The DAYS fixture gives HOST 12 clean days at a fixed direct/referred ratio of
+// 1.5, so it clears RATIO_MIN_CLEAN_DAYS and the real 2026-08-08/09 flood days
+// get a ratio estimate rather than the older floor-only split — computed here
+// from the same bots.js functions loadDashboard calls, not hand-derived, so a
+// change to the estimator's arithmetic fails this file instead of silently
+// going stale.
+const hostClassified = classifyTraffic(traffic, referrers);
+const hostRatioStats = directRatioStats(hostClassified, HOST);
+const estimatedHuman = (date) => splitDay(hostClassified.get(HOST).get(date), hostRatioStats).human;
 
 // A deliberately deep tail of stored queries, appended to the keyword rows only
 // inside the block that exercises the raised KEYWORD_ROW_LIMIT. Empty otherwise,
@@ -294,39 +304,50 @@ const load = async (query) => {
 };
 
 // 1. The 24h view, where the only day available is flooded. This is the exact
-//    case that rendered an empty card.
+//    case that rendered an empty card. HOST's 12 clean prior days clear
+//    RATIO_MIN_CLEAN_DAYS, so the direct bucket gets a ratio estimate instead
+//    of the older floor-only split (see hostRatioStats above).
 {
   const { data, site } = await load(`domain=${HOST}&period=1`);
-  const recovered = nonDirect("2026-08-09");
-  check("flooded-only day still reports referred sessions", site.visits, recovered);
-  check("...and marks them as a partial-day floor", site.partialVisits, recovered);
+  const recovered = nonDirect("2026-08-09");           // referred sessions, measured
+  const estimated = estimatedHuman("2026-08-09");       // referred + estimated direct
+  check("flooded-only day reports the ratio-estimated total", site.visits, estimated);
+  check("...flagged as an estimate, not a bare floor", site.estimatedVisits, true);
+  check("...marked as a partial day", site.partialVisits, estimated);
   check("...over the one flooded day", site.partialDays, 1);
   check("...with no clean day claimed", site.cleanDays, 0);
-  check("...crediting the crawler with the direct bucket only",
-    site.botVisits, 1689 - recovered);
+  check("...crediting the crawler with what the estimate leaves over",
+    site.botVisits, 1689 - estimated);
   check("...and keeps the referrers that survived", site.referrers.length, 1);
-  check("...at the recovered volume", site.referrers[0]?.visits, recovered);
+  check("...at the measured (not estimated) referred volume", site.referrers[0]?.visits, recovered);
   check("...counted as search traffic", site.sources.search, recovered);
+  // The estimated direct portion has no referrer row to sit in, so it is
+  // credited straight into the direct bucket rather than ballooning
+  // "unattributed" into the largest slice of the mix.
+  check("...and the estimated direct portion lands in the direct bucket, not unattributed",
+    site.sources.direct, estimated - recovered);
   check("...without inventing pageviews", site.views, 0);
   check("...or a pages/session rate", site.pagesPerSession, 0);
-  // Previous day was flooded too, so a floor would be compared against a floor.
+  // Previous day was flooded too, so an estimate would be compared against one.
   check("...and suppresses the delta across partial days", site.delta, null);
-  check("previous period is recovered the same way", site.previousVisits, nonDirect("2026-08-08"));
-  check("totals follow the site", data.totals.visits, recovered);
-  check("totals report the recovered volume", data.totals.partialVisits, recovered);
+  check("previous period is estimated the same way", site.previousVisits, estimatedHuman("2026-08-08"));
+  check("totals follow the site", data.totals.visits, estimated);
+  check("totals report the estimated volume", data.totals.partialVisits, estimated);
 }
 
 // 2. A window that mixes clean and flooded days: clean days count whole, flooded
-//    days contribute only their referred sessions, and pageviews stay clean-only.
+//    days contribute their ratio-estimated total, and pageviews stay clean-only
+//    (a flooded day's views carry no referer dimension at all, so they cannot
+//    be estimated the same way and stay a hard exclusion).
 {
   const { site } = await load(`domain=${HOST}&period=7`);
   const window = DAYS.slice(-7);
   const clean = window.filter((day) => day.date < "2026-08-08");
   const cleanVisits = clean.reduce((sum, day) => sum + day.visits, 0);
   const cleanViews = clean.reduce((sum, day) => sum + Math.round(day.visits * day.pps), 0);
-  const recovered = nonDirect("2026-08-08") + nonDirect("2026-08-09");
+  const estimated = estimatedHuman("2026-08-08") + estimatedHuman("2026-08-09");
   check("clean days count whole", site.cleanDays, clean.length);
-  check("mixed window sums clean plus recovered", site.visits, cleanVisits + recovered);
+  check("mixed window sums clean plus the ratio estimate", site.visits, cleanVisits + estimated);
   check("pageviews come only from clean days", site.views, cleanViews);
   check("pages/session divides by clean sessions only",
     Number(site.pagesPerSession.toFixed(3)), Number((cleanViews / cleanVisits).toFixed(3)));
@@ -357,7 +378,7 @@ const load = async (query) => {
   check("totals.visits excludes every zoneSourced site", data.totals.visits, rumVisits);
   check("totals.views excludes every zoneSourced site", data.totals.views, rumViews);
   check("...so the headline carries no zone visits", data.totals.visits,
-    nonDirect("2026-08-09") + WIKI_DAYS.at(-1).visits + SMALL_DAYS.at(-1).visits);
+    estimatedHuman("2026-08-09") + WIKI_DAYS.at(-1).visits + SMALL_DAYS.at(-1).visits);
   check("...and no zone requests, only RUM pageviews", data.totals.views,
     WIKI_DAYS.at(-1).views + SMALL_DAYS.at(-1).views);
   check("previous-period totals exclude them too", data.totals.previousVisits,
@@ -710,8 +731,11 @@ for (const period of [7, 30]) {
   const trend = totals.trend;
 
   check("the traffic comparator spans 14 daily snapshots", trend.days, 14);
+  // HOST's flood days fall inside this 14-day window and now carry a ratio
+  // estimate (see hostRatioStats above) rather than the older floor, which is
+  // why this mean is higher than the pre-estimator figure.
   check("...averaging human sessions the same way the cards do",
-    trend.visitsPerDay.toFixed(1), "40.2");
+    trend.visitsPerDay.toFixed(1), "45.7");
   check("...pageviews from clean days only", trend.viewsPerDay.toFixed(1), "49.9");
   check("...and search sessions off the same referrer history", trend.searchPerDay.toFixed(1), "15.0");
 
@@ -962,15 +986,23 @@ for (const period of [7, 30]) {
   check("fixture check: today's volume is below 3x the flood's own 25th percentile",
     8000 < 3 * 20000, true);
 
+  // FORUM_HOST's 21 genuinely clean days (a fixed .7 direct/.3 referred ratio)
+  // clear RATIO_MIN_CLEAN_DAYS too, so today's direct bucket gets the same ratio
+  // estimate treatment as HOST above rather than the floor-only split — computed
+  // the same way, from the real bots.js functions over this block's own fixture.
+  const forumClassified = classifyTraffic(traffic, referrers);
+  const forumRatioStats = directRatioStats(forumClassified, FORUM_HOST);
+  const forumEstimated = splitDay(forumClassified.get(FORUM_HOST).get(FLOOD_TODAY), forumRatioStats).human;
+
   readWidths = [];
   const { data } = await load(`domain=${FORUM_HOST}&period=1`);
   const site = data.sites.find((s) => s.host === FORUM_HOST);
   check("the classifier still finds today a bot flood despite 29 flood-shaped days in the 30-day window",
     site.botVisits > 0, true);
   check("...specifically the crawler volume computed against the true, older baseline",
-    site.botVisits, 7840); // 8000 - round(8000*.98)=160 human, rest crawler
-  check("...leaving only the referred sessions as human",
-    site.visits, 160);
+    site.botVisits, 8000 - forumEstimated);
+  check("...leaving the ratio-estimated total as human",
+    site.visits, forumEstimated);
   check("...marked partial, not a clean day",
     site.partialDays, 1);
   check("the daily_traffic read for the classifier reaches back past the 30-day floor",

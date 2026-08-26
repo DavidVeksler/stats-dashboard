@@ -2,7 +2,7 @@ import { SITES, FORUMS } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, KEYWORD_ROW_LIMIT } from "./gsc.js";
-import { classifyTraffic, floodReason, floodDates, splitDay,
+import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
 import { computeSignals } from "./signals.js";
@@ -381,8 +381,9 @@ async function summarizeToday(env, date) {
     const day = classified.get(host)?.get(date);
     if (!day) continue;
     // Same split as the dashboard: a flooded day still contributes its referred
-    // sessions, so the phone alert reports a floor instead of a zero.
-    const part = splitDay(day);
+    // sessions, plus a ratio estimate of its direct bucket where this host has
+    // enough clean-day history — see splitDay in bots.js.
+    const part = splitDay(day, directRatioStats(classified, host));
     botVisits += part.crawler;
     humanVisits += part.human;
     if (part.human) perHost.set(host, part.human);
@@ -442,7 +443,7 @@ async function loadDashboard(env, options = {}) {
         zoneDomains: selectedSites.filter((s) => measurementOf(s) === "zone").length,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
         botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
-        partialVisits: 0, partialSites: 0,
+        partialVisits: 0, partialSites: 0, estimatedSites: 0, estimatedDirect: 0,
         sourceMix: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 },
         internalMeasured: false,
         zone: { visits: 0, requests: 0, bytes: 0, sites: 0, hosts: [] },
@@ -456,7 +457,7 @@ async function loadDashboard(env, options = {}) {
         opportunities: 0, snippetOpportunities: 0, rankOpportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
-        partialVisits: 0, partialDays: 0,
+        partialVisits: 0, partialDays: 0, estimatedVisits: false, spread: 0, estimatedDirect: 0, ratioSampleDays: null,
         previousPartialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
@@ -567,6 +568,14 @@ async function loadDashboard(env, options = {}) {
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
   ]);
   const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
+  // Memoized per host: directRatioStats scans a host's whole clean-day history,
+  // and this function calls it once per site plus once per history row in the
+  // 14-day trend loop below — same input every time within one load.
+  const ratioStatsCache = new Map();
+  const ratioStatsFor = (host) => {
+    if (!ratioStatsCache.has(host)) ratioStatsCache.set(host, directRatioStats(classified, host));
+    return ratioStatsCache.get(host);
+  };
 
   const byHost = (rows, h) => (rows.results ?? []).filter((r) => r.host === h);
   const availableDates = [...new Set((tr.results ?? []).map((row) => row.date))].sort();
@@ -575,8 +584,8 @@ async function loadDashboard(env, options = {}) {
   // still contributes its referred sessions, so a site whose only day in view was
   // flooded reports a measured floor instead of an empty card; its direct bucket
   // and its pageviews are the parts that stay unrecoverable.
-  const sumTraffic = (rows, days) => rows.reduce((acc, row) => {
-    const part = splitDay(days?.get(row.date));
+  const sumTraffic = (rows, days, ratioStats) => rows.reduce((acc, row) => {
+    const part = splitDay(days?.get(row.date), ratioStats);
     acc.visits += part.human;
     acc.views += part.views;
     if (part.partial) {
@@ -585,12 +594,17 @@ async function loadDashboard(env, options = {}) {
       acc.botVisits += part.crawler;
       acc.botViews += part.crawlerViews;
       acc.botDays += 1;
+      if (part.estimated) {
+        acc.estimatedDays += 1;
+        acc.spread += part.spread;
+        acc.estimatedDirect += part.estimatedDirect;
+      }
     } else {
       acc.cleanDays += 1;
     }
     return acc;
   }, { visits: 0, views: 0, partialVisits: 0, partialDays: 0,
-       botVisits: 0, botViews: 0, botDays: 0, cleanDays: 0 });
+       botVisits: 0, botViews: 0, botDays: 0, cleanDays: 0, estimatedDays: 0, spread: 0, estimatedDirect: 0 });
   // `unattributed` is a residual, never a channel: it is the gap between sessions
   // the traffic table counted and referrer rows the referrer table stored. It was
   // called "other" and rendered as a fifth segment in the mix bar, which invited
@@ -599,7 +613,7 @@ async function loadDashboard(env, options = {}) {
   // bar. `internal` is a real channel: sessions arriving from one of the site's
   // own hostnames (see classifyReferrer). Those used to fall into this residual.
   const emptyMix = () => ({ direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 });
-  const summarizeSources = (rows, visits) => {
+  const summarizeSources = (rows, visits, estimatedDirect = 0) => {
     const result = emptyMix();
     for (const row of rows) {
       // "ai" (an AI chat/answer-engine referrer, see classifyReferrer) is folded
@@ -609,6 +623,12 @@ async function loadDashboard(env, options = {}) {
       const key = row.kind === "ref" || row.kind === "ai" ? "referral" : row.kind;
       if (key in result && key !== "unattributed") result[key] += Number(row.visits || 0);
     }
+    // A ratio-estimated flooded day's direct bucket has no referrer row to carry
+    // it — the raw direct row on that day is dropped, crawler and human mixed
+    // beyond separation — so without crediting it here it would show up as
+    // unattributed instead of what it actually is: an estimate of direct human
+    // traffic. See splitDay/estimatedDirect in bots.js.
+    result.direct += estimatedDirect;
     const attributed = result.direct + result.search + result.social + result.referral + result.internal;
     result.unattributed = Math.max(0, visits - attributed);
     return result;
@@ -628,8 +648,9 @@ async function loadDashboard(env, options = {}) {
   let sites = selectedSites.map((s) => {
     const floods = floodDates(classified, s.host);
     const days = classified.get(s.host);
-    const t = sumTraffic(byHost(tr, s.host), days);
-    const previous = sumTraffic(byHost(previousTr, s.host), days);
+    const ratioStats = ratioStatsFor(s.host);
+    const t = sumTraffic(byHost(tr, s.host), days, ratioStats);
+    const previous = sumTraffic(byHost(previousTr, s.host), days, ratioStats);
     // Latest-snapshot views. The keyword and page reads are already narrowed to
     // `date` in SQL (see the read-width note); the filter stays as a cheap
     // belt-and-braces so a future widening of either read cannot silently turn
@@ -689,6 +710,12 @@ async function loadDashboard(env, options = {}) {
       // Sessions recovered from flooded days: real, but a floor rather than a
       // count, because the direct bucket those days is unusable.
       partialVisits: t.partialVisits, partialDays: t.partialDays,
+      // Whether the visits/partialVisits figures above are a ratio estimate
+      // (with a margin) or the older floor-only reading — a host either has
+      // enough clean-day history to estimate every one of its flooded days or
+      // none, so this is never a mix within one site. See splitDay in bots.js.
+      estimatedVisits: t.estimatedDays > 0, spread: t.spread, estimatedDirect: t.estimatedDirect,
+      ratioSampleDays: ratioStats?.sampleDays ?? null,
       // Carried so the `no-comparison` signal can name which side of the
       // comparison was partial, rather than lumping a flooded previous period in
       // with a site that simply has no history yet.
@@ -703,9 +730,9 @@ async function loadDashboard(env, options = {}) {
       pagesPerSession: currentRate,
       previousPagesPerSession: previousRate,
       pagesPerSessionDelta: previous.visits ? currentRate - previousRate : null,
-      anomaly: latestFlood ? floodReason(days?.get(latestFlood)) : null,
+      anomaly: latestFlood ? floodReason(days?.get(latestFlood), ratioStats) : null,
       referrers: refRows.slice(0, 8).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
-      sources: summarizeSources(refRows, t.visits),
+      sources: summarizeSources(refRows, t.visits, t.estimatedDirect),
       keywords: kwRows.slice(0, 12).map((k) => ({ query: k.query, clicks: k.clicks,
         impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position })),
       pages: pageRows.slice(0, 8).map((p) => ({ page: p.page, clicks: p.clicks,
@@ -778,9 +805,10 @@ async function loadDashboard(env, options = {}) {
   for (const row of hist.results ?? []) {
     if (!rumHosts.has(row.host)) continue;
     // The same split the cards use: a flooded day contributes its referred
-    // sessions and no pageviews, so the baseline is built from the same quantity
-    // it is compared against.
-    const part = splitDay(classified.get(row.host)?.get(row.date));
+    // sessions (plus a ratio estimate of its direct bucket where available) and
+    // no pageviews, so the baseline is built from the same quantity it is
+    // compared against.
+    const part = splitDay(classified.get(row.host)?.get(row.date), ratioStatsFor(row.host));
     const rec = dailyRum.get(row.date) ?? { date: row.date, visits: 0, views: 0, search: 0 };
     rec.visits += part.human;
     rec.views += part.views;
@@ -879,6 +907,12 @@ async function loadDashboard(env, options = {}) {
     previousBotVisits: rumSites.reduce((a, s) => a + s.previousBotVisits, 0),
     partialVisits: rumSites.reduce((a, s) => a + s.partialVisits, 0),
     partialSites: rumSites.filter((s) => s.partialDays > 0).length,
+    // Sites whose partial days above are a ratio estimate rather than a bare
+    // floor — see the note on estimatedVisits in the per-site block.
+    estimatedSites: rumSites.filter((s) => s.estimatedVisits).length,
+    // The estimated (not measured) slice of partialVisits, so callers can say
+    // how much of "recovered sessions" is a real referred count vs an estimate.
+    estimatedDirect: rumSites.reduce((a, s) => a + (s.estimatedDirect || 0), 0),
     floodedSiteDays: rumSites.reduce((a, s) => a + s.botDays, 0),
     floodedSites: rumSites.filter((s) => s.botDays > 0).length,
     daysAvailable: availableDates.length,
