@@ -26,6 +26,15 @@
 //   queryDenyPatterns: ["^some phrase$", "another\\s+phrase"],
 // and nothing else changes — `src/opportunities.js` compiles it lazily and a
 // malformed pattern denies nothing rather than breaking the page.
+//
+// Optional `bing: "…"` is the exact site URL string as Bing Webmaster Tools has
+// it on file (verified independently of Search Console — do not assume the same
+// coverage as `gsc`). Get the exact string with `getUserSites` in src/bing.js
+// against a live BING_API_KEY; Bing 400s on anything that isn't one of the URLs
+// that call returns, the same intolerance GSC has for its `gsc` property. Ships
+// unset on every site until that discovery step has actually been run — see
+// AGENTS.md's Bing section for why nothing here should be guessed from the GSC
+// property string.
 export const SITES = [
   {
     // objectivismonline.com (and its www alias) is just a landing page in front

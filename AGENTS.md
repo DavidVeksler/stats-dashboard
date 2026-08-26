@@ -14,7 +14,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `daily_forum_activity`, `runs`), not docs |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
 | Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 implemented; 9, 10, 11 proposed) |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
@@ -22,6 +22,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | Forum user login/activity stats | `src/discourse.js` + `FORUMS` in `src/config.js` — no API key, see the note below |
+| Bing Search stats | `src/bing.js` + `bing` field in `src/config.js` — a flat API key (`BING_API_KEY`), not OAuth, see the note below |
 | Everything else | this file |
 
 ## What this is
@@ -126,6 +127,24 @@ Rails-runner recipe for minting a scoped key lives in this session's history, no
 If a forum ever sets `login_required` or otherwise hides its about stats, the pull starts failing
 loudly (a note in the `runs` table) rather than silently zeroing — see `parseAboutStats` in
 `discourse.js` and `scripts/discourse-check.mjs`.
+
+**Bing Search is a fourth, independent pull**, per-site rather than estate-wide like Discourse —
+sites opt in via an optional `bing` property in `src/config.js`, pulled by `src/bing.js`, stored in
+`daily_bing_summary`/`daily_bing_keywords`, and rendered on that site's own card (a "Bing Search"
+stat row plus a "Top search queries (Bing)" panel) rather than merged into the Google Search figures
+above it. It is a different search engine's audience measured by a different tool, and combining the
+two would repeat the RUM/zone population-mismatch mistake documented above. Auth is a single flat
+`BING_API_KEY` (Settings → API Access in Bing Webmaster Tools), not OAuth, and one key covers every
+site verified under that Bing account — see `getUserSites` in `bing.js` for discovering the exact
+`Url` string a site is registered under (Bing 400s on anything else, the same intolerance GSC has
+for its `gsc` property). No site ships with `bing` set: which of `SITES` actually has a Bing
+Webmaster Tools property has to be discovered live with a real `BING_API_KEY`, not guessed from the
+`gsc` list — the two tools are verified independently. **Deliberately narrower than GSC**: only 2
+Bing calls per site (summary + keywords) rather than 3, and no `daily_bing_pages` table at all — see
+the subrequest-budget gotcha below for why, and `src/bing.js` for the field-shape differences (two
+position fields instead of GSC's one; a daily-updating summary paired with weekly-updating keyword
+rows, so a keyword snapshot can be several days further behind than the summary beside it — each row
+carries its own `bing_window` for exactly that reason, same role as `gsc_window`).
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics
@@ -263,7 +282,10 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   removes ~1 GSC call per site per night. If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
   Workers plan's subrequest ceiling itself, not another code trim — that is a billing decision, David's
-  call.
+  call. **Bing adds 2 more calls per site with a `bing` property set** (see the Bing paragraph above),
+  spent out of the same headroom this fix just bought back — that is exactly why Bing does not also make
+  a third (page-level) call per site. Before adding `bing` to more than a couple of `SITES` entries,
+  re-measure this budget with a live pull rather than assuming the headroom is still there.
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB
@@ -452,4 +474,6 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
 Set via `wrangler secret put` (or auto-provisioned by `deploy.sh`): `CF_API_TOKEN`
 (Worker's own analytics-scoped token for GraphQL), `REFRESH_KEY` (guards `/run`; persisted
 locally in gitignored `.deploy/refresh_key.txt`), `GSC_SA_KEY` (Google service-account JSON,
-one line). `NTFY_TOPIC` is a plain var in `wrangler.jsonc`.
+one line), `BING_API_KEY` (a flat Bing Webmaster Tools API key — Settings → API Access in
+Bing Webmaster Tools; set with `./deploy.sh --bing-key KEY` / `./deploy.ps1 -BingKey KEY`, a
+string argument, not a file path like `--gsc-key`). `NTFY_TOPIC` is a plain var in `wrangler.jsonc`.

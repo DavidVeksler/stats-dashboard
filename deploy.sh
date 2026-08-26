@@ -9,6 +9,7 @@
 #   ./deploy.sh                 # install, ensure secrets, deploy, verify
 #   ./deploy.sh --refresh       # ...then trigger a live data pull via /run
 #   ./deploy.sh --gsc-key PATH  # also (re)set GSC_SA_KEY from a service-account JSON
+#   ./deploy.sh --bing-key KEY  # also (re)set BING_API_KEY (a flat string, not a file)
 #   ./deploy.sh --schema        # also (re)apply the D1 schema — needs a token with
 #                               #   D1:Edit scope (the analytics token can't; use the
 #                               #   Cloudflare dashboard or MCP connector instead).
@@ -29,12 +30,14 @@ DO_REFRESH=0
 DO_SCHEMA=0
 ASSUME_YES=0
 GSC_KEY_PATH=""
+BING_API_KEY_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --refresh) DO_REFRESH=1; shift ;;
     --schema)  DO_SCHEMA=1; shift ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
     --gsc-key) GSC_KEY_PATH="${2:?--gsc-key needs a path}"; shift 2 ;;
+    --bing-key) BING_API_KEY_ARG="${2:?--bing-key needs the API key string}"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -114,6 +117,13 @@ if [ -n "$GSC_KEY_PATH" ]; then
   wr secret put GSC_SA_KEY < "$GSC_KEY_PATH" >/dev/null
 elif ! has_secret GSC_SA_KEY; then
   echo "⚠ GSC_SA_KEY not set — keywords will be skipped. Set later with: ./deploy.sh --gsc-key PATH"
+fi
+
+if [ -n "$BING_API_KEY_ARG" ]; then
+  echo "setting BING_API_KEY"
+  printf '%s' "$BING_API_KEY_ARG" | wr secret put BING_API_KEY >/dev/null
+elif ! has_secret BING_API_KEY; then
+  echo "⚠ BING_API_KEY not set — Bing stats will be skipped for any site with a \`bing\` property. Set later with: ./deploy.sh --bing-key KEY"
 fi
 
 # --- 5. Deploy ---------------------------------------------------------------

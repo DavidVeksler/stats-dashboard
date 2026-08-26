@@ -119,6 +119,38 @@ CREATE TABLE IF NOT EXISTS daily_forum_activity (
   PRIMARY KEY (date, host)
 );
 
+-- Bing Webmaster Tools search stats (see src/bing.js). Independent of the GSC
+-- tables above: a different search engine, a different auth model (a flat
+-- per-account API key, not OAuth), and a different shape (two position fields
+-- instead of GSC's one; the site-wide summary updates daily but per-query rows
+-- update weekly, per Bing's own docs). Never summed with the Google numbers
+-- above -- they measure different engines' audiences, and combining them would
+-- repeat the exact population-mismatch mistake documented in AGENTS.md for the
+-- RUM/zone split. There is deliberately no daily_bing_pages: a third Bing call
+-- per site was cut to protect the Worker's subrequest budget -- see the note in
+-- src/bing.js and AGENTS.md's subrequest-budget entry.
+CREATE TABLE IF NOT EXISTS daily_bing_summary (
+  date        TEXT NOT NULL,         -- snapshot date (matches daily_traffic)
+  host        TEXT NOT NULL,
+  clicks      INTEGER NOT NULL DEFAULT 0,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  ctr         REAL NOT NULL DEFAULT 0,
+  bing_window TEXT,                  -- the actual date Bing's data is for
+  PRIMARY KEY (date, host)
+);
+
+CREATE TABLE IF NOT EXISTS daily_bing_keywords (
+  date                    TEXT NOT NULL,
+  host                    TEXT NOT NULL,
+  query                   TEXT NOT NULL,
+  clicks                  INTEGER NOT NULL DEFAULT 0,
+  impressions             INTEGER NOT NULL DEFAULT 0,
+  avg_click_position      REAL NOT NULL DEFAULT 0,
+  avg_impression_position REAL NOT NULL DEFAULT 0,
+  bing_window             TEXT,
+  PRIMARY KEY (date, host, query)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,
@@ -136,3 +168,5 @@ CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, h
 CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host);
 CREATE INDEX IF NOT EXISTS idx_forum_activity_dh ON daily_forum_activity(date, host);
+CREATE INDEX IF NOT EXISTS idx_bing_summary_dh ON daily_bing_summary(date, host);
+CREATE INDEX IF NOT EXISTS idx_bing_keywords_dh ON daily_bing_keywords(date, host);

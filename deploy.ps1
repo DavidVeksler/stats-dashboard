@@ -3,6 +3,7 @@ param(
   [switch]$Refresh,
   [switch]$Schema,
   [string]$GscKey,
+  [string]$BingKey,
   [switch]$Yes
 )
 
@@ -44,6 +45,10 @@ if ($Yes) { $deployArgs += "--yes" }
 if ($GscKey) {
   $keyPath = (Resolve-Path -LiteralPath $GscKey).Path -replace "\\", "/"
   $deployArgs += @("--gsc-key", $keyPath)
+}
+if ($BingKey) {
+  # A flat API key string, not a file path — unlike -GscKey, nothing to resolve.
+  $deployArgs += @("--bing-key", $BingKey)
 }
 
 Push-Location $PSScriptRoot

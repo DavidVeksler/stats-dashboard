@@ -3,6 +3,7 @@ import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudfla
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
   KEYWORD_ROW_LIMIT } from "./gsc.js";
+import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords } from "./bing.js";
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
@@ -129,6 +130,24 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_forum_activity_dh ON daily_forum_activity(date, host)`),
+    // Bing Webmaster Tools search stats (see src/bing.js). Independent of the
+    // GSC tables above and deliberately narrower — see schema.sql for why there
+    // is no daily_bing_pages.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_bing_summary (
+      date TEXT NOT NULL, host TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0, impressions INTEGER NOT NULL DEFAULT 0,
+      ctr REAL NOT NULL DEFAULT 0, bing_window TEXT,
+      PRIMARY KEY (date, host)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_bing_summary_dh ON daily_bing_summary(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_bing_keywords (
+      date TEXT NOT NULL, host TEXT NOT NULL, query TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0, impressions INTEGER NOT NULL DEFAULT 0,
+      avg_click_position REAL NOT NULL DEFAULT 0, avg_impression_position REAL NOT NULL DEFAULT 0,
+      bing_window TEXT,
+      PRIMARY KEY (date, host, query)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_bing_keywords_dh ON daily_bing_keywords(date, host)`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -344,6 +363,51 @@ async function runDaily(env, now = new Date()) {
     notes.push("GSC_SA_KEY not set — keywords skipped");
   }
 
+  // 2b. Bing Search (Bing Webmaster Tools) — independent of GSC above: separate
+  // API, separate auth (a flat per-account key, not OAuth, so no shared token
+  // fetch to wrap in an outer try/catch), and only the SITES entries that have a
+  // `bing` property (populated once a site has actually been verified in Bing
+  // Webmaster Tools and its exact URL string discovered with getUserSites — see
+  // config.js). Deliberately 2 calls per site (summary + keywords), not 3: see
+  // the subrequest-budget note in src/bing.js for why GetPageStats is left out.
+  // One host's failure must not stop the rest of the night's write, same
+  // per-host try/catch discipline as the GSC loop above.
+  const bingSites = SITES.filter((s) => s.bing);
+  if (bingSites.length && env.BING_API_KEY) {
+    for (const { host, bing } of bingSites) {
+      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
+      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
+      try {
+        const summary = await queryBingSummary(env.BING_API_KEY, bing);
+        if (summary) {
+          stmts.push(
+            env.DB.prepare(
+              `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
+            ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
+          );
+        }
+      } catch (e) {
+        notes.push(`bing summary ${host}: ${e.message}`.slice(0, 140));
+      }
+      try {
+        const { window: bingWindow, rows } = await queryBingKeywords(env.BING_API_KEY, bing);
+        for (const k of rows) {
+          stmts.push(
+            env.DB.prepare(
+              `INSERT INTO daily_bing_keywords
+               (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
+               VALUES (?,?,?,?,?,?,?,?)`
+            ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
+          );
+        }
+      } catch (e) {
+        notes.push(`bing keywords ${host}: ${e.message}`.slice(0, 140));
+      }
+    }
+  } else if (bingSites.length) {
+    notes.push("BING_API_KEY not set — Bing stats skipped");
+  }
+
   // One ordered stream, several batches. Not one batch: a night's writes now run
   // to roughly 7,000 statements, most of them keyword rows.
   await batchInChunks(env.DB, stmts);
@@ -473,6 +537,7 @@ async function loadDashboard(env, options = {}) {
         partialVisits: 0, partialDays: 0, estimatedVisits: false, spread: 0, estimatedDirect: 0, ratioSampleDays: null,
         previousPartialDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
+        bingSummary: null, bingKeywords: [], bingWindow: null,
         bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
         measurement: measurementOf(s),
         zoneBots: measurementOf(s) === "zone" ? summarizeVerifiedBots([]) : null,
@@ -523,6 +588,17 @@ async function loadDashboard(env, options = {}) {
   const searchSummaryQuery = env.DB.prepare(
     `SELECT date,host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date BETWEEN ? AND ?`
   ).bind(historyStart, date).all().catch(() => ({ results: [] }));
+  // Bing Search (Bing Webmaster Tools) — latest snapshot only, same "current
+  // card, not a trend" treatment as the GSC keyword/page reads above, and the
+  // same schema-tolerance .catch (the tables arrive with ensureSchema on the
+  // next run for any site that hasn't had a Bing pull yet).
+  const bingSummaryQuery = env.DB.prepare(
+    `SELECT host,clicks,impressions,ctr,bing_window FROM daily_bing_summary WHERE date=?`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const bingKeywordsQuery = env.DB.prepare(
+    `SELECT host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window
+     FROM daily_bing_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
   // Referrers and landing pages keep their date so flooded days can be dropped;
   // otherwise the detail panels would still show the crawler's millions of
   // direct hits under a headline that had already excluded them.
@@ -555,7 +631,7 @@ async function loadDashboard(env, options = {}) {
     `SELECT date,host,users_count,active_today,active_7d,active_30d,new_today,new_7d,new_30d,posts_today,posts_count,topics_count
      FROM daily_forum_activity WHERE date BETWEEN ? AND ? ORDER BY date ASC`
   ).bind(historyStart, date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, hist, histRefs, run] = await Promise.all([
+  const [tr, previousTr, refs, kws, pages, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -568,6 +644,8 @@ async function loadDashboard(env, options = {}) {
     env.DB.prepare(`SELECT date,host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
     searchSummaryQuery,
+    bingSummaryQuery,
+    bingKeywordsQuery,
     cfPagesQuery,
     zoneCountriesQuery,
     zoneStatusQuery,
@@ -686,6 +764,12 @@ async function loadDashboard(env, options = {}) {
     const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
       (r) => `${r.referrer}\u0000${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host).find((r) => r.date === date) ?? null;
+    // Bing Search — both reads are already filtered to `date=?` in SQL (see the
+    // query comments above), so unlike summaryRow there is no further date
+    // filter needed here. Absent entirely for any host with no `bing` property
+    // configured or no pull yet, same as searchSummary/keywords for GSC.
+    const bingSummaryRow = byHost(bingSummaries, s.host)[0] ?? null;
+    const bingKeywordRows = byHost(bingKeywords, s.host);
     // Zone-sourced hosts only: bandwidth sums plainly over the period (bytes
     // carries no crawler-flood signal to split against), country/status rows
     // are the latest-day snapshot, same treatment as keywords/pages above.
@@ -753,6 +837,17 @@ async function loadDashboard(env, options = {}) {
       cfPages: cfPageRows.slice(0, 8).map((p) => ({ page: p.page, visits: Number(p.visits || 0), views: Number(p.views || 0) })),
       searchSummary: summaryRow ? { clicks: Number(summaryRow.clicks || 0), impressions: Number(summaryRow.impressions || 0),
         ctr: Number(summaryRow.ctr || 0), position: Number(summaryRow.position || 0) } : null,
+      // Bing Search (Bing Webmaster Tools) — a separate engine's numbers, never
+      // folded into searchSummary/gscClicks above. No `position` on the summary:
+      // GetRankAndTrafficStats doesn't report one (see src/bing.js); only the
+      // per-query rows carry Bing's two position fields, shown as reported
+      // rather than averaged into a single number for this small a sample.
+      bingSummary: bingSummaryRow ? { clicks: Number(bingSummaryRow.clicks || 0),
+        impressions: Number(bingSummaryRow.impressions || 0), ctr: Number(bingSummaryRow.ctr || 0) } : null,
+      bingKeywords: bingKeywordRows.slice(0, 12).map((k) => ({ query: k.query,
+        clicks: Number(k.clicks || 0), impressions: Number(k.impressions || 0),
+        avgClickPosition: Number(k.avg_click_position || 0), avgImpressionPosition: Number(k.avg_impression_position || 0) })),
+      bingWindow: bingSummaryRow?.bing_window || bingKeywordRows[0]?.bing_window || null,
       bytes, zoneCountries: zoneCountryRows, zoneStatuses: zoneStatusRows,
       zoneSourced: measurementOf(s) === "zone",
       measurement: measurementOf(s),

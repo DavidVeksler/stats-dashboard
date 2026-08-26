@@ -270,6 +270,11 @@ const fixture = {
   ],
 };
 
+// Bing fields are optional per site in this fixture (added after most of the
+// blocks above were written) — default them here rather than editing every
+// site block, the same way loadDashboard always supplies them for real data.
+fixture.sites = fixture.sites.map((s) => ({ bingSummary: null, bingKeywords: [], bingWindow: null, ...s }));
+
 const html = renderDashboard(fixture);
 const required = [
   "Human sessions", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
