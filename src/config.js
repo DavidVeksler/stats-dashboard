@@ -46,6 +46,12 @@ export const SITES = [
     alsoHosts: ["objectivismonline.com", "www.objectivismonline.com"],
     gsc: "sc-domain:objectivismonline.com",
     gscPageFilter: "^https?://(?:www\\.|forum\\.)?objectivismonline\\.com/",
+    // Bing verifies this subdomain on its own (a URL-prefix property, not a
+    // domain-wide one like the GSC row above) -- confirmed live via
+    // getUserSites 2026-08-26. objectivismonline.com/www itself is NOT
+    // separately Bing-verified, so unlike gscPageFilter there is no coverage
+    // to worry about double-counting.
+    bing: "https://forum.objectivismonline.com/",
   },
   {
     host: "cheatsheets.davidveksler.com",
@@ -53,24 +59,33 @@ export const SITES = [
     // /history.php is hit almost entirely by bots crawling revision links, not
     // real users; drop it from traffic so sessions/views reflect actual readers.
     excludePaths: ["/history.php"],
+    bing: "https://cheatsheets.davidveksler.com/", // confirmed live via getUserSites 2026-08-26
   },
   {
     host: "coloradofirearmswatch.org",
     gsc: "sc-domain:coloradofirearmswatch.org",
+    bing: "https://coloradofirearmswatch.org/", // confirmed live via getUserSites 2026-08-26
   },
   {
     host: "davidveksler.com",
     gsc: "sc-domain:davidveksler.com",
     gscPageFilter: "^https?://(?:www\\.)?davidveksler\\.com/",
+    bing: "https://davidveksler.com/", // confirmed live via getUserSites 2026-08-26
   },
-  { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info" },
+  { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
+    bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
   // The domain property spans every *.freecapitalists.org subdomain, several of
   // which are rows of their own below, so the apex row is filtered down to the
   // apex. Subdomains with no row here (archive., alexmerced., anarchonews.,
   // austrotrader., mises.) are therefore in the property but on no card — the
   // same coverage the old apex URL-prefix property gave.
   { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
-    gscPageFilter: "^https?://(?:www\\.)?freecapitalists\\.org/" },
+    gscPageFilter: "^https?://(?:www\\.)?freecapitalists\\.org/",
+    // Bing verifies only the apex as a URL-prefix property (unlike GSC's
+    // domain-wide one above), so it needs no equivalent of gscPageFilter --
+    // there is no subdomain coverage to filter out. Confirmed live via
+    // getUserSites 2026-08-26.
+    bing: "https://freecapitalists.org/" },
   { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
   { host: "wiki.objectivismonline.com", gsc: "sc-domain:wiki.objectivismonline.com" },
   // Reads the parent domain property filtered to the subdomain. A dedicated

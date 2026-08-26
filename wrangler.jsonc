@@ -21,9 +21,16 @@
     }
   ],
 
-  // Nightly pull at 13:00 UTC (~6am Pacific)
+  // Nightly pull at 13:00 UTC (~6am Pacific). The second cron (10 minutes
+  // later) fires runBingDaily instead of runDaily (see the BING_CRON branch in
+  // src/index.js's `scheduled` handler) -- a SEPARATE Worker invocation, on
+  // purpose, so Bing's subrequests spend their own fresh 50/request budget
+  // rather than sharing runDaily's, which the GSC pull already runs close to
+  // (see AGENTS.md's subrequest-budget entry). If you change either time,
+  // update BING_CRON in src/index.js to match -- there is no shared constant
+  // across the two files.
   "triggers": {
-    "crons": ["0 13 * * *"]
+    "crons": ["0 13 * * *", "10 13 * * *"]
   },
 
   // Serve the dashboard from the custom domain.

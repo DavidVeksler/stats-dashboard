@@ -363,17 +363,66 @@ async function runDaily(env, now = new Date()) {
     notes.push("GSC_SA_KEY not set — keywords skipped");
   }
 
-  // 2b. Bing Search (Bing Webmaster Tools) — independent of GSC above: separate
-  // API, separate auth (a flat per-account key, not OAuth, so no shared token
-  // fetch to wrap in an outer try/catch), and only the SITES entries that have a
-  // `bing` property (populated once a site has actually been verified in Bing
-  // Webmaster Tools and its exact URL string discovered with getUserSites — see
-  // config.js). Deliberately 2 calls per site (summary + keywords), not 3: see
-  // the subrequest-budget note in src/bing.js for why GetPageStats is left out.
-  // One host's failure must not stop the rest of the night's write, same
-  // per-host try/catch discipline as the GSC loop above.
+  // One ordered stream, several batches. Not one batch: a night's writes now run
+  // to roughly 7,000 statements, most of them keyword rows.
+  await batchInChunks(env.DB, stmts);
+
+  // 3. Record the run
+  const totalVisits = [...traffic.values()].reduce((a, r) => a + r.visits, 0);
+  const ok = notes.length === 0;
+  await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
+    .bind(now.toISOString(), date, ok ? 1 : 0, notes.join(" | ") || "ok").run();
+
+  // 4. ntfy push — classified against the trailing history that was just written,
+  //    so the daily phone alert reports the human audience rather than whatever a
+  //    crawler happened to do that night.
+  const summary = await summarizeToday(env, date).catch(() => null);
+  // The push carries the finding, not only the volumes. The signal engine runs
+  // read-side over what was just written rather than being re-derived here: one
+  // copy of the rules, exactly as spec item 3 established for the opportunity
+  // predicate. Quiet-success discipline is preserved — only a severity-1 signal
+  // ("act today") is worth waking a phone for, and with none the push is
+  // byte-for-byte what it was before.
+  const dashboard = await loadDashboard(env).catch(() => null);
+  const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal);
+  return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
+    botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
+    topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
+    notes };
+}
+
+// ---- Nightly pull: Bing Search -> D1 --------------------------------------
+// A SEPARATE Worker invocation from runDaily above, on its own cron trigger
+// (see wrangler.jsonc) and its own /run-bing endpoint — not a second phase
+// inside runDaily. This is deliberate, not an oversight: runDaily's GSC pull
+// already runs close to Cloudflare's own per-invocation subrequest ceiling
+// (50/request on this account's plan — see AGENTS.md's subrequest-budget
+// entry), and adding Bing's calls to that same invocation would have put it
+// right back at the edge the 2026-08-26 GSC fix just pulled it back from.
+// Splitting the cron gives Bing its own fresh 50-request budget instead of
+// spending out of GSC's, so growing the Bing site list doesn't re-create the
+// GSC failure mode. It writes to daily_bing_summary/daily_bing_keywords only —
+// disjoint tables from everything runDaily touches — so the two invocations
+// never contend for the same row even if their schedules overlap.
+async function runBingDaily(env, now = new Date()) {
+  await ensureSchema(env);
+  const date = utcDate(now);
+  const notes = [];
+  const stmts = [];
+
+  // Only SITES entries with a `bing` property (populated once a site has
+  // actually been verified in Bing Webmaster Tools and its exact URL string
+  // discovered with getUserSites — see config.js). Deliberately 2 calls per
+  // site (summary + keywords), not 3: see the subrequest-budget note in
+  // src/bing.js for why GetPageStats is left out. One host's failure must not
+  // stop the rest of the pull, same per-host try/catch discipline as GSC.
   const bingSites = SITES.filter((s) => s.bing);
-  if (bingSites.length && env.BING_API_KEY) {
+  if (!bingSites.length) {
+    notes.push("no SITES entry has a `bing` property set — nothing to pull");
+  } else if (!env.BING_API_KEY) {
+    notes.push("BING_API_KEY not set — Bing stats skipped");
+  } else {
     for (const { host, bing } of bingSites) {
       stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
       stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
@@ -404,37 +453,16 @@ async function runDaily(env, now = new Date()) {
         notes.push(`bing keywords ${host}: ${e.message}`.slice(0, 140));
       }
     }
-  } else if (bingSites.length) {
-    notes.push("BING_API_KEY not set — Bing stats skipped");
   }
 
-  // One ordered stream, several batches. Not one batch: a night's writes now run
-  // to roughly 7,000 statements, most of them keyword rows.
-  await batchInChunks(env.DB, stmts);
-
-  // 3. Record the run
-  const totalVisits = [...traffic.values()].reduce((a, r) => a + r.visits, 0);
-  const ok = notes.length === 0;
-  await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
-    .bind(now.toISOString(), date, ok ? 1 : 0, notes.join(" | ") || "ok").run();
-
-  // 4. ntfy push — classified against the trailing history that was just written,
-  //    so the daily phone alert reports the human audience rather than whatever a
-  //    crawler happened to do that night.
-  const summary = await summarizeToday(env, date).catch(() => null);
-  // The push carries the finding, not only the volumes. The signal engine runs
-  // read-side over what was just written rather than being re-derived here: one
-  // copy of the rules, exactly as spec item 3 established for the opportunity
-  // predicate. Quiet-success discipline is preserved — only a severity-1 signal
-  // ("act today") is worth waking a phone for, and with none the push is
-  // byte-for-byte what it was before.
-  const dashboard = await loadDashboard(env).catch(() => null);
-  const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal);
-  return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
-    botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
-    topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    notes };
+  const batches = await batchInChunks(env.DB, stmts);
+  // Deliberately no `runs` table row here: that table is read by loadDashboard
+  // as "last run OK / see run log" for the main nightly write, and a second
+  // writer racing it would make that indicator describe whichever of the two
+  // pulls happened to run last rather than the one it was built to describe.
+  // Failures are visible via `wrangler tail` and this function's own return
+  // value (surfaced by /run-bing), the same as any other Worker invocation.
+  return { date, sites: bingSites.map((s) => s.host), batches, ok: notes.length === 0, notes };
 }
 
 // Re-read the trailing history and split today into human vs crawler traffic.
@@ -1142,9 +1170,15 @@ Content-Signal: search=no, ai-input=no, ai-train=no
 Disallow: /
 `;
 
+// The second cron string in wrangler.jsonc's `triggers.crons` — kept as one
+// named constant so the branch below and the config it depends on can't drift
+// apart silently. See runBingDaily for why this needs to be its own scheduled
+// invocation rather than a second phase inside runDaily.
+const BING_CRON = "10 13 * * *";
+
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDaily(env));
+    ctx.waitUntil(event.cron === BING_CRON ? runBingDaily(env) : runDaily(env));
   },
 
   async fetch(request, env) {
@@ -1166,6 +1200,19 @@ export default {
         return new Response("forbidden", { status: 403 });
       }
       const result = await runDaily(env);
+      return Response.json(result);
+    }
+
+    // Manual Bing re-pull: /run-bing?key=<REFRESH_KEY> — a separate endpoint,
+    // not a flag on /run, so testing it is a separate Worker invocation with
+    // its own subrequest budget, the same isolation the BING_CRON split gives
+    // the scheduled path. Calling it from inside the /run handler above would
+    // undo that isolation even though the code looks decoupled.
+    if (url.pathname === "/run-bing") {
+      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const result = await runBingDaily(env);
       return Response.json(result);
     }
 

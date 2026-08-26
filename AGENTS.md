@@ -71,13 +71,19 @@ or inspect the `runs` table in D1. `npm run dev` runs
 
 ## Data flow (the big picture)
 
-The Worker has two entry points in `src/index.js`:
+The Worker has three entry points in `src/index.js`:
 
 - **`scheduled`** (cron `0 13 * * *`) and **`GET /run?key=…`** both call `runDaily(env)`, which:
   1. `pullTraffic()` (`cloudflare.js`) → Cloudflare GraphQL → 24h visitors/referrers.
   2. `queryKeywords()` (`gsc.js`) → Google Search Console → top keywords (only if `GSC_SA_KEY` set).
   3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_keywords`), plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
+- **`scheduled`** on a SECOND cron (`10 13 * * *`, `BING_CRON` in `src/index.js`) and **`GET /run-bing?key=…`**
+  both call `runBingDaily(env)` instead — a deliberately separate invocation from `runDaily` above, not a
+  second phase inside it, so Bing's subrequests spend their own fresh 50/request budget rather than
+  runDaily's, which the GSC pull already runs close to. See the Bing paragraph and the subrequest-budget
+  gotcha below. It writes only `daily_bing_summary`/`daily_bing_keywords` and does not touch `runs` or
+  send an ntfy push.
 - **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `computeSignals()` (`signals.js`) ranks what needs doing → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
 
 **The signal engine** (`src/signals.js`) is where every rule lives. `computeSignals` is a **pure function of rows `loadDashboard` has already read** — it queries nothing — which is what lets `runDaily` reuse it for the ntfy push instead of growing a second copy of the rules. When a rule needs more history, **widen an existing read rather than adding a query** (`daily_zone_status` was widened from latest-day to the history window for the `error-spike` baseline). Signals are `{ severity, kind, host, headline, evidence, action, href, recurrence }`, severity 1 = act today, 2 = look at it, 3 = context; the top three severity-1/2 signals render as "Today's actions" above the KPI tiles, and the top severity-1 signal is appended to the ntfy push. `recurrence` is populated only where the loaded history answers it exactly (today: consecutive flooded days behind `no-comparison`, in the 24h view) — nothing guesses it, because a wrong "3rd consecutive day" is worse than an absent one.
@@ -137,14 +143,21 @@ two would repeat the RUM/zone population-mismatch mistake documented above. Auth
 `BING_API_KEY` (Settings → API Access in Bing Webmaster Tools), not OAuth, and one key covers every
 site verified under that Bing account — see `getUserSites` in `bing.js` for discovering the exact
 `Url` string a site is registered under (Bing 400s on anything else, the same intolerance GSC has
-for its `gsc` property). No site ships with `bing` set: which of `SITES` actually has a Bing
-Webmaster Tools property has to be discovered live with a real `BING_API_KEY`, not guessed from the
-`gsc` list — the two tools are verified independently. **Deliberately narrower than GSC**: only 2
-Bing calls per site (summary + keywords) rather than 3, and no `daily_bing_pages` table at all — see
-the subrequest-budget gotcha below for why, and `src/bing.js` for the field-shape differences (two
-position fields instead of GSC's one; a daily-updating summary paired with weekly-updating keyword
-rows, so a keyword snapshot can be several days further behind than the summary beside it — each row
-carries its own `bing_window` for exactly that reason, same role as `gsc_window`).
+for its `gsc` property). Which of `SITES` actually has a Bing Webmaster Tools property was discovered
+live with a real `BING_API_KEY` on 2026-08-26, not guessed from the `gsc` list — the two tools are
+verified independently, and 4 of the account's Bing-verified sites (liberty.me, tucker.liberty.me,
+theobjectivestandard.com, plus the still-unverified mises.org) have no `SITES` entry at all and were
+left untouched rather than folding "add Bing stats" into "start tracking new sites." **Runs as its
+own Worker invocation** (`runBingDaily`, its own cron and its own `/run-bing` endpoint — see Data
+flow above), not a second phase inside `runDaily`, specifically so its subrequests spend a fresh
+50/request budget instead of runDaily's, which the GSC pull already runs close to (see the
+subrequest-budget gotcha below — this was caught and fixed before ever deploying, not after). And
+**deliberately narrower than GSC** on top of that: only 2 Bing calls per site (summary + keywords)
+rather than 3, and no `daily_bing_pages` table at all — see `src/bing.js` for the field-shape
+differences too (two position fields instead of GSC's one; a daily-updating summary paired with
+weekly-updating keyword rows, so a keyword snapshot can be several days further behind than the
+summary beside it — each row carries its own `bing_window` for exactly that reason, same role as
+`gsc_window`).
 
 `src/config.js` is the source of truth for **which domains** (`SITES`) and **which Cloudflare
 accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analytics
@@ -282,10 +295,15 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   removes ~1 GSC call per site per night. If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
   Workers plan's subrequest ceiling itself, not another code trim — that is a billing decision, David's
-  call. **Bing adds 2 more calls per site with a `bing` property set** (see the Bing paragraph above),
-  spent out of the same headroom this fix just bought back — that is exactly why Bing does not also make
-  a third (page-level) call per site. Before adding `bing` to more than a couple of `SITES` entries,
-  re-measure this budget with a live pull rather than assuming the headroom is still there.
+  call. **Bing's pull deliberately does NOT spend out of this headroom at all.** `runBingDaily` (see
+  the Bing paragraph above) runs as its own Worker invocation, on its own cron and its own
+  `/run-bing` endpoint, specifically so growing the Bing site list can never re-create this exact
+  failure inside `runDaily` — 6 Bing sites × 2 calls is 12 requests, which would have landed the
+  combined invocation at 49/50 right back at the edge this fix just pulled it away from, if it had
+  shared runDaily's budget. Bing's own invocation still has its own 50/request ceiling, cheap as it
+  is today (12 of 50) — if the Bing site list grows enough to approach that on its own, the fix is
+  the same lever restated for a different invocation: re-measure with a live `/run-bing` pull before
+  assuming headroom, not another code trim first.
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB

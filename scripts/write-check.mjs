@@ -16,11 +16,19 @@
 //   - a run with no GSC key issues no keyword DELETE at all, so it refreshes
 //     traffic without wiping keyword history.
 //
-// Cloudflare, Google and D1 are all stubbed. The service-account key is generated
-// here rather than fixtured, because gsc.js signs a real JWT with it.
+// Part 3 exercises runBingDaily/`/run-bing` the same way, plus the one thing
+// specific to it: that it is genuinely a separate invocation from runDaily's
+// (see the subrequest-budget gotcha in AGENTS.md) rather than sharing its
+// statement stream, which would have quietly reintroduced the exact ceiling
+// the 2026-08-26 GSC fix pulled the Worker back from.
+//
+// Cloudflare, Google, Bing and D1 are all stubbed. The service-account key is
+// generated here rather than fixtured, because gsc.js signs a real JWT with it.
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
 import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
 import { SITES, FORUMS } from "../src/config.js";
+
+const BING_SITES = SITES.filter((s) => s.bing);
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -82,6 +90,14 @@ globalThis.fetch = async (input, init = {}) => {
     } } });
   }
 
+  if (url.includes("ssl.bing.com/webmaster/api.svc/json/GetRankAndTrafficStats")) {
+    return json({ d: [{ Clicks: 5, Impressions: 50, Date: "/Date(1316156400000-0700)/" }] });
+  }
+  if (url.includes("ssl.bing.com/webmaster/api.svc/json/GetQueryStats")) {
+    return json({ d: [{ Query: "test query", Clicks: 1, Impressions: 10,
+      AvgClickPosition: 5, AvgImpressionPosition: 6, Date: "/Date(1316156400000-0700)/" }] });
+  }
+
   if (url.includes("api.cloudflare.com")) {
     const body = JSON.parse(init.body ?? "{}");
     if (body.query.includes("rumPageloadEventsAdaptiveGroups")) {
@@ -129,6 +145,21 @@ const run = async (env) => {
     new Request("https://stats.test/run?key=k"), { DB: db, REFRESH_KEY: "k", CF_API_TOKEN: "cf", ...env });
   const result = await res.json();
   // ensureSchema has its own batch; the night's data writes are the rest.
+  const writes = batches.filter((list) => !/CREATE TABLE|CREATE INDEX/i.test(list[0].sql));
+  return { result, writes, flat: writes.flat() };
+};
+
+// runBingDaily's own entry point (/run-bing) — a SEPARATE Worker invocation
+// from runDaily/`run` above, exactly the isolation the BING_CRON split exists
+// for (see AGENTS.md's subrequest-budget gotcha). Hitting it through its own
+// Request, rather than adding a flag to `run` above, is what proves the two
+// pulls don't share one invocation's statement stream.
+const runBing = async (env) => {
+  seq = 0;
+  batches = [];
+  const res = await worker.fetch(
+    new Request("https://stats.test/run-bing?key=k"), { DB: db, REFRESH_KEY: "k", ...env });
+  const result = await res.json();
   const writes = batches.filter((list) => !/CREATE TABLE|CREATE INDEX/i.test(list[0].sql));
   return { result, writes, flat: writes.flat() };
 };
@@ -236,6 +267,50 @@ const run = async (env) => {
     check(`...or writing to ${table}`,
       flat.some((s) => s.sql.startsWith(`INSERT INTO ${table} `)), false);
   }
+}
+
+// ---- 3. Bing pull, as its OWN invocation -----------------------------------
+// The whole point of runBingDaily/BING_CRON/`/run-bing` is that this pull never
+// shares a statement stream (or a subrequest budget) with runDaily's. Assert
+// that isolation directly: /run-bing's writes touch only the Bing tables, and
+// /run's writes (part 1 above) never touch them either.
+{
+  const { result, flat } = await runBing({ BING_API_KEY: "stub-key" });
+  check("the Bing run completed", Array.isArray(result.notes) && result.notes.length === 0, true);
+  check("it pulled every SITES entry with a `bing` property", result.sites.length, BING_SITES.length);
+
+  check("...and wrote a summary row per Bing site",
+    flat.filter((s) => s.sql.startsWith("INSERT INTO daily_bing_summary")).length, BING_SITES.length);
+  check("...and a keyword row for the one query the stub returned, per site",
+    flat.filter((s) => s.sql.startsWith("INSERT INTO daily_bing_keywords")).length, BING_SITES.length);
+
+  // Same ordering discipline as the GSC tables in part 1, on a much smaller
+  // stream — still worth asserting, because nothing else in the repo checks it.
+  for (const table of ["daily_bing_summary", "daily_bing_keywords"]) {
+    const hosts = new Set(flat.filter((s) => s.sql.includes(`DELETE FROM ${table} `)).map((s) => s.binds[1]));
+    check(`${table} is deleted for every Bing site`, hosts.size, BING_SITES.length);
+    for (const host of hosts) {
+      const deleteAt = flat.findIndex((s) => s.sql.includes(`DELETE FROM ${table} `) && s.binds[1] === host);
+      const insertAt = flat.findIndex((s) => s.sql.startsWith(`INSERT INTO ${table} `) && s.binds[1] === host);
+      if (insertAt === -1) continue;
+      check(`${table}/${host}: the delete precedes the insert`, deleteAt >= 0 && deleteAt < insertAt, true);
+    }
+  }
+
+  // The isolation claim itself: this invocation never touches anything runDaily
+  // owns, and vice versa (checked against part 1's `flat` would require closing
+  // over it, so this instead asserts the Bing run's own statement list is
+  // Bing-table-only).
+  check("the Bing run touches no non-Bing table",
+    flat.every((s) => /daily_bing_(summary|keywords)/.test(s.sql)), true);
+}
+
+// No key: the pull is skipped cleanly, same shape as the no-GSC-key case above.
+{
+  const { result, flat } = await runBing({});
+  check("no BING_API_KEY: the run still completes", Array.isArray(result.notes), true);
+  check("...reports itself not ok", result.ok, false);
+  check("...and writes nothing", flat.length, 0);
 }
 
 globalThis.fetch = realFetch;
