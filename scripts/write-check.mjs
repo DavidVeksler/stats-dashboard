@@ -27,8 +27,13 @@
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
 import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
 import { SITES, FORUMS } from "../src/config.js";
+import { bingUrlsOf } from "../src/bing.js";
 
-const BING_SITES = SITES.filter((s) => s.bing);
+const BING_SITES = SITES.filter((s) => bingUrlsOf(s).length);
+// A site can carry more than one Bing URL (Bing verifies objectivismonline.com
+// and its forum separately, one card here), so the subrequest count is per URL
+// while the stored rows stay one per host.
+const BING_URLS = BING_SITES.flatMap((s) => bingUrlsOf(s));
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -278,11 +283,28 @@ const runBing = async (env) => {
   const { result, flat } = await runBing({ BING_API_KEY: "stub-key" });
   check("the Bing run completed", Array.isArray(result.notes) && result.notes.length === 0, true);
   check("it pulled every SITES entry with a `bing` property", result.sites.length, BING_SITES.length);
+  // The budget figure is per URL, because that is what spends subrequests: at 2
+  // calls each, this invocation costs 2 x properties against its own 50.
+  check("...and reports the property count, not the site count", result.properties, BING_URLS.length);
+  check("...which is larger, because one site carries two Bing properties",
+    BING_URLS.length > BING_SITES.length, true);
+  check("the Bing pull stays inside one invocation's subrequest budget",
+    BING_URLS.length * 2 <= 50, true);
 
   check("...and wrote a summary row per Bing site",
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_bing_summary")).length, BING_SITES.length);
+  // Per SITE, not per URL: the two-property site's rows merge into the one row
+  // per (date, host, query) the schema's primary key allows. A regression that
+  // inserted per URL would collide on that key instead of summing.
   check("...and a keyword row for the one query the stub returned, per site",
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_bing_keywords")).length, BING_SITES.length);
+  const multi = BING_SITES.find((s) => bingUrlsOf(s).length > 1);
+  const mergedSummary = flat.find((s) => s.sql.startsWith("INSERT INTO daily_bing_summary") && s.binds[1] === multi.host);
+  // The stub answers 5 clicks / 50 impressions per property, so the merged row
+  // for a two-property site is 10 / 100 — added, with the rate recomputed.
+  check("a two-property site's summary is the sum of its properties", mergedSummary.binds[2], 10);
+  check("...impressions likewise", mergedSummary.binds[3], 100);
+  check("...and CTR is recomputed from the totals", mergedSummary.binds[4], 10 / 100);
 
   // Same ordering discipline as the GSC tables in part 1, on a much smaller
   // stream — still worth asserting, because nothing else in the repo checks it.

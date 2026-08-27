@@ -29,7 +29,13 @@
 //
 // Optional `bing: "…"` is the exact site URL string as Bing Webmaster Tools has
 // it on file (verified independently of Search Console — do not assume the same
-// coverage as `gsc`). Get the exact string with `getUserSites` in src/bing.js
+// coverage as `gsc`). It may also be an ARRAY of such strings, for a site whose
+// hostnames Bing verified as separate URL-prefix properties even though this
+// file treats them as one site (objectivismonline.com and its forum): the pull
+// fetches each and merges them into the one stored row per host — see
+// mergeBingSummaries/mergeBingKeywords in src/bing.js. Only list URLs the site
+// genuinely covers, i.e. its `host` or one of its `alsoHosts`; a second site's
+// property does not belong in another site's array. Get the exact string with `getUserSites` in src/bing.js
 // against a live BING_API_KEY; Bing 400s on anything that isn't one of the URLs
 // that call returns, the same intolerance GSC has for its `gsc` property. Ships
 // unset on every site until that discovery step has actually been run — see
@@ -46,12 +52,19 @@ export const SITES = [
     alsoHosts: ["objectivismonline.com", "www.objectivismonline.com"],
     gsc: "sc-domain:objectivismonline.com",
     gscPageFilter: "^https?://(?:www\\.|forum\\.)?objectivismonline\\.com/",
-    // Bing verifies this subdomain on its own (a URL-prefix property, not a
-    // domain-wide one like the GSC row above) -- confirmed live via
-    // getUserSites 2026-08-26. objectivismonline.com/www itself is NOT
-    // separately Bing-verified, so unlike gscPageFilter there is no coverage
-    // to worry about double-counting.
-    bing: "https://forum.objectivismonline.com/",
+    // Bing verifies the apex and the forum as two separate URL-prefix
+    // properties rather than one domain-wide property, so this row carries
+    // both and src/bing.js merges them into the single stored row (clicks and
+    // impressions add; rates and positions are recomputed from the summed
+    // counts, never averaged across properties). That is the same coverage the
+    // one GSC domain property above already gives this card, restated in the
+    // shape Bing verifies things in — not a second site.
+    //
+    // The apex URL is the 2026-08-27 finding: it was verified in Bing all along
+    // and unreachable because this field could only hold one string, so this
+    // site's Bing figures were the forum's alone. Both strings re-confirmed
+    // live via getUserSites 2026-08-27.
+    bing: ["https://forum.objectivismonline.com/", "https://objectivismonline.com/"],
   },
   {
     host: "cheatsheets.davidveksler.com",

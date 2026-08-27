@@ -23,6 +23,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | Forum user login/activity stats | `src/discourse.js` + `FORUMS` in `src/config.js` — no API key, see the note below |
 | Bing Search stats | `src/bing.js` + `bing` field in `src/config.js` — a flat API key (`BING_API_KEY`), not OAuth, see the note below |
+| Re-checking which sites Bing verifies, against `SITES` | `GET /bing-sites?key=…` (`diffBingSites` in `src/bing.js`) |
+| How the cards are grouped and ordered on the page | `groupByDomain` in `src/index.js` (+ `registrableDomain` in `src/config.js`) |
 | Everything else | this file |
 
 ## What this is
@@ -84,9 +86,30 @@ The Worker has three entry points in `src/index.js`:
   runDaily's, which the GSC pull already runs close to. See the Bing paragraph and the subrequest-budget
   gotcha below. It writes only `daily_bing_summary`/`daily_bing_keywords` and does not touch `runs` or
   send an ntfy push.
+- **`GET /bing-sites?key=…`** (same `REFRESH_KEY` guard, writes nothing) returns Bing's
+  `GetUserSites` list plus `diffBingSites(SITES, verified)` — `ok` / `stale` (a config string Bing no
+  longer returns, with the URL it does have for that host) / `missing` (a host this dashboard already
+  covers, aliases included, that Bing verifies and no `bing` field pulls) / `untracked` (verified in
+  Bing, on no `SITES` row — a dashboard decision, not a mapping fix). This is how the periodic
+  Bing re-sync the section below asks for is actually run: one guarded request, no live key pasted
+  into a local script. The response names every site in the Bing account, which is why it is guarded.
 - **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `computeSignals()` (`signals.js`) ranks what needs doing → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
 
 **The signal engine** (`src/signals.js`) is where every rule lives. `computeSignals` is a **pure function of rows `loadDashboard` has already read** — it queries nothing — which is what lets `runDaily` reuse it for the ntfy push instead of growing a second copy of the rules. When a rule needs more history, **widen an existing read rather than adding a query** (`daily_zone_status` was widened from latest-day to the history window for the `error-spike` baseline). Signals are `{ severity, kind, host, headline, evidence, action, href, recurrence }`, severity 1 = act today, 2 = look at it, 3 = context; the top three severity-1/2 signals render as "Today's actions" above the KPI tiles, and the top severity-1 signal is appended to the ntfy push. `recurrence` is populated only where the loaded history answers it exactly (today: consecutive flooded days behind `no-comparison`, in the 24h view) — nothing guesses it, because a wrong "3rd consecutive day" is worse than an absent one.
+
+**Cards are laid out domain-first.** `groupByDomain` (`src/index.js`) puts every host of a
+registrable domain (`registrableDomain` in `src/config.js` — the naive last-two-labels rule, correct
+for every host in `SITES` because they all sit under single-label suffixes; a `.co.uk`-shaped host
+would need the Public Suffix List, not another hand-list) into one contiguous run, orders the runs by
+the domain's aggregate of the active sort metric, and orders hosts inside a run by theirs. `render.js`
+draws one grid per run under a heading naming the domain, its site count, and its total *in that
+class's unit*. Two things to preserve: grouping runs **inside a measurement class**, so a domain
+owning both a RUM host and a zone host (freecapitalists.org owns library.) gets a run in each section
+rather than one ranking that adds HTTP requests to sessions; and the renderer **reads the order rather
+than re-deriving it** (`domainRuns` only breaks a run where `site.domain` changes), so the page and
+`/api/json` cannot disagree about which domain outranks which. The group metric is the same metric its
+cards are ranked by — for `sort=change` that is the best single host gain, not a sum of ratios across
+hosts of wildly different size, which would mean nothing.
 
 **Two measurement classes, never mixed.** `loadDashboard` partitions `SITES` on
 `site.trafficSource` into `measurement: "rum"` and `measurement: "zone"` (the `measurementOf`
@@ -156,18 +179,30 @@ to a site already tracked, so it needed both tools to agree before promoting any
 freecapitalists.org` is GSC- and Bing-verified as `http://`, not `https://`, on both — kept exactly as
 returned. `forum.freecapitalists.org` now has both a `SITES` row (traffic/search) and its pre-existing
 `FORUMS` row (Discourse login/activity) — independent pulls about the same host, not a conflict.
-Left deliberately untracked because Bing and GSC don't agree on the same exact host: `mises.org`
-(GSC-verified, Bing does not verify it), `quotes.freecapitalists.org` and `fee.org` (Bing-verified,
-no GSC property found for either), `liberty.me`/`tucker.liberty.me` (Bing-verified, no GSC property),
-and `theobjectivestandard.com` (Bing verifies the apex; GSC instead verifies a *different* host,
-`2020.theobjectivestandard.com` — the two tools cover different parts of that domain, so neither could
-be added without picking one arbitrarily). **`objectivismonline.com` exposes a real gap in the single-string `bing` field**: it is Bing-verified
-as its own URL-prefix property, separate from `forum.objectivismonline.com`'s, but that row's `bing`
-field can only hold one URL — unlike the GSC row above it, which covers both under one `sc-domain:`
-property. `objectivismonline.com`'s own Bing traffic is currently NOT pulled at all. Fixing that means
-teaching `bing` to hold multiple URLs and summing their stats (a real change to `src/bing.js`'s
-per-site call shape), which has not been done — this is a known, accepted gap, not an oversight to
-silently "fix" by guessing which URL matters more. **Runs as its
+Left deliberately untracked because Bing and GSC don't agree on the same exact host, re-verified
+2026-08-27 against both tools: `mises.org` (GSC-verified; **present in the Bing account but with
+`IsVerified: false`**, so there is nothing to pull until someone completes verification there —
+"not in Bing" was the 2026-08-26 reading and is not quite what the account says), `fee.org` and
+`liberty.me`/`tucker.liberty.me` (Bing-verified, no GSC property at all), `theobjectivestandard.com`
+(Bing verifies the apex; GSC instead verifies a *different* host, `2020.theobjectivestandard.com` —
+the two tools cover different parts of that domain, so neither could be added without picking one
+arbitrarily), and `quotes.freecapitalists.org` (Bing-verified; **no dedicated GSC property, but the
+`sc-domain:freecapitalists.org` property does cover it**, the same parent-plus-`gscPageFilter` shape
+`davidveksler.freecapitalists.org` already uses — so unlike the others this one is a live candidate
+for a `SITES` row rather than a dead end. Adding it is a dashboard decision (a new card, traffic
+tracking) and is David's call, not an agent's). **`objectivismonline.com` used to expose a real gap
+in the single-string `bing` field** and no longer does: it is Bing-verified as its own URL-prefix
+property, separate from `forum.objectivismonline.com`'s, while the GSC row above covers both under
+one `sc-domain:` property — so that row's Bing figures were the forum's alone. `bing` now accepts an
+**array** of URL strings, and `runBingDaily` pulls each and merges them into the one row per
+(date, host) the schema stores: `mergeBingSummaries`/`mergeBingKeywords` in `src/bing.js` add clicks
+and impressions and recompute every rate and position from the summed counts (impression-weighted for
+`AvgImpressionPosition`, click-weighted for `AvgClickPosition`, with the `-1` sentinel never averaged
+in as though it were a rank), so nothing is an average of averages and a single-URL site is an exact
+pass-through. Windows are merged the way `gsc_window` already works — a spread of freshness across
+properties is stored as a `date–date` range rather than labelled with one of them. **Only list URLs
+the site itself covers** (its `host` or an `alsoHosts` entry); a different site's property in the
+array would silently merge two audiences. **Runs as its
 own Worker invocation** (`runBingDaily`, its own cron and its own `/run-bing` endpoint — see Data
 flow above), not a second phase inside `runDaily`, specifically so its subrequests spend a fresh
 50/request budget instead of runDaily's, which the GSC pull already runs close to (see the
@@ -320,10 +355,14 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `/run-bing` endpoint, specifically so growing the Bing site list can never re-create this exact
   failure inside `runDaily` — 6 Bing sites × 2 calls is 12 requests, which would have landed the
   combined invocation at 49/50 right back at the edge this fix just pulled it away from, if it had
-  shared runDaily's budget. Bing's own invocation still has its own 50/request ceiling, cheap as it
-  is today (12 of 50) — if the Bing site list grows enough to approach that on its own, the fix is
-  the same lever restated for a different invocation: re-measure with a live `/run-bing` pull before
-  assuming headroom, not another code trim first.
+  shared runDaily's budget. Bing's own invocation still has its own 50/request ceiling, and the
+  figure to watch is **per property, not per site**: a `SITES` row's `bing` field can hold several
+  URLs (objectivismonline.com's does), and each URL costs its own 2 calls. 17 Bing sites carrying 18
+  properties is 36 of 50 as of 2026-08-27, which is no longer "cheap" — `runBingDaily` returns
+  `properties` in its result for exactly this reason, and `write-check.mjs` asserts
+  `2 x properties <= 50`. Roughly 7 more properties is the ceiling. If the list grows past that, the
+  fix is the same lever restated for a different invocation: re-measure with a live `/run-bing` pull
+  before assuming headroom, not another code trim first.
 - **Bing's `AvgClickPosition` came back `-1` on every query row in the first live pull, including rows
   with real clicks.** A 2026-08-27 `/run-bing` against cheatsheets.davidveksler.com stored 12 keyword
   rows; every one had `avgClickPosition: -1`, one of them on a query with 4 clicks. `AvgImpressionPosition`

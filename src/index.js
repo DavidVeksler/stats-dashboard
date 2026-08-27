@@ -4,7 +4,8 @@ import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
   KEYWORD_ROW_LIMIT } from "./gsc.js";
 import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords,
-  getUserSites as getBingSites, diffBingSites } from "./bing.js";
+  getUserSites as getBingSites, diffBingSites, bingUrlsOf,
+  mergeBingSummaries, mergeBingKeywords } from "./bing.js";
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
@@ -418,40 +419,57 @@ async function runBingDaily(env, now = new Date()) {
   // site (summary + keywords), not 3: see the subrequest-budget note in
   // src/bing.js for why GetPageStats is left out. One host's failure must not
   // stop the rest of the pull, same per-host try/catch discipline as GSC.
-  const bingSites = SITES.filter((s) => s.bing);
+  const bingSites = SITES.filter((s) => bingUrlsOf(s).length);
   if (!bingSites.length) {
     notes.push("no SITES entry has a `bing` property set — nothing to pull");
   } else if (!env.BING_API_KEY) {
     notes.push("BING_API_KEY not set — Bing stats skipped");
   } else {
-    for (const { host, bing } of bingSites) {
+    // A site is usually one Bing property, but can be several: Bing verifies
+    // objectivismonline.com and forum.objectivismonline.com separately even
+    // though this dashboard shows them as one site and Search Console covers
+    // both with one domain property. The URLs are pulled independently and
+    // merged into the single row per (date, host) the schema stores — see the
+    // merge functions in src/bing.js. One URL failing costs that URL's share of
+    // the site, not the site, hence the try/catch inside each loop.
+    for (const site of bingSites) {
+      const host = site.host;
+      const urls = bingUrlsOf(site);
       stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
       stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
-      try {
-        const summary = await queryBingSummary(env.BING_API_KEY, bing);
-        if (summary) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
-            ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
-          );
+      const summaryParts = [];
+      for (const url of urls) {
+        try {
+          summaryParts.push(await queryBingSummary(env.BING_API_KEY, url));
+        } catch (e) {
+          notes.push(`bing summary ${host} (${url}): ${e.message}`.slice(0, 140));
         }
-      } catch (e) {
-        notes.push(`bing summary ${host}: ${e.message}`.slice(0, 140));
       }
-      try {
-        const { window: bingWindow, rows } = await queryBingKeywords(env.BING_API_KEY, bing);
-        for (const k of rows) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_bing_keywords
-               (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
-               VALUES (?,?,?,?,?,?,?,?)`
-            ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
-          );
+      const summary = mergeBingSummaries(summaryParts);
+      if (summary) {
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
+          ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
+        );
+      }
+      const keywordParts = [];
+      for (const url of urls) {
+        try {
+          keywordParts.push(await queryBingKeywords(env.BING_API_KEY, url));
+        } catch (e) {
+          notes.push(`bing keywords ${host} (${url}): ${e.message}`.slice(0, 140));
         }
-      } catch (e) {
-        notes.push(`bing keywords ${host}: ${e.message}`.slice(0, 140));
+      }
+      const { window: bingWindow, rows } = mergeBingKeywords(keywordParts);
+      for (const k of rows) {
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO daily_bing_keywords
+             (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
+             VALUES (?,?,?,?,?,?,?,?)`
+          ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
+        );
       }
     }
   }
@@ -463,7 +481,12 @@ async function runBingDaily(env, now = new Date()) {
   // pulls happened to run last rather than the one it was built to describe.
   // Failures are visible via `wrangler tail` and this function's own return
   // value (surfaced by /run-bing), the same as any other Worker invocation.
-  return { date, sites: bingSites.map((s) => s.host), batches, ok: notes.length === 0, notes };
+  // `properties` is the subrequest count this invocation actually spent (2 per
+  // Bing URL, not per site) — the number to read against the 50/request ceiling
+  // when the Bing list grows, since a site can now carry more than one URL.
+  return { date, sites: bingSites.map((s) => s.host),
+    properties: bingSites.reduce((sum, s) => sum + bingUrlsOf(s).length, 0),
+    batches, ok: notes.length === 0, notes };
 }
 
 // Re-read the trailing history and split today into human vs crawler traffic.

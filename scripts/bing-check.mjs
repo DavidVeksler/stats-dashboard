@@ -2,7 +2,8 @@
 // queryRankAndTraffic/queryKeywords need a live fetch, so this exercises
 // parseBingDate and latestDateRows directly, offline, the same way the rest of
 // this project keeps pure logic testable (see discourse-check.mjs).
-import { parseBingDate, latestDateRows, diffBingSites } from "../src/bing.js";
+import { parseBingDate, latestDateRows, diffBingSites, bingUrlsOf,
+  mergeBingWindows, mergeBingSummaries, mergeBingKeywords } from "../src/bing.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -63,11 +64,73 @@ check("diffBingSites: ...naming the URL Bing actually has",
 check("diffBingSites: ...and null when Bing has none for that host",
   diff.stale.find((r) => r.host === "gone.example").verifiedAs, null);
 check("diffBingSites: a tracked site Bing verifies but config does not use",
-  diff.missing.map((r) => r.host).join(","), "nobing.example");
+  diff.missing.map((r) => r.host).join(","), "nobing.example,apex.example");
+check("diffBingSites: ...an alias host Bing verifies separately counts too",
+  diff.missing.find((r) => r.host === "apex.example").verifiedAs, "https://www.apex.example/");
+check("diffBingSites: a host with a stale string is not also reported as missing",
+  diff.missing.some((r) => r.host === "protocol.example"), false);
 check("diffBingSites: an alias host counts as tracked, not untracked",
   diff.untracked.some((r) => r.url.includes("apex")), false);
 check("diffBingSites: a Bing property on no SITES row is untracked",
   diff.untracked.map((r) => r.url).join(","), "https://stranger.example/");
+
+// A site whose hostnames Bing verified as separate properties (the live case is
+// objectivismonline.com vs forum.objectivismonline.com, one card and one GSC
+// domain property here) is pulled per URL and merged into the one row per
+// (date, host) the schema allows. The merge must be arithmetic, never an
+// average of averages, and must be an exact pass-through for the single-URL
+// case every other site is.
+check("bingUrlsOf: a plain string is one URL", bingUrlsOf({ bing: "https://a.example/" }).length, 1);
+check("bingUrlsOf: an array is each of its URLs", bingUrlsOf({ bing: ["https://a.example/", "https://b.example/"] }).length, 2);
+check("bingUrlsOf: no bing field is no URLs", bingUrlsOf({ host: "a.example" }).length, 0);
+
+check("mergeBingWindows: one date stays a date", mergeBingWindows(["2026-08-25"]), "2026-08-25");
+check("mergeBingWindows: two dates become a range",
+  mergeBingWindows(["2026-08-26", "2026-08-24"]), "2026-08-24–2026-08-26");
+check("mergeBingWindows: nothing measured is null", mergeBingWindows([null, undefined]), null);
+
+const oneSummary = { window: "2026-08-25", clicks: 4, impressions: 100, ctr: .04 };
+check("mergeBingSummaries: a single property passes through unchanged",
+  JSON.stringify(mergeBingSummaries([oneSummary])), JSON.stringify(oneSummary));
+// 10% of 10 impressions and 1% of 1,000 must come out at 1.09%, not 5.5%.
+const merged = mergeBingSummaries([
+  { window: "2026-08-25", clicks: 1, impressions: 10, ctr: .1 },
+  { window: "2026-08-24", clicks: 10, impressions: 1000, ctr: .01 },
+]);
+check("mergeBingSummaries: clicks add", merged.clicks, 11);
+check("mergeBingSummaries: impressions add", merged.impressions, 1010);
+check("mergeBingSummaries: CTR is recomputed from the totals, not averaged", merged.ctr, 11 / 1010);
+check("mergeBingSummaries: a spread of freshness is reported as a range",
+  merged.window, "2026-08-24–2026-08-25");
+check("mergeBingSummaries: every property failing yields no row", mergeBingSummaries([null, undefined]), null);
+
+const kw = mergeBingKeywords([
+  { window: "2026-08-20", rows: [
+    { query: "shared", clicks: 2, impressions: 100, avgClickPosition: 4, avgImpressionPosition: 10 },
+    { query: "apex only", clicks: 0, impressions: 5, avgClickPosition: -1, avgImpressionPosition: 30 },
+  ] },
+  { window: "2026-08-20", rows: [
+    { query: "shared", clicks: 8, impressions: 900, avgClickPosition: -1, avgImpressionPosition: 20 },
+  ] },
+]);
+const shared = kw.rows.find((r) => r.query === "shared");
+check("mergeBingKeywords: one row per query across properties", kw.rows.length, 2);
+check("mergeBingKeywords: clicks add", shared.clicks, 10);
+check("mergeBingKeywords: impressions add", shared.impressions, 1000);
+check("mergeBingKeywords: impression position is impression-weighted",
+  shared.avgImpressionPosition, (10 * 100 + 20 * 900) / 1000);
+check("mergeBingKeywords: Bing's -1 sentinel is never averaged in as a position",
+  shared.avgClickPosition, 4);
+check("mergeBingKeywords: ...and a query no property positions keeps the sentinel",
+  kw.rows.find((r) => r.query === "apex only").avgClickPosition, -1);
+check("mergeBingKeywords: rows come back ranked by impressions", kw.rows[0].query, "shared");
+
+const singleKw = { window: "2026-08-20", rows: [
+  { query: "solo", clicks: 3, impressions: 60, avgClickPosition: 2.5, avgImpressionPosition: 7.5 },
+] };
+const passthrough = mergeBingKeywords([singleKw]);
+check("mergeBingKeywords: a single property passes through unchanged",
+  JSON.stringify(passthrough.rows), JSON.stringify(singleKw.rows));
 
 if (failures) {
   console.error(`\n${failures} bing check(s) failed`);

@@ -137,23 +137,128 @@ function bingHost(url) {
 export function diffBingSites(sites, verified) {
   const urls = new Set(verified.map((v) => v.url));
   const byHost = new Map(verified.map((v) => [bingHost(v.url), v.url]));
-  const configured = sites.filter((s) => s.bing);
+  // One entry per (site, URL): a row carrying several Bing properties is only
+  // as correct as its least correct URL, and a mapping report that collapsed
+  // them would hide exactly the half that broke.
+  const configured = sites.flatMap((s) => bingUrlsOf(s).map((bing) => ({ host: s.host, bing })));
+  const configuredUrls = new Set(configured.map((c) => c.bing));
+  const configuredHosts = new Set(configured.map((c) => bingHost(c.bing)));
   const trackedHosts = new Set(sites.flatMap((s) => [s.host, ...(s.alsoHosts ?? [])]));
+  // Every hostname a SITES row covers, aliases included: the apex alias of a
+  // forum row is a tracked host, so a Bing property for it is a `bing` field
+  // this config could be holding and is not — a missing mapping, not an
+  // untracked site.
+  const coveredHosts = new Map(sites.flatMap((s) => [s.host, ...(s.alsoHosts ?? [])].map((h) => [h.toLowerCase(), s.host])));
   return {
     // Config strings Bing still recognizes, exactly as written.
-    ok: configured.filter((s) => urls.has(s.bing)).map((s) => ({ host: s.host, bing: s.bing })),
+    ok: configured.filter((c) => urls.has(c.bing)),
     // Config strings Bing no longer returns: the pull for these 400s or comes
     // back empty. `verifiedAs` names the URL Bing has for that host, if any, so
     // the fix (usually an http/https or trailing-slash difference) is visible.
-    stale: configured.filter((s) => !urls.has(s.bing))
-      .map((s) => ({ host: s.host, bing: s.bing, verifiedAs: byHost.get(s.host.toLowerCase()) ?? null })),
-    // Tracked sites with no `bing` field that Bing does verify — candidates to
-    // wire up, one config line each, no new card.
-    missing: sites.filter((s) => !s.bing && byHost.has(s.host.toLowerCase()))
-      .map((s) => ({ host: s.host, verifiedAs: byHost.get(s.host.toLowerCase()) })),
+    stale: configured.filter((c) => !urls.has(c.bing))
+      .map((c) => ({ ...c, verifiedAs: byHost.get(bingHost(c.bing)) ?? null })),
+    // A hostname this dashboard already covers that Bing verifies and the
+    // config does not pull — one line to wire up, and no new card, whether the
+    // host is a SITES row's own or one of its aliases.
+    // Hosts that already have a config string are excluded here even when the
+    // string does not match: those are `stale` (a mapping to repair), and one
+    // host should never appear in both lists saying two different things.
+    missing: verified.filter((v) => !configuredUrls.has(v.url)
+      && !configuredHosts.has(bingHost(v.url)) && coveredHosts.has(bingHost(v.url)))
+      .map((v) => ({ host: coveredHosts.get(bingHost(v.url)), verifiedAs: v.url })),
     // Verified in Bing, on no SITES row at all. Adding one is a dashboard
     // decision, not a mapping fix.
     untracked: verified.filter((v) => !trackedHosts.has(bingHost(v.url)))
       .map((v) => ({ url: v.url, verified: v.verified })),
   };
+}
+
+// ---- Multi-property sites ---------------------------------------------------
+// A SITES row can carry more than one Bing URL, because a site's hostnames are
+// not always verified together: objectivismonline.com and
+// forum.objectivismonline.com are one card here (the apex is a landing page in
+// front of the forum) and one GSC property (a domain property covers both), but
+// Bing verifies them as two separate URL-prefix properties. Pulling only one of
+// them reported part of that site's Bing traffic as all of it.
+//
+// The merge below is what makes several properties into the one row per
+// (date, host) the schema stores. It is arithmetic, not estimation: clicks and
+// impressions add, and every rate is recomputed from the summed pair rather than
+// averaged. Both are pure so scripts/bing-check.mjs can drive them, and both are
+// exact pass-throughs for the single-URL case every other site is.
+
+// Bing's per-endpoint freshness differs by property as well as by endpoint, so
+// two properties of one site can answer for different dates. Rather than picking
+// one and labelling the sum with it, a spread is reported as a range — the same
+// shape (and the same honesty) as gsc_window, which is a range for the same
+// reason.
+export function mergeBingWindows(windows) {
+  const dates = [...new Set(windows.filter(Boolean))].sort();
+  if (!dates.length) return null;
+  return dates.length === 1 ? dates[0] : `${dates[0]}–${dates.at(-1)}`;
+}
+
+// Sum of every property's site-wide figures. CTR is recomputed from the totals,
+// never averaged across properties: a 10%-CTR property with 3 impressions and a
+// 1%-CTR one with 3,000 do not average to 5.5%.
+export function mergeBingSummaries(parts) {
+  const present = parts.filter(Boolean);
+  if (!present.length) return null;
+  const clicks = present.reduce((sum, p) => sum + p.clicks, 0);
+  const impressions = present.reduce((sum, p) => sum + p.impressions, 0);
+  return {
+    window: mergeBingWindows(present.map((p) => p.window)),
+    clicks, impressions, ctr: impressions ? clicks / impressions : 0,
+  };
+}
+
+// Per-query rows across properties, keyed by query text because that is the
+// table's key. Clicks and impressions add. The two positions are averages
+// already, so combining them means weighting each property's figure by the
+// count it was averaged over — impressions for the impression position, clicks
+// for the click position. Bing's -1 "not reported" sentinel is not a position
+// and is never averaged into one: a row contributes to the click position only
+// if it reports one, and a query whose properties all report -1 keeps -1, so
+// render.js still shows it as "—" rather than a number nobody measured.
+export function mergeBingKeywords(parts) {
+  const present = parts.filter((p) => p && p.rows?.length);
+  const byQuery = new Map();
+  for (const part of present) {
+    for (const row of part.rows) {
+      const acc = byQuery.get(row.query) ?? {
+        query: row.query, clicks: 0, impressions: 0,
+        impPosWeight: 0, impPosSum: 0, clickPosWeight: 0, clickPosSum: 0,
+      };
+      acc.clicks += row.clicks;
+      acc.impressions += row.impressions;
+      if (row.avgImpressionPosition >= 0) {
+        // Weight by impressions, falling back to 1 so a positioned row with no
+        // impressions still counts once instead of vanishing from the average.
+        const w = row.impressions || 1;
+        acc.impPosWeight += w;
+        acc.impPosSum += row.avgImpressionPosition * w;
+      }
+      if (row.avgClickPosition >= 0) {
+        const w = row.clicks || 1;
+        acc.clickPosWeight += w;
+        acc.clickPosSum += row.avgClickPosition * w;
+      }
+      byQuery.set(row.query, acc);
+    }
+  }
+  const rows = [...byQuery.values()].map((acc) => ({
+    query: acc.query, clicks: acc.clicks, impressions: acc.impressions,
+    avgClickPosition: acc.clickPosWeight ? acc.clickPosSum / acc.clickPosWeight : -1,
+    avgImpressionPosition: acc.impPosWeight ? acc.impPosSum / acc.impPosWeight : -1,
+  })).sort((a, b) => b.impressions - a.impressions || b.clicks - a.clicks);
+  return { window: mergeBingWindows(present.map((p) => p.window)), rows };
+}
+
+// The Bing URLs a SITES row covers. `bing` is a single URL string on almost
+// every row and an array on the rare site whose hostnames Bing verified
+// separately (see the merge note above). Normalized in one place so every
+// caller — the nightly pull, diffBingSites, the checks — reads the same shape.
+export function bingUrlsOf(site) {
+  if (!site?.bing) return [];
+  return Array.isArray(site.bing) ? site.bing.filter(Boolean) : [site.bing];
 }
