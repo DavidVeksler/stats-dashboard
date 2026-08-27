@@ -304,6 +304,14 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   is today (12 of 50) — if the Bing site list grows enough to approach that on its own, the fix is
   the same lever restated for a different invocation: re-measure with a live `/run-bing` pull before
   assuming headroom, not another code trim first.
+- **Bing's `AvgClickPosition` came back `-1` on every query row in the first live pull, including rows
+  with real clicks.** A 2026-08-27 `/run-bing` against cheatsheets.davidveksler.com stored 12 keyword
+  rows; every one had `avgClickPosition: -1`, one of them on a query with 4 clicks. `AvgImpressionPosition`
+  on the same rows was populated normally (1, 2, 5, 6...). Read as Bing's own "not reported" sentinel for
+  this field, not a real rank — and definitely not evidence the pull is broken. `src/bing.js` stores it
+  as-is (a raw pass-through, the same as every other field), and `bingPos()` in `render.js` is what turns
+  a negative value into "—" instead of a literal `-1.0`. If a future pull shows real (non-negative) click
+  positions for some site, that is new information, not a regression to "fix" back to always-hidden.
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB

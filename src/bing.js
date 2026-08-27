@@ -78,7 +78,13 @@ export async function queryRankAndTraffic(apiKey, siteUrl) {
 // Two position fields, not GSC's one: AvgClickPosition (where the results people
 // actually clicked ranked) and AvgImpressionPosition (where every impression
 // ranked). Kept apart rather than collapsed into a single number, because they
-// answer different questions and Bing reports both distinctly.
+// answer different questions and Bing reports both distinctly. AvgClickPosition
+// is passed through as-is, including -1: a live pull against
+// cheatsheets.davidveksler.com on 2026-08-27 came back with -1 on every query
+// row regardless of click count (one had 4 clicks and still -1), which reads as
+// Bing's own "not reported" sentinel rather than a real rank. This module does
+// not interpret it -- src/render.js's bingKeywordList renders any negative
+// value as "—" rather than a literal -1.0.
 export async function queryKeywords(apiKey, siteUrl) {
   const raw = await call("GetQueryStats", apiKey, { siteUrl });
   const { date, rows } = latestDateRows(raw);

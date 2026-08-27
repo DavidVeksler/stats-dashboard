@@ -100,6 +100,16 @@ const fixture = {
       pagesPerSession: 1.36, previousPagesPerSession: 1.2, pagesPerSessionDelta: .16,
       searchSummary: { clicks: 40, impressions: 1900, ctr: .0211, position: 7.5 },
       gscWindow: "2026-07-12–2026-07-14",
+      // Bing's AvgClickPosition came back -1 on every row of a real 2026-08-27
+      // pull, including rows with real clicks — Bing's own "not reported"
+      // sentinel, not a rank. Fixtured here so a regression that renders it as
+      // a literal -1.0 (instead of "—") fails this check. AvgImpressionPosition
+      // was populated normally in that same pull, so it's a real number here.
+      bingSummary: { clicks: 26, impressions: 839, ctr: .031 },
+      bingKeywords: [
+        { query: "starlink satellite schematic", clicks: 4, impressions: 1, avgClickPosition: -1, avgImpressionPosition: 1 },
+      ],
+      bingWindow: "2026-08-24",
       referrers: [
         { referrer: "(direct)", kind: "direct", visits: 700 },
         { referrer: "www.google.com", kind: "search", visits: 250 },
@@ -276,6 +286,20 @@ const fixture = {
 fixture.sites = fixture.sites.map((s) => ({ bingSummary: null, bingKeywords: [], bingWindow: null, ...s }));
 
 const html = renderDashboard(fixture);
+
+// Bing's -1 "not reported" sentinel (see the fixture comment above) must never
+// reach the page as a literal number — that reads as broken data, not absent
+// data. bingPos() in render.js is what turns it into "—".
+if (html.includes("click pos -1.0")) {
+  throw new Error("Bing's -1 click-position sentinel rendered as a literal number instead of —");
+}
+if (!html.includes("click pos —")) {
+  throw new Error("Bing keyword row with avgClickPosition: -1 did not render as —");
+}
+if (!html.includes("Top search queries (Bing)")) {
+  throw new Error("Bing keyword panel did not render for a site with bingKeywords");
+}
+
 const required = [
   "Human sessions", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
   "high impression opportunity", "Last successful pull",

@@ -269,13 +269,21 @@ function bingSummary(site) {
 // the sample doesn't support. No opportunity classification, unlike
 // keywordList above — that classifier is tuned against GSC's expectedCtr curve
 // (see opportunities.js), which has no Bing equivalent.
+//
+// A live pull against cheatsheets.davidveksler.com on 2026-08-27 came back with
+// AvgClickPosition: -1 on every single query row, including rows with real
+// clicks (e.g. 4 clicks, -1 position) — Bing's own sentinel for "not reported",
+// not a real rank. Rendered as "—", never as a literal -1.0, which would read
+// as broken data rather than absent data. AvgImpressionPosition was populated
+// normally in that same pull, so only click position gets this guard.
+const bingPos = (n) => (Number(n) >= 0 ? Number(n).toFixed(1) : "—");
 function bingKeywordList(keywords) {
   if (!keywords?.length) return `<p class="none">No Bing search queries in the latest window.</p>`;
   return `<ol class="metric-list">${keywords.map((keyword) => {
     const ctr = keyword.impressions ? keyword.clicks / keyword.impressions : 0;
     return `<li class="metric-row">
       <div class="metric-name"><span class="truncate" title="${esc(keyword.query)}">${esc(keyword.query)}</span></div>
-      <div class="metric-values"><strong>${fmt(keyword.clicks)} clk</strong><span>${fmt(keyword.impressions)} imp · ${pct(ctr, 1)} CTR · click pos ${keyword.avgClickPosition.toFixed(1)} · imp pos ${keyword.avgImpressionPosition.toFixed(1)}</span></div>
+      <div class="metric-values"><strong>${fmt(keyword.clicks)} clk</strong><span>${fmt(keyword.impressions)} imp · ${pct(ctr, 1)} CTR · click pos ${bingPos(keyword.avgClickPosition)} · imp pos ${bingPos(keyword.avgImpressionPosition)}</span></div>
     </li>`;
   }).join("")}</ol>`;
 }
