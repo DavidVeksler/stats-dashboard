@@ -83,7 +83,20 @@ export const SITES = [
     host: "davidveksler.com",
     gsc: "sc-domain:davidveksler.com",
     gscPageFilter: "^https?://(?:www\\.)?davidveksler\\.com/",
-    bing: "https://davidveksler.com/", // confirmed live via getUserSites 2026-08-26
+    // NO `bing` field, deliberately, even though https://davidveksler.com/ is
+    // Bing-verified. The first live pull of it (2026-08-27) came back with
+    // cheatsheets.davidveksler.com's data: 32 clicks / 920 impressions against
+    // that site's own property's 32 / 918, with an identical top-query list
+    // ("starlink satellite schematic", "how to program my baofeng uv-5r" — cheat
+    // sheet content, not this blog's). Bing's apex property here reports the
+    // whole domain, subdomains included, and neither GetRankAndTrafficStats nor
+    // GetQueryStats takes a page or host filter, so there is no Bing equivalent
+    // of the gscPageFilter above to narrow it back to the apex. Wiring it up
+    // printed one site's numbers on two different cards. The share that is
+    // genuinely this host's (2 impressions out of 920) is not worth that, so it
+    // stays unmeasured rather than wrong. Re-check before re-adding: a per-site
+    // scope setting in Bing Webmaster Tools, not a code change, is what would
+    // make this property mean the apex.
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26

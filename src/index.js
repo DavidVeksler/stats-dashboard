@@ -472,6 +472,20 @@ async function runBingDaily(env, now = new Date()) {
         );
       }
     }
+
+    // A site that used to carry a `bing` property and no longer does
+    // (davidveksler.com, whose apex property turned out to report its
+    // subdomain's traffic — see config.js) would otherwise keep the rows an
+    // earlier run wrote for today: the loop above only deletes for hosts it is
+    // about to rewrite. Clearing the current date for opted-out hosts costs 2
+    // statements each and keeps "no Bing property" from looking, on the card,
+    // exactly like "Bing had nothing today". Inside this branch on purpose — a
+    // run with no API key refreshes nothing and so must delete nothing. Only
+    // today's rows; stored history is never deleted here.
+    for (const site of SITES.filter((s) => !bingUrlsOf(s).length)) {
+      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, site.host));
+      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, site.host));
+    }
   }
 
   const batches = await batchInChunks(env.DB, stmts);

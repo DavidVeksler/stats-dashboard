@@ -363,6 +363,21 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `2 x properties <= 50`. Roughly 7 more properties is the ceiling. If the list grows past that, the
   fix is the same lever restated for a different invocation: re-measure with a live `/run-bing` pull
   before assuming headroom, not another code trim first.
+- **A Bing URL-prefix property can silently cover a site's SUBDOMAINS, and there is no Bing
+  equivalent of `gscPageFilter` to narrow it.** The first live pull of `https://davidveksler.com/`
+  (2026-08-27) returned cheatsheets.davidveksler.com's data — 32 clicks / 920 impressions against
+  that subdomain's own property's 32 / 918, with an identical top-query list of cheat-sheet queries.
+  Neither `GetRankAndTrafficStats` nor `GetQueryStats` accepts a page or host filter, so the only
+  remedy is which URLs a row lists: `davidveksler.com` now carries **no** `bing` field (see the
+  comment on that row), because pulling it printed one site's numbers on two cards, and the ~2
+  impressions genuinely its own are not worth that. Consequences: **before adding a `bing` URL for an
+  apex whose subdomains are tracked separately, compare the two properties' query lists after the
+  first pull** — matching top queries mean the apex property is domain-wide. `freecapitalists.org`'s
+  apex property is the open case: its queries read like library/mises subdomain topics, but every
+  subdomain property returns zero rows so far, so there is nothing to compare against yet — recheck
+  when one of them starts reporting. And `runBingDaily` clears the current date's Bing rows for
+  every SITES row with **no** `bing` property, so removing a mapping takes effect that night instead
+  of freezing the last bad pull on the card (asserted by `write-check.mjs`).
 - **Bing's `AvgClickPosition` came back `-1` on every query row in the first live pull, including rows
   with real clicks.** A 2026-08-27 `/run-bing` against cheatsheets.davidveksler.com stored 12 keyword
   rows; every one had `avgClickPosition: -1`, one of them on a query with 4 clicks. `AvgImpressionPosition`

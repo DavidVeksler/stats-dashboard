@@ -310,13 +310,27 @@ const runBing = async (env) => {
   // stream — still worth asserting, because nothing else in the repo checks it.
   for (const table of ["daily_bing_summary", "daily_bing_keywords"]) {
     const hosts = new Set(flat.filter((s) => s.sql.includes(`DELETE FROM ${table} `)).map((s) => s.binds[1]));
-    check(`${table} is deleted for every Bing site`, hosts.size, BING_SITES.length);
+    // Every Bing site (about to be rewritten) plus every opted-out site (rows
+    // cleared, see below) — the delete set is deliberately wider than the write set.
+    check(`${table} is deleted for every Bing site`, hosts.size, SITES.length);
     for (const host of hosts) {
       const deleteAt = flat.findIndex((s) => s.sql.includes(`DELETE FROM ${table} `) && s.binds[1] === host);
       const insertAt = flat.findIndex((s) => s.sql.startsWith(`INSERT INTO ${table} `) && s.binds[1] === host);
       if (insertAt === -1) continue;
       check(`${table}/${host}: the delete precedes the insert`, deleteAt >= 0 && deleteAt < insertAt, true);
     }
+  }
+
+  // A site that has opted out of Bing (no `bing` field) still gets today's rows
+  // cleared, so a property removed from config.js stops showing on the card that
+  // night rather than freezing its last pull in place.
+  const optedOut = SITES.filter((s) => !bingUrlsOf(s).length);
+  for (const table of ["daily_bing_summary", "daily_bing_keywords"]) {
+    const deletedHosts = new Set(flat.filter((s) => s.sql.includes(`DELETE FROM ${table} `)).map((s) => s.binds[1]));
+    check(`${table}: opted-out sites are cleared for today too`,
+      optedOut.every((s) => deletedHosts.has(s.host)), true);
+    check(`${table}: ...and never written for them`,
+      flat.some((s) => s.sql.startsWith(`INSERT INTO ${table} `) && optedOut.some((o) => o.host === s.binds[1])), false);
   }
 
   // The isolation claim itself: this invocation never touches anything runDaily
