@@ -469,6 +469,39 @@ function crawlerRowDetail(site) {
   return `${clean ? `${clean}, plus ${recovered}` : `The figure above is the ${recovered}`}. ${why}`;
 }
 
+// Consecutive-run grouping, never a re-sort: loadDashboard has already ordered
+// the cards domain-first (see groupByDomain there), so this only draws a heading
+// where the domain changes. Reading the order rather than re-deriving it means
+// the page cannot disagree with /api/json about which domain outranks which.
+// Falls back to the host when a row carries no `domain` (an /api/json payload
+// captured before this shipped), which groups that card alone rather than
+// throwing it into somebody else's domain.
+function domainRuns(sites) {
+  const runs = [];
+  for (const site of sites) {
+    const domain = site.domain || site.host;
+    if (runs.at(-1)?.domain === domain) runs.at(-1).sites.push(site);
+    else runs.push({ domain, sites: [site] });
+  }
+  return runs;
+}
+
+// One grid per domain, with a label naming the domain and its total in the unit
+// of the class it belongs to — "sessions" for RUM, "zone visits" for zone hosts.
+// The unit is spelled out on the heading because the total is the number the
+// group's position in the page is ranked by, and a zone group's total is not the
+// same quantity as a RUM group's.
+function domainGrids(sites, allSites, periodDays, unit) {
+  return domainRuns(sites).map((run) => {
+    const id = `domain-${run.domain.replace(/[^a-z0-9]/gi, "-")}`;
+    const total = run.sites.reduce((sum, site) => sum + (site.visits || 0), 0);
+    return `<section class="domain-group" aria-labelledby="${id}">
+      <h3 class="domain-heading" id="${id}">${esc(run.domain)}<span>${run.sites.length} site${run.sites.length === 1 ? "" : "s"} &middot; ${fmt(total)} ${unit}</span></h3>
+      <div class="grid">${run.sites.map((site) => siteCard(site, allSites.indexOf(site), periodDays)).join("")}</div>
+    </section>`;
+  }).join("");
+}
+
 function siteCard(site, index, periodDays) {
   // Same function the signal hrefs are built from, so a "Today's actions" link
   // cannot point at an anchor this card does not carry.
@@ -722,7 +755,7 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
 .spark-flood{fill:var(--paper);stroke:var(--social);stroke-width:1.6}
 .zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
-.zone-section{margin-top:22px}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
+.zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line)}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.internal,.source-legend i.internal{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.source-note{margin:10px 0 0;padding-top:9px;border-top:1px dashed var(--line);font-size:10.5px;line-height:1.5;color:var(--faint)}.source-note b{color:var(--muted);font-weight:650}
 .cmp{display:inline-flex;align-items:center;font-size:10px;font-weight:650;border-radius:999px;padding:2px 6px;background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);white-space:nowrap;text-decoration:none}a.cmp:hover{color:var(--ink)}
@@ -766,15 +799,16 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
       ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
     </section>
     ${sourceMix(totals)}
-    <div class="grid">${rumSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
+    ${domainGrids(rumSites, data.sites, data.periodDays, "sessions")}
     ${hasZoneSite ? `<section class="zone-section" aria-labelledby="zone-section-heading">
       <h2 class="section-heading" id="zone-section-heading">Zone-log measurement</h2>
-      <div class="grid">${zoneSites.map((site) => siteCard(site, data.sites.indexOf(site), data.periodDays)).join("")}</div>
+      ${domainGrids(zoneSites, data.sites, data.periodDays, "zone visits")}
     </section>` : ""}
     ${forumSection(data.forums)}
   </main>
   <footer>
     <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable. Each KPI tile carries a <b>14-day mean</b> beside it, computed from the same daily snapshots and the same human/crawler split the cards use, so every figure can be read against what normal looks like.</div>
+    <div><b>Cards are grouped by domain.</b> Every host of a registrable domain (freecapitalists.org covers wiki., forum., library. and the apex) sits in one block, blocks are ordered by that domain's own total, and hosts are ordered by theirs inside it — the same metric at both levels, so the sort control moves them together. Grouping happens within a measurement class, never across one: a domain with both a RUM host and a zone-log host appears in both sections, ranked against its own class each time, because sessions and HTTP requests are not the same quantity.</div>
     <div><b>Traffic sources</b> covers RUM sites only, and <b>Unattributed is a residual, not a channel</b>: it is the arithmetic gap between the sessions the traffic table counted and the referrer rows the referrer table stored, so it sits outside the mix bar with its causes named rather than competing with Direct and Search. <b>Internal</b> is sessions arriving from one of a site's own hostnames — an apex landing page handing off to the forum, say. Those were dropped rather than stored and reappeared inside the residual; they are recorded from 2026-08-13 forward. The channel is frozen into each stored row at write time, so it cannot be backfilled: over a window that reaches back before that date the channel is simply absent rather than shown as a measured zero.</div>
     <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count. For a site with at least ${RATIO_MIN_CLEAN_DAYS} clean days on record, the direct bucket is also given a ratio estimate — that site's own typical direct-to-referred split on ordinary days — and shown as "~" with its own margin; otherwise the day's sessions read as a floor (≥) rather than a count. Either way, pages/session divides by clean sessions only, and a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
     <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. Flooded days are called out as "no like-for-like comparison" rather than quietly dropping off the list.</div>

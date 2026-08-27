@@ -223,3 +223,22 @@ export function classifyReferrer(refHost, selfHost = null) {
   if (SOCIAL.some((s) => h.includes(s))) return "social";
   return "ref";
 }
+
+// The registrable domain (eTLD+1) a host belongs to — "freecapitalists.org" for
+// both "wiki.freecapitalists.org" and the apex — used to group the dashboard's
+// cards so a domain's subdomains sit together (see loadDashboard's grouping
+// step in src/index.js).
+//
+// Deliberately the naive last-two-labels rule rather than a Public Suffix List
+// lookup: every host in SITES sits under a single-label public suffix (.com,
+// .org, .info, .capital), so the two agree today, and shipping (or fetching) the
+// PSL into a Worker to serve a grouping heading would cost far more than the
+// question is worth. It is wrong for multi-label suffixes — a ".co.uk" or
+// ".github.io" host would group under "co.uk" / "github.io" — so if one ever
+// joins SITES, this is the function to fix, and the fix is the PSL, not another
+// hand-maintained suffix list. Fails soft: a bare label returns itself.
+export function registrableDomain(host) {
+  const parts = String(host ?? "").toLowerCase().split(".").filter(Boolean);
+  if (parts.length < 2) return parts.join(".") || String(host ?? "");
+  return parts.slice(-2).join(".");
+}

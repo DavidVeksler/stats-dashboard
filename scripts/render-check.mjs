@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { renderDashboard } from "../src/render.js";
+import { registrableDomain } from "../src/config.js";
 // Imported, never retyped: the footer prose that explains these rules is
 // asserted against the constants themselves, so the two cannot drift.
 import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "../src/bots.js";
@@ -284,6 +285,10 @@ const fixture = {
 // blocks above were written) — default them here rather than editing every
 // site block, the same way loadDashboard always supplies them for real data.
 fixture.sites = fixture.sites.map((s) => ({ bingSummary: null, bingKeywords: [], bingWindow: null, ...s }));
+// `domain` is the grouping key loadDashboard puts on every row; defaulted here
+// through the same function it uses rather than typed per site, so this fixture
+// cannot drift into asserting a grouping the real page would not produce.
+fixture.sites = fixture.sites.map((s) => ({ domain: registrableDomain(s.host), ...s }));
 
 const html = renderDashboard(fixture);
 
@@ -380,6 +385,12 @@ const required = [
   "Verified-crawler figures appear after the next daily pull.",
   // Forum activity: its own section, its own card, sourced from about.json
   // rather than re-derived from the paginated admin user list.
+  // Cards are grouped under a heading naming the registrable domain and the
+  // group's total in its own class's unit — a subdomain heads up under its
+  // domain, not its own host, and a zone group counts zone visits, not sessions.
+  `id="domain-freecapitalists-org">freecapitalists.org<span>1 site &middot; 200 sessions`,
+  `id="domain-library-example">library.example<span>1 site &middot; 1,059 zone visits`,
+  "Cards are grouped by domain.",
   "Forum activity (Discourse)", "Example Forum",
   "https://forum.example/admin/users/list/active",
   "active users today", "14-day mean 2",

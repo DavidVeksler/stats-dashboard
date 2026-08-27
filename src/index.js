@@ -1,9 +1,10 @@
-import { SITES, FORUMS } from "./config.js";
+import { SITES, FORUMS, registrableDomain } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
   KEYWORD_ROW_LIMIT } from "./gsc.js";
-import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords } from "./bing.js";
+import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords,
+  getUserSites as getBingSites, diffBingSites } from "./bing.js";
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
@@ -527,6 +528,37 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
 }
 
 // ---- Read from D1 and render ---------------------------------------------
+// Cards are laid out domain-first: every host of a registrable domain sits in
+// one run, the runs are ordered by the domain's own popularity, and hosts are
+// ordered by theirs inside it. The same sort key drives both levels, so "biggest
+// first" means the same thing at each — a domain's rank is the aggregate of
+// exactly the metric its own cards are ranked by, never a different one.
+//
+// Called once per measurement class and never across them, for the same reason
+// bySort is: a domain owning both a RUM host and a zone host (freecapitalists.org
+// does — library. is zone-sourced) gets a group in each section, ranked against
+// its own class. Summing 19,506 HTTP requests into a session ranking is the exact
+// mistake the RUM/zone split exists to prevent, and without this it would come
+// back as a domain outranking every other on a metric it does not share.
+function groupByDomain(list, bySort, sort) {
+  const groups = new Map();
+  for (const site of list) {
+    if (!groups.has(site.domain)) groups.set(site.domain, []);
+    groups.get(site.domain).push(site);
+  }
+  // A group's rank is its members' aggregate of the active metric: total visits
+  // for traffic; the best single gain for "biggest gain" (a domain is as
+  // interesting as its most-moved host — summing ratios across hosts of wildly
+  // different size would mean nothing); the name itself for "domain name".
+  const rankOf = (members) => sort === "change"
+    ? Math.max(...members.map((s) => s.delta ?? -Infinity))
+    : members.reduce((sum, s) => sum + (s.visits || 0), 0);
+  const byGroup = sort === "name"
+    ? (a, b) => a[0].localeCompare(b[0])
+    : (a, b) => rankOf(b[1]) - rankOf(a[1]);
+  return [...groups.entries()].sort(byGroup).flatMap(([, members]) => members.sort(bySort));
+}
+
 async function loadDashboard(env, options = {}) {
   const requestedDays = Number(options.periodDays);
   const periodDays = [1, 7, 30].includes(requestedDays) ? requestedDays : 1;
@@ -560,7 +592,8 @@ async function loadDashboard(env, options = {}) {
           gscSnapshots: 0, gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
           gscWindowFirst: null, gscWindowLast: null, gscSeries: [] },
         opportunities: 0, snippetOpportunities: 0, rankOpportunities: 0 },
-      sites: selectedSites.map((s) => ({ host: s.host, visits: 0, views: 0, previousVisits: 0,
+      sites: selectedSites.map((s) => ({ host: s.host, domain: registrableDomain(s.host),
+        visits: 0, views: 0, previousVisits: 0,
         botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
         partialVisits: 0, partialDays: 0, estimatedVisits: false, spread: 0, estimatedDirect: 0, ratioSampleDays: null,
         previousPartialDays: 0,
@@ -830,6 +863,10 @@ async function loadDashboard(env, options = {}) {
     const latestFlood = [...floods].sort().at(-1);
     return {
       host: s.host,
+      // The registrable domain this host rolls up into — the grouping key the
+      // cards are laid out by (see the grouping step below). Carried on the row
+      // so render.js and /api/json read the same key rather than re-deriving it.
+      domain: registrableDomain(s.host),
       visits: t.visits, views: t.views,
       botVisits: t.botVisits, botViews: t.botViews, botDays: t.botDays,
       // Sessions recovered from flooded days: real, but a floor rather than a
@@ -903,8 +940,8 @@ async function loadDashboard(env, options = {}) {
   const bySort = sort === "name" ? (a, b) => a.host.localeCompare(b.host)
     : sort === "change" ? (a, b) => (b.delta ?? -Infinity) - (a.delta ?? -Infinity)
       : (a, b) => b.visits - a.visits;
-  const rumSites = sites.filter((s) => s.measurement === "rum").sort(bySort);
-  const zoneSites = sites.filter((s) => s.measurement === "zone").sort(bySort);
+  const rumSites = groupByDomain(sites.filter((s) => s.measurement === "rum"), bySort, sort);
+  const zoneSites = groupByDomain(sites.filter((s) => s.measurement === "zone"), bySort, sort);
   sites = [...rumSites, ...zoneSites];
 
   // Every session-shaped aggregate below reduces over RUM sites only. Zone hosts
@@ -1214,6 +1251,21 @@ export default {
       }
       const result = await runBingDaily(env);
       return Response.json(result);
+    }
+
+    // Which SITES rows Bing still verifies, reconciled against their `bing`
+    // fields. Read-only and writes nothing — AGENTS.md asks for this re-sync
+    // periodically (the account's verified list grew from 9 sites to 24 in a
+    // single day), and this makes it one request instead of a script with a
+    // live key pasted into it. Guarded by the same REFRESH_KEY as /run: the
+    // response names every site in the Bing account, which is not public.
+    if (url.pathname === "/bing-sites") {
+      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (!env.BING_API_KEY) return Response.json({ error: "BING_API_KEY not set" }, { status: 503 });
+      const verified = await getBingSites(env.BING_API_KEY);
+      return Response.json({ count: verified.length, verified, diff: diffBingSites(SITES, verified) });
     }
 
     const dashboardOptions = {

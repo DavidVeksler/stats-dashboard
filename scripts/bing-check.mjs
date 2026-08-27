@@ -2,7 +2,7 @@
 // queryRankAndTraffic/queryKeywords need a live fetch, so this exercises
 // parseBingDate and latestDateRows directly, offline, the same way the rest of
 // this project keeps pure logic testable (see discourse-check.mjs).
-import { parseBingDate, latestDateRows } from "../src/bing.js";
+import { parseBingDate, latestDateRows, diffBingSites } from "../src/bing.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -37,6 +37,37 @@ check("latestDateRows: empty input rows", empty.rows.length, 0);
 
 const unparsable = latestDateRows([{ Query: "x", Date: "garbage", Clicks: 1, Impressions: 1 }]);
 check("latestDateRows: all-unparsable dates -> null", unparsable.date, null);
+
+// diffBingSites reconciles SITES' `bing` fields against a live GetUserSites
+// list. The case that matters is the near-miss: Bing's URLs are protocol- and
+// slash-exact, so an https:// config string against an http:// verification is
+// a broken pull that looks fine in a diff of hostnames.
+const diff = diffBingSites([
+  { host: "ok.example", bing: "https://ok.example/" },
+  { host: "protocol.example", bing: "https://protocol.example/" },
+  { host: "gone.example", bing: "https://gone.example/" },
+  { host: "nobing.example" },
+  { host: "apex.example", alsoHosts: ["www.apex.example"] },
+], [
+  { url: "https://ok.example/", verified: true },
+  { url: "http://protocol.example/", verified: true },
+  { url: "https://nobing.example/", verified: true },
+  { url: "https://www.apex.example/", verified: true },
+  { url: "https://stranger.example/", verified: true },
+]);
+check("diffBingSites: an exact match is ok", diff.ok.map((r) => r.host).join(","), "ok.example");
+check("diffBingSites: an http/https mismatch is stale, not ok",
+  diff.stale.map((r) => r.host).join(","), "protocol.example,gone.example");
+check("diffBingSites: ...naming the URL Bing actually has",
+  diff.stale.find((r) => r.host === "protocol.example").verifiedAs, "http://protocol.example/");
+check("diffBingSites: ...and null when Bing has none for that host",
+  diff.stale.find((r) => r.host === "gone.example").verifiedAs, null);
+check("diffBingSites: a tracked site Bing verifies but config does not use",
+  diff.missing.map((r) => r.host).join(","), "nobing.example");
+check("diffBingSites: an alias host counts as tracked, not untracked",
+  diff.untracked.some((r) => r.url.includes("apex")), false);
+check("diffBingSites: a Bing property on no SITES row is untracked",
+  diff.untracked.map((r) => r.url).join(","), "https://stranger.example/");
 
 if (failures) {
   console.error(`\n${failures} bing check(s) failed`);

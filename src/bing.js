@@ -109,3 +109,51 @@ export async function queryKeywords(apiKey, siteUrl) {
 // named QueryStats for both) with the page URL coming back in a field still
 // called `Query` — confirmed against Microsoft's own XML sample, which shows a
 // URL in that position ("<Query>PageURL</Query>").
+
+// The host part of a Bing site URL ("https://wiki.freecapitalists.org/" ->
+// "wiki.freecapitalists.org"). Bing's strings are protocol- and trailing-slash
+// exact and http:// vs https:// is a real distinction to Bing (two SITES rows
+// are verified as http://), so this is only ever used to *compare* a URL to a
+// host, never to rebuild one — the stored `bing` string stays whatever
+// GetUserSites returned.
+function bingHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (_) {
+    return String(url ?? "").toLowerCase();
+  }
+}
+
+// Reconcile SITES' `bing` fields against what the Bing account actually has
+// verified today. Pure (no fetch) so scripts/bing-check.mjs can drive it, and
+// exposed over /bing-sites so the re-sync AGENTS.md asks for periodically is one
+// request rather than a hand-run script with a live key pasted in.
+//
+// Deliberately reports rather than decides. Adding a site to the dashboard is a
+// bigger call than adding a data source to a site already tracked (it means a
+// card, traffic tracking, and a GSC property that has to agree), so `untracked`
+// is a list to look at, not a to-do list — see AGENTS.md's Bing section for the
+// hosts that are verified on one tool and deliberately not on the other.
+export function diffBingSites(sites, verified) {
+  const urls = new Set(verified.map((v) => v.url));
+  const byHost = new Map(verified.map((v) => [bingHost(v.url), v.url]));
+  const configured = sites.filter((s) => s.bing);
+  const trackedHosts = new Set(sites.flatMap((s) => [s.host, ...(s.alsoHosts ?? [])]));
+  return {
+    // Config strings Bing still recognizes, exactly as written.
+    ok: configured.filter((s) => urls.has(s.bing)).map((s) => ({ host: s.host, bing: s.bing })),
+    // Config strings Bing no longer returns: the pull for these 400s or comes
+    // back empty. `verifiedAs` names the URL Bing has for that host, if any, so
+    // the fix (usually an http/https or trailing-slash difference) is visible.
+    stale: configured.filter((s) => !urls.has(s.bing))
+      .map((s) => ({ host: s.host, bing: s.bing, verifiedAs: byHost.get(s.host.toLowerCase()) ?? null })),
+    // Tracked sites with no `bing` field that Bing does verify — candidates to
+    // wire up, one config line each, no new card.
+    missing: sites.filter((s) => !s.bing && byHost.has(s.host.toLowerCase()))
+      .map((s) => ({ host: s.host, verifiedAs: byHost.get(s.host.toLowerCase()) })),
+    // Verified in Bing, on no SITES row at all. Adding one is a dashboard
+    // decision, not a mapping fix.
+    untracked: verified.filter((v) => !trackedHosts.has(bingHost(v.url)))
+      .map((v) => ({ url: v.url, verified: v.verified })),
+  };
+}

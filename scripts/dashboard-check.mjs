@@ -397,6 +397,54 @@ const load = async (query) => {
   check("zone cards sort after every RUM card", data.sites.at(-1).host, ZONE_HOST);
 }
 
+// 4b. Domain grouping. Cards are laid out domain-first: one contiguous run per
+//     registrable domain, runs ranked by the domain's own total, hosts ranked by
+//     theirs inside it. Contiguity is the part worth asserting — a card that
+//     drifts out of its domain's run turns the heading above it into a lie about
+//     what the block contains.
+{
+  const { data } = await load("period=1");
+  const runs = (sites) => {
+    const out = [];
+    for (const site of sites) {
+      if (out.at(-1)?.domain === site.domain) out.at(-1).sites.push(site);
+      else out.push({ domain: site.domain, sites: [site] });
+    }
+    return out;
+  };
+  const rum = data.sites.filter((s) => !s.zoneSourced);
+  const rumRuns = runs(rum);
+
+  check("every host carries its registrable domain",
+    data.sites.find((s) => s.host === WIKI_HOST).domain, "freecapitalists.org");
+  check("...a two-label host included",
+    data.sites.find((s) => s.host === SMALL_HOST).domain, "davidveksler.com");
+  check("each domain forms exactly one contiguous run of cards",
+    rumRuns.length, new Set(rum.map((s) => s.domain)).size);
+  check("...so a subdomain sits next to its own apex",
+    rumRuns.find((r) => r.domain === "freecapitalists.org").sites.some((s) => s.host === WIKI_HOST), true);
+  const total = (run) => run.sites.reduce((sum, s) => sum + s.visits, 0);
+  check("domain runs are ordered by the domain's own total, descending",
+    rumRuns.every((run, i) => i === 0 || total(rumRuns[i - 1]) >= total(run)), true);
+  check("...and hosts by theirs inside each run",
+    rumRuns.every((run) => run.sites.every((s, i) => i === 0 || run.sites[i - 1].visits >= s.visits)), true);
+  check("the busiest domain leads", rumRuns[0].domain, "freecapitalists.org");
+  // Zone hosts are grouped the same way but ranked in their own class: a domain
+  // that owns a host in each section gets a run in each, never one ranking that
+  // adds 19,506 HTTP requests to a session count.
+  const zoneRuns = runs(data.sites.filter((s) => s.zoneSourced));
+  check("zone hosts group by domain in their own section", zoneRuns[0].domain, "freecapitalists.org");
+  check("...without merging into the RUM run for the same domain",
+    rumRuns.some((r) => r.sites.some((s) => s.host === ZONE_HOST)), false);
+
+  const { data: byName } = await load("period=1&sort=name");
+  const nameRuns = runs(byName.sites.filter((s) => !s.zoneSourced));
+  check("sort=name orders the domain runs alphabetically",
+    nameRuns.map((r) => r.domain).join(","), [...nameRuns.map((r) => r.domain)].sort().join(","));
+  check("...and the hosts inside each run",
+    nameRuns.every((run) => run.sites.every((s, i) => i === 0 || run.sites[i - 1].host.localeCompare(s.host) <= 0)), true);
+}
+
 // 5. Zone crawler accounting. The flood classifier cannot fire on a zone host
 //    (no referrer rows, so directShare is always 0), so its crawler volume would
 //    otherwise be counted as an audience by implication. Two lenses replace the
