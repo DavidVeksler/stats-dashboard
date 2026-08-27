@@ -76,9 +76,12 @@ export const SITES = [
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
   // The domain property spans every *.freecapitalists.org subdomain, several of
   // which are rows of their own below, so the apex row is filtered down to the
-  // apex. Subdomains with no row here (archive., alexmerced., anarchonews.,
-  // austrotrader., mises.) are therefore in the property but on no card — the
-  // same coverage the old apex URL-prefix property gave.
+  // apex. Subdomains with no row here (alexmerced., anarchonews., austrotrader.)
+  // are therefore in the property but on no card — the same coverage the old
+  // apex URL-prefix property gave. archive. and mises. used to be on this list
+  // too; both turned out to have their own dedicated GSC property (confirmed via
+  // the search-console MCP's list_sites 2026-08-27), so they got real rows below
+  // instead of staying folded into this one.
   { host: "freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
     gscPageFilter: "^https?://(?:www\\.)?freecapitalists\\.org/",
     // Bing verifies only the apex as a URL-prefix property (unlike GSC's
@@ -86,8 +89,32 @@ export const SITES = [
     // there is no subdomain coverage to filter out. Confirmed live via
     // getUserSites 2026-08-26.
     bing: "https://freecapitalists.org/" },
-  { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org" },
-  { host: "wiki.objectivismonline.com", gsc: "sc-domain:wiki.objectivismonline.com" },
+  { host: "wiki.freecapitalists.org", gsc: "sc-domain:wiki.freecapitalists.org",
+    bing: "https://wiki.freecapitalists.org/" }, // confirmed live via getUserSites 2026-08-27
+  { host: "wiki.objectivismonline.com", gsc: "sc-domain:wiki.objectivismonline.com",
+    bing: "https://wiki.objectivismonline.com/" }, // confirmed live via getUserSites 2026-08-27
+  // Both discovered via the 2026-08-27 Bing re-sync (they were not in SITES
+  // before), then confirmed against list_sites to have their OWN dedicated GSC
+  // property rather than relying on the parent freecapitalists.org one above —
+  // no gscPageFilter needed, they're not a subset of anything.
+  { host: "archive.freecapitalists.org", gsc: "https://archive.freecapitalists.org/",
+    bing: "https://archive.freecapitalists.org/" },
+  // GSC verifies this one as http://, matching Bing's http:// verification
+  // exactly — kept as both tools returned it, not upgraded to https on the
+  // assumption the site redirects.
+  { host: "mises.freecapitalists.org", gsc: "http://mises.freecapitalists.org/",
+    bing: "http://mises.freecapitalists.org/" },
+  // Also discovered via the 2026-08-27 Bing re-sync. Independent of this
+  // host's entry in FORUMS (Discourse login/activity, a completely different
+  // pull) — a site can be both a tracked SITES row for traffic/search and a
+  // tracked FORUMS row for user activity at the same time.
+  { host: "forum.freecapitalists.org", gsc: "sc-domain:forum.freecapitalists.org",
+    bing: "https://forum.freecapitalists.org/" },
+  // Standalone domain (not a freecapitalists.org subdomain), added the same way:
+  // Bing-verified as of the 2026-08-27 re-sync, and list_sites confirms its own
+  // dedicated sc-domain: property.
+  { host: "peikofflibrary.com", gsc: "sc-domain:peikofflibrary.com",
+    bing: "https://peikofflibrary.com/" },
   // Reads the parent domain property filtered to the subdomain. A dedicated
   // sc-domain:davidveksler.freecapitalists.org property was created 2026-08-12
   // and is readable, but Search Console has not backfilled it yet: it returns
@@ -98,9 +125,15 @@ export const SITES = [
   // (The older http:// URL-prefix property is dead for a different reason:
   // URL-prefix properties are protocol-exact and the site serves https.)
   { host: "davidveksler.freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
-    gscPageFilter: "^https?://davidveksler\\.freecapitalists\\.org/" },
-  { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org" },
-  { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/" },
+    gscPageFilter: "^https?://davidveksler\\.freecapitalists\\.org/",
+    // Bing's verification for this one is http://, not https:// -- kept exactly
+    // as getUserSites returned it (2026-08-27); Bing 400s on any other string,
+    // same as everywhere else in this file. Not a sign the pull is misconfigured.
+    bing: "http://davidveksler.freecapitalists.org/" },
+  { host: "whopaysforai.org", gsc: "sc-domain:whopaysforai.org",
+    bing: "https://whopaysforai.org/" }, // confirmed live via getUserSites 2026-08-27
+  { host: "oneminute.freecapitalists.org", gsc: "https://oneminute.freecapitalists.org/",
+    bing: "https://oneminute.freecapitalists.org/" }, // confirmed live via getUserSites 2026-08-27
   // File-host subdomain (PDF/EPUB/MP3/MP4 payloads, no HTML pages), so the Web
   // Analytics RUM beacon never fires here. trafficSource: "zone" routes traffic
   // to Cloudflare's zone-level HTTP request log (httpRequestsAdaptiveGroups)
@@ -108,8 +141,13 @@ export const SITES = [
   // trafficSource and still queries Search Console; the property is live but has
   // returned no rows yet, so expect an empty search panel until it does.
   { host: "library.freecapitalists.org", trafficSource: "zone", zoneTag: "066e5342a1531be2638029c2f1dde5f6",
-    gsc: "sc-domain:library.freecapitalists.org" },
-  { host: "vellum.capital", gsc: "sc-domain:vellum.capital" },
+    gsc: "sc-domain:library.freecapitalists.org",
+    // Bing's pull is independent of trafficSource (it needs only a URL, not a
+    // Cloudflare RUM beacon), so a zone-sourced host is just as pullable as any
+    // other. Confirmed live via getUserSites 2026-08-27.
+    bing: "https://library.freecapitalists.org/" },
+  { host: "vellum.capital", gsc: "sc-domain:vellum.capital",
+    bing: "https://vellum.capital/" }, // confirmed live via getUserSites 2026-08-27
 ];
 
 // Discourse forums tracked for user login/activity stats — a separate pull

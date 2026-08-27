@@ -144,10 +144,30 @@ two would repeat the RUM/zone population-mismatch mistake documented above. Auth
 site verified under that Bing account — see `getUserSites` in `bing.js` for discovering the exact
 `Url` string a site is registered under (Bing 400s on anything else, the same intolerance GSC has
 for its `gsc` property). Which of `SITES` actually has a Bing Webmaster Tools property was discovered
-live with a real `BING_API_KEY` on 2026-08-26, not guessed from the `gsc` list — the two tools are
-verified independently, and 4 of the account's Bing-verified sites (liberty.me, tucker.liberty.me,
-theobjectivestandard.com, plus the still-unverified mises.org) have no `SITES` entry at all and were
-left untouched rather than folding "add Bing stats" into "start tracking new sites." **Runs as its
+live with a real `BING_API_KEY` on 2026-08-26 and re-synced 2026-08-27 (the account's verified list grew
+from 9 sites to 24 in that one day — **re-run `getUserSites` periodically rather than assuming the
+2026-08-27 list is final**), not guessed from the `gsc` list — the two tools are verified independently.
+17 `SITES` entries carry a `bing` property as of the 2026-08-27 sync, four of them (archive.
+freecapitalists.org, mises.freecapitalists.org, forum.freecapitalists.org, peikofflibrary.com) added as
+brand-new `SITES` rows that same day — **only because the search-console MCP's `list_sites` also showed
+a dedicated GSC property for that exact host**, not on Bing verification alone: adding a site to the
+dashboard is a bigger decision (traffic tracking, a card on the page) than adding one more data source
+to a site already tracked, so it needed both tools to agree before promoting anything. `mises.
+freecapitalists.org` is GSC- and Bing-verified as `http://`, not `https://`, on both — kept exactly as
+returned. `forum.freecapitalists.org` now has both a `SITES` row (traffic/search) and its pre-existing
+`FORUMS` row (Discourse login/activity) — independent pulls about the same host, not a conflict.
+Left deliberately untracked because Bing and GSC don't agree on the same exact host: `mises.org`
+(GSC-verified, Bing does not verify it), `quotes.freecapitalists.org` and `fee.org` (Bing-verified,
+no GSC property found for either), `liberty.me`/`tucker.liberty.me` (Bing-verified, no GSC property),
+and `theobjectivestandard.com` (Bing verifies the apex; GSC instead verifies a *different* host,
+`2020.theobjectivestandard.com` — the two tools cover different parts of that domain, so neither could
+be added without picking one arbitrarily). **`objectivismonline.com` exposes a real gap in the single-string `bing` field**: it is Bing-verified
+as its own URL-prefix property, separate from `forum.objectivismonline.com`'s, but that row's `bing`
+field can only hold one URL — unlike the GSC row above it, which covers both under one `sc-domain:`
+property. `objectivismonline.com`'s own Bing traffic is currently NOT pulled at all. Fixing that means
+teaching `bing` to hold multiple URLs and summing their stats (a real change to `src/bing.js`'s
+per-site call shape), which has not been done — this is a known, accepted gap, not an oversight to
+silently "fix" by guessing which URL matters more. **Runs as its
 own Worker invocation** (`runBingDaily`, its own cron and its own `/run-bing` endpoint — see Data
 flow above), not a second phase inside `runDaily`, specifically so its subrequests spend a fresh
 50/request budget instead of runDaily's, which the GSC pull already runs close to (see the
