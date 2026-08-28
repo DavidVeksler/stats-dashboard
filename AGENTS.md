@@ -428,7 +428,7 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   continuity; do not put it back on a tile.
 - **Crawlers are counted as humans by RUM, and we do NOT block them.** These sites opt into AI
   training (`Content-Signal: ai-train=yes`); the fix is measurement, not blocking. `src/bots.js`
-  classifies each *site-day* and sets aside "floods" (≥90% direct, ≤1.15 pages/session, ≥500
+  classifies each *site-day* and sets aside "floods" (≥90% direct, ≤3.0 pages/session, ≥500
   sessions, ≥3× a normal day). On a flooded day the direct bucket and the landing-page rows are
   set aside; referred sessions still count (see the next bullet). Excluded volume is always
   reported separately — never silently dropped. Two things to preserve:
@@ -437,6 +437,19 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   remain, the baseline falls back to the **25th percentile**, not the median — a median inside a
   sustained flood blesses the flood as normal, which is exactly how the Aug 2026
   forum.objectivismonline.com flood went unflagged for eight days.
+- **A flood's own shape can drift mid-event, and the pages/session cap has to have margin for
+  that.** `FLAT_PAGES_PER_SESSION` was 1.15 (tuned for the Aug 2026 floods, which were all
+  single-hit crawls) until forum.objectivismonline.com's flood — correctly flagged for 13 straight
+  days, 2026-08-15 through -27 — flipped back to `flood: false` on 2026-08-28 the moment the
+  crawler itself started requesting ~2 pages a visit instead of 1 (pagesPerSession ~1.0 → ~2.08),
+  even though the day was still ≥99.9% direct and ~10-26× the host's true baseline. One shape trait
+  drifting killed the whole AND'd signature and the entire day counted as human. Raised to 3.0 with
+  margin above that observed value — see the comment on the constant in `src/bots.js` for why this
+  cap is the least load-bearing of the three tests (direct share + volume already do most of the
+  discriminating; a real human spike essentially never arrives ≥90% direct at flood volume). If a
+  future flood's pages/session drifts past 3.0 too, re-measure from a live pull before raising it
+  again rather than guessing — and note that `likely-bot-subflood` in `src/signals.js` shares this
+  same constant, so widening it here also widens that rule's shape gate.
 - **The baseline window itself can run out of clean days, not just the fallback percentile.**
   Both percentile paths in `classifyTraffic` are computed over whatever window the caller reads —
   and by 2026-08-24 the forum.objectivismonline.com flood (started 2026-07-30, a true baseline of

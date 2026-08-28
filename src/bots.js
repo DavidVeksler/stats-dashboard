@@ -29,7 +29,18 @@ export const FLOOD_MULTIPLE = 3;       // ...and must be this many times a norma
 export const BASELINE_LOOKBACK_DAYS = 180;
 // Exported so the footer prose that explains these rules can interpolate them
 // rather than restate them as literals that drift out of sync with the code.
-export const FLAT_PAGES_PER_SESSION = 1.15;   // humans click through; crawlers hit one URL and leave
+// Was 1.15 (single-hit crawlers only) until forum.objectivismonline.com's
+// sustained flood — flagged correctly for 13 straight days (2026-08-15 through
+// -27) — shifted its own crawl pattern on 2026-08-28: pagesPerSession jumped
+// from ~1.0 to ~2.08 (still ≥99.9% direct, still ~10-26x the host's true
+// baseline) and slipped under the old cap, so the whole day flipped back to
+// "human" the moment the bot's own request shape changed mid-event. Raised
+// with margin above that observed value; direct share ≥ DIRECT_SHARE and
+// volume ≥ FLOOD_MIN_VISITS/FLOOD_MULTIPLE are what actually carry the
+// signal here — a real human traffic spike essentially never arrives ≥90%
+// direct at flood volume, so this cap only needs to separate "one hit and
+// gone" / "a couple of pages and gone" crawling from genuinely deep browsing.
+export const FLAT_PAGES_PER_SESSION = 3.0;
 export const DIRECT_SHARE = 0.9;              // crawlers send no referer
 // Minimum clean days (see directRatioStats) needed before a flooded day's direct
 // bucket gets a ratio estimate instead of the floor-only split. This gates on

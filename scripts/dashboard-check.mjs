@@ -1015,7 +1015,7 @@ for (const period of [7, 30]) {
     date: dayAfter("2026-06-20", i), visits: 700 + (i % 3) * 40,
   }));
   // 30 flood days filling the entire 30-day floor, including today: matches the
-  // flood signature (>=90% direct, <=1.15 pages/session) throughout, so the
+  // flood signature (>=90% direct, <=FLAT_PAGES_PER_SESSION pages/session) throughout, so the
   // narrow window has zero clean days to build a baseline from.
   const floodDays = Array.from({ length: 30 }, (_, i) => ({
     date: dayAfter("2026-07-11", i), visits: i === 29 ? 8000 : 20000,
