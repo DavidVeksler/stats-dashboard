@@ -237,9 +237,18 @@ function bytesLabel(n) {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${BYTE_UNITS[i]}`;
 }
 
+// Named by a heading above the block (same dot+label pattern the "Top
+// referrers"/"Search opportunities" panels use below), not by prefixing every
+// cell's own label: "Google clicks"/"Google impressions"/etc. was tried first
+// and overflowed its column in the 4-up grid ("GOOGLE IMPRESSIONS" collided
+// with "GOOGLE CTR" next to it) — `.search-summary span` is `white-space:
+// nowrap` (so a stat like "1,900" never wraps off its own label), and a
+// per-cell "Google " prefix pushed several labels past that width. One heading
+// says which engine for the whole block instead.
 function searchSummary(summary) {
   if (!summary) return "";
-  return `<div class="search-summary" aria-label="Google Search performance">
+  return `<h3 class="mini-h3"><span class="dot search"></span>Google Search</h3>
+  <div class="search-summary" aria-label="Google Search performance">
     <div><strong>${fmt(summary.clicks)}</strong><span>clicks</span></div>
     <div><strong>${fmt(summary.impressions)}</strong><span>impressions</span></div>
     <div><strong>${pct(summary.ctr, 1)}</strong><span>CTR</span></div>
@@ -251,15 +260,23 @@ function searchSummary(summary) {
 // all — only the per-query rows do, with two of them (see bingKeywordList) —
 // so this tile is three numbers, not four, rather than padding in a figure
 // Bing never reported. Never merged with searchSummary above: a different
-// search engine's audience, not a second measurement of the same one.
+// search engine's audience, not a second measurement of the same one. Same
+// heading-names-the-block pattern as searchSummary now, so the per-cell "Bing "
+// prefix is dropped too — the heading already says which engine, and repeating
+// it on every cell was the more cramped of the two ways to say the same thing
+// once searchSummary switched. The block no longer states its pull date
+// underneath either: that "Bing Webmaster Tools · 2026-08-25" caption was the
+// only one of the two panels naming a date, which read as a mismatch rather
+// than useful information — the heading is enough.
 function bingSummary(site) {
   const summary = site.bingSummary;
   if (!summary) return "";
-  return `<div class="search-summary bing" aria-label="Bing Search performance">
-    <div><strong>${fmt(summary.clicks)}</strong><span>Bing clicks</span></div>
-    <div><strong>${fmt(summary.impressions)}</strong><span>Bing impressions</span></div>
-    <div><strong>${pct(summary.ctr, 1)}</strong><span>Bing CTR</span></div>
-  </div>${site.bingWindow ? `<p class="bing-window">Bing Webmaster Tools · ${esc(site.bingWindow)}</p>` : ""}`;
+  return `<h3 class="mini-h3"><span class="dot bing"></span>Bing Search</h3>
+  <div class="search-summary bing" aria-label="Bing Search performance">
+    <div><strong>${fmt(summary.clicks)}</strong><span>clicks</span></div>
+    <div><strong>${fmt(summary.impressions)}</strong><span>impressions</span></div>
+    <div><strong>${pct(summary.ctr, 1)}</strong><span>CTR</span></div>
+  </div>`;
 }
 
 // Bing's own per-query rows, shown as reported rather than averaged into one
@@ -763,7 +780,7 @@ export function renderDashboard(data) {
     <div class="v tv-search" hidden>${fmt(searchTotal)}</div>
     <div class="v tv-referred" hidden>${fmt(referredTotal)}</div>
     <div class="s tv-all">${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}</div>
-    <div class="s tv-search" hidden><span>RUM sessions with a search-engine referrer — Google or Bing. A crawler doesn't fake this, so it holds up even on a flooded day. Not the same measurement as the Google clicks / search impressions tiles below: those are Search Console's own click counts on their own rolling, lagged window.</span></div>
+    <div class="s tv-search" hidden><span>RUM sessions with a search-engine referrer — any of them, not just Google and Bing. A crawler doesn't fake this, so it holds up even on a flooded day. Not the same measurement as the Google clicks / search impressions tiles below: those are Search Console's own click counts on their own rolling, lagged window.</span></div>
     <div class="s tv-referred" hidden><span>RUM sessions with any non-direct referrer (search, social, external link). Bots almost never carry one. Not the same measurement as the search tiles below, which come from Search Console's own click reporting.</span></div>
   </div>`;
   const stats = [
@@ -868,7 +885,7 @@ html[data-traffic-view=search] .source-segment:not(.search),html[data-traffic-vi
 .delta.small{background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);font-weight:650}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .big .spread{font-size:12px;font-weight:600;color:var(--faint);letter-spacing:normal;margin-left:3px;cursor:help}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}.dot.bing{background:var(--traffic)}
 .ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.tag.internal{background:color-mix(in srgb,var(--faint) 16%,transparent);color:var(--faint)}.tag.ai{background:color-mix(in srgb,var(--traffic) 18%,transparent);color:var(--traffic)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
-.search-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:color-mix(in srgb,var(--search-soft) 55%,transparent);border-radius:8px;padding:8px 10px}.search-summary>div{display:flex;flex-direction:column;min-width:0}.search-summary strong{font-size:13px;color:var(--search);line-height:1.2}.search-summary span{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);white-space:nowrap}.search-summary.bing{grid-template-columns:repeat(3,1fr);background:color-mix(in srgb,var(--traffic-soft) 55%,transparent);margin-top:-3px}.search-summary.bing strong{color:var(--traffic)}.bing-window{font-size:9.5px;color:var(--faint);margin:2px 0 0}.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.flagged{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px 6px;min-width:0;font-size:11.5px;flex-wrap:wrap}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name .truncate{flex:1 1 120px;min-width:70px}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none;cursor:help}.opportunity-tag.rank{color:var(--traffic);border-color:color-mix(in srgb,var(--traffic) 35%,transparent)}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
+.search-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:color-mix(in srgb,var(--search-soft) 55%,transparent);border-radius:8px;padding:8px 10px}.search-summary>div{display:flex;flex-direction:column;min-width:0}.search-summary strong{font-size:13px;color:var(--search);line-height:1.2}.search-summary span{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);white-space:nowrap}.search-summary.bing{grid-template-columns:repeat(3,1fr);background:color-mix(in srgb,var(--traffic-soft) 55%,transparent);margin-top:-3px}.search-summary.bing strong{color:var(--traffic)}.mini-h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 6px;display:flex;align-items:center;gap:6px;color:var(--muted)}.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.flagged{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px 6px;min-width:0;font-size:11.5px;flex-wrap:wrap}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name .truncate{flex:1 1 120px;min-width:70px}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none;cursor:help}.opportunity-tag.rank{color:var(--traffic);border-color:color-mix(in srgb,var(--traffic) 35%,transparent)}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
 footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:5px}footer b{color:var(--ink);font-weight:650}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media (max-width:940px){.grid{grid-template-columns:1fr}.card{max-width:760px;width:100%;margin-inline:auto}}
 @media (max-width:700px){.toolbar{align-items:stretch;flex-direction:column}.filters{display:grid;grid-template-columns:1fr 1fr auto}.field select{width:100%}.totals{grid-template-columns:repeat(2,1fr)}.source-legend{grid-template-columns:repeat(2,1fr)}}
