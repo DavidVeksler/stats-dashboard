@@ -491,15 +491,81 @@ function domainRuns(sites) {
 // The unit is spelled out on the heading because the total is the number the
 // group's position in the page is ranked by, and a zone group's total is not the
 // same quantity as a RUM group's.
+// Sessions with any non-direct referrer (search + social + referral + internal).
+// Not `visits - direct`, which would silently fold the unattributed residual in
+// as though it were known to carry a referrer — see the "Unattributed is a
+// residual" gotcha in AGENTS.md. Zero for zone-sourced hosts, which write no
+// daily_referrers rows at all (see the RUM/zone measurement-class split).
+const referredVisitsOf = (site) =>
+  Number(site.sources?.search || 0) + Number(site.sources?.social || 0) +
+  Number(site.sources?.referral || 0) + Number(site.sources?.internal || 0);
+
+// One heading, three renderings of its trailing count — all/search/referred —
+// toggled client-side (see the bottom-of-page script) by hiding all but one via
+// the `hidden` attribute. Only the RUM ("sessions") unit gets search/referred
+// variants: a zone group has no referrer dimension to break out (same reason
+// zoneCrawlerPanel never claims a human count for a zone host).
 function domainGrids(sites, allSites, periodDays, unit) {
+  const isRum = unit === "sessions";
   return domainRuns(sites).map((run) => {
     const id = `domain-${run.domain.replace(/[^a-z0-9]/gi, "-")}`;
     const total = run.sites.reduce((sum, site) => sum + (site.visits || 0), 0);
+    const countLabel = `${run.sites.length} site${run.sites.length === 1 ? "" : "s"}`;
+    const channelSpans = isRum ? (() => {
+      const totalSearch = run.sites.reduce((sum, site) => sum + Number(site.sources?.search || 0), 0);
+      const totalReferred = run.sites.reduce((sum, site) => sum + referredVisitsOf(site), 0);
+      return `<span class="tv-search" hidden>${countLabel} &middot; ${fmt(totalSearch)} search sessions</span>
+        <span class="tv-referred" hidden>${countLabel} &middot; ${fmt(totalReferred)} referred sessions</span>`;
+    })() : "";
     return `<section class="domain-group" aria-labelledby="${id}">
-      <h3 class="domain-heading" id="${id}">${esc(run.domain)}<span>${run.sites.length} site${run.sites.length === 1 ? "" : "s"} &middot; ${fmt(total)} ${unit}</span></h3>
+      <h3 class="domain-heading" id="${id}">${esc(run.domain)}<span class="tv-all">${countLabel} &middot; ${fmt(total)} ${unit}</span>${channelSpans}</h3>
       <div class="grid">${run.sites.map((site) => siteCard(site, allSites.indexOf(site), periodDays)).join("")}</div>
     </section>`;
   }).join("");
+}
+
+// Three renderings of the card's headline number block, only one visible at a
+// time (toggled client-side — see the bottom-of-page script and the
+// "Bot-resistant view" select in the toolbar). "all" is the existing figure,
+// unchanged. "search"/"referred" read straight off `site.sources`, which is
+// already the crawler-clean quantity: a flooded day's direct bucket is set
+// aside, but its referred/search rows survive (see splitDay/refRows in
+// index.js), so these two views need no separate bot-handling of their own —
+// that is the whole premise of the toggle (search clicks and real referrers are
+// not something a crawler fakes). Neither carries a delta badge or a
+// pages/session figure: no previous-period channel breakdown is stored, and
+// pageviews carry no referrer dimension to split by channel, so showing either
+// would fabricate a comparison the data does not support.
+function numsBlocks(site, periodLabel) {
+  const allBlock = `<div class="nums tv-all"><div class="big">${site.visits
+    ? `${site.partialDays ? (site.estimatedVisits ? "&sim;&nbsp;" : "&ge;&nbsp;") : ""}${fmt(site.visits)}`
+    : "—"}${site.estimatedVisits && site.spread ? `<span class="spread" title="Ratio estimate of the flooded day's direct bucket, plus or minus this margin — see the note below.">&plusmn;${fmt(site.spread)}</span>` : ""}</div><div class="lbl">${site.zoneSourced ? "zone visits" : "human sessions"} ${periodLabel}</div>
+    ${deltaBadge(site.delta, true, site.visits - site.previousVisits)}<div class="pv">${site.zoneSourced
+      ? `${fmt(site.views)} requests · ${bytesLabel(site.bytes)}`
+      : site.cleanDays
+        ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
+        : `pageviews not separable on flooded days`}</div></div>`;
+  if (site.zoneSourced) {
+    // Zone hosts write no daily_referrers rows at all (no referer dimension in
+    // the zone log), so there is no channel to break out — say so rather than
+    // rendering a confident zero. Kept to one short line: `.nums` is
+    // `white-space:nowrap` (see the CSS), so a longer sentence here would widen
+    // the box and squeeze the host name instead of wrapping — the fuller
+    // explanation lives in the KPI tile and footer instead.
+    const na = `<div class="big">—</div><div class="lbl">not tracked by referrer</div>
+      <div class="pv">No referrer dimension on this host.</div>`;
+    return `${allBlock}<div class="nums tv-search" hidden>${na}</div><div class="nums tv-referred" hidden>${na}</div>`;
+  }
+  // Short lines only — see the `.nums{white-space:nowrap}` note above; the "why"
+  // is explained once, in the KPI tile and the footer, not repeated per card.
+  const searchBlock = `<div class="nums tv-search" hidden><div class="big">${fmt(site.sources?.search)}</div>
+    <div class="lbl">search sessions ${periodLabel}</div>
+    <div class="pv">via Google/Bing</div></div>`;
+  const referred = referredVisitsOf(site);
+  const referredBlock = `<div class="nums tv-referred" hidden><div class="big">${fmt(referred)}</div>
+    <div class="lbl">referred sessions ${periodLabel}</div>
+    <div class="pv">any non-direct referrer</div></div>`;
+  return `${allBlock}${searchBlock}${referredBlock}`;
 }
 
 function siteCard(site, index, periodDays) {
@@ -517,14 +583,7 @@ function siteCard(site, index, periodDays) {
         <h2 class="host" id="${id}"><a href="https://${esc(site.host)}" target="_blank" rel="noopener">${esc(site.host)}</a></h2>
         ${sparkline(site.spark, site.host)}
       </div>
-      <div class="nums"><div class="big">${site.visits
-        ? `${site.partialDays ? (site.estimatedVisits ? "&sim;&nbsp;" : "&ge;&nbsp;") : ""}${fmt(site.visits)}`
-        : "—"}${site.estimatedVisits && site.spread ? `<span class="spread" title="Ratio estimate of the flooded day's direct bucket, plus or minus this margin — see the note below.">&plusmn;${fmt(site.spread)}</span>` : ""}</div><div class="lbl">${site.zoneSourced ? "zone visits" : "human sessions"} ${periodLabel}</div>
-        ${deltaBadge(site.delta, true, site.visits - site.previousVisits)}<div class="pv">${site.zoneSourced
-          ? `${fmt(site.views)} requests · ${bytesLabel(site.bytes)}`
-          : site.cleanDays
-            ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
-            : `pageviews not separable on flooded days`}</div></div>
+      ${numsBlocks(site, periodLabel)}
     </div>
     ${site.zoneSourced ? `<p class="zone-row" role="note">Counted from zone HTTP request logs (no RUM tag on this site).
       Requests include crawlers, assets, and robots.txt, so this is not comparable to the session counts above.</p>` : ""}
@@ -662,8 +721,26 @@ export function renderDashboard(data) {
   const domainSplit = zoneDomains
     ? `${rumDomains} RUM + ${zoneDomains} zone · ${totals.active} with traffic`
     : `${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${totals.active} with traffic`;
+  // The "Human sessions" tile gets three renderings — all/search/referred — same
+  // client-side toggle as the site cards and domain headings (see numsBlocks and
+  // the bottom-of-page script). `totals.sourceMix` is already RUM-only and
+  // already crawler-clean (see the "Two measurement classes" and flood-splitting
+  // notes in AGENTS.md), so no new aggregate is computed here — just read back.
+  // Neither channel view carries a delta or 14-day mean: no previous-period
+  // channel breakdown is stored, so showing one would fabricate a comparator.
+  const searchTotal = Number(totals.sourceMix?.search || 0);
+  const referredTotal = ["search", "social", "referral", "internal"]
+    .reduce((sum, key) => sum + Number(totals.sourceMix?.[key] || 0), 0);
+  const sessionsTile = `<div class="stat">
+    <div class="k">Human sessions</div>
+    <div class="v tv-all">${fmt(totals.visits)}</div>
+    <div class="v tv-search" hidden>${fmt(searchTotal)}</div>
+    <div class="v tv-referred" hidden>${fmt(referredTotal)}</div>
+    <div class="s tv-all">${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}</div>
+    <div class="s tv-search" hidden><span>Sessions with a search-engine referrer — Google or Bing. A crawler doesn't fake this, so it holds up even on a flooded day.</span></div>
+    <div class="s tv-referred" hidden><span>Sessions with any non-direct referrer (search, social, external link). Bots almost never carry one.</span></div>
+  </div>`;
   const stats = [
-    ["Human sessions", fmt(totals.visits), `${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}`],
     ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>${meanNote(totals.views, trend.viewsPerDay, totals.daysAvailable, data.periodDays)}`],
     ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>${meanNote(totals.search, trend.searchPerDay, totals.daysAvailable, data.periodDays)}`],
     [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${domainSplit}</span>`],
@@ -758,6 +835,7 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line)}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.internal,.source-legend i.internal{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.source-note{margin:10px 0 0;padding-top:9px;border-top:1px dashed var(--line);font-size:10.5px;line-height:1.5;color:var(--faint)}.source-note b{color:var(--muted);font-weight:650}
+html[data-traffic-view=search] .source-segment:not(.search),html[data-traffic-view=search] .source-legend>div:not(:has(i.search)){opacity:.32}html[data-traffic-view=referred] .source-segment.direct,html[data-traffic-view=referred] .source-legend>div:has(i.direct){opacity:.32}
 .cmp{display:inline-flex;align-items:center;font-size:10px;font-weight:650;border-radius:999px;padding:2px 6px;background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);white-space:nowrap;text-decoration:none}a.cmp:hover{color:var(--ink)}
 .insights{margin:0 0 18px}.insights>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;list-style:none;padding:2px 2px 11px;font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.insights>summary::-webkit-details-marker{display:none}.insights>summary::before{content:"▾";font-size:9px;margin-right:7px;color:var(--faint)}.insights:not([open])>summary::before{content:"▸"}.insights:not([open])>summary{padding-bottom:2px}.insights-label{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.insights-count{font-size:10px;text-transform:none;letter-spacing:0;font-weight:650;color:var(--muted);background:color-mix(in srgb,var(--line) 70%,transparent);border-radius:999px;padding:2px 8px}.insights-body{display:flex;flex-direction:column;gap:12px}.insights>summary .summary-action{text-transform:none;letter-spacing:0;font-weight:650;font-size:11.5px;color:var(--traffic)}
 .actions{margin:0}.action-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}.action{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);border-radius:var(--radius);box-shadow:var(--shadow);padding:11px 14px;font-size:12px;line-height:1.5;color:var(--muted)}.action.sev1{border-left-color:var(--danger)}.action.sev2{border-left-color:var(--search)}.action-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:3px}.action-head b{color:var(--ink);font-weight:650;font-size:13px}.sev-tag{font-size:8.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;border-radius:4px;padding:2px 5px;background:var(--line);color:var(--muted);flex:none}.action.sev1 .sev-tag{background:var(--danger-soft);color:var(--danger)}.action.sev2 .sev-tag{background:var(--search-soft);color:var(--search)}.sev-run{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;color:var(--faint)}.action-why{color:var(--muted)}.action-do{margin-top:4px;color:var(--ink)}.action-do a{color:var(--traffic);font-weight:650;text-decoration:none;white-space:nowrap}.action-do a:hover{text-decoration:underline}.action-none{margin:0;padding:11px 14px;background:var(--card);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:var(--radius);box-shadow:var(--shadow);font-size:12px;color:var(--muted)}
@@ -770,6 +848,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
 @media (max-width:700px){.toolbar{align-items:stretch;flex-direction:column}.filters{display:grid;grid-template-columns:1fr 1fr auto}.field select{width:100%}.totals{grid-template-columns:repeat(2,1fr)}.source-legend{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:560px){.wrap{padding:calc(20px + env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) calc(44px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left))}header.top{flex-direction:column;align-items:flex-start;gap:10px;padding-bottom:16px}.win{text-align:left;width:100%;font-size:12px;line-height:1.7}h1{font-size:25px;line-height:1.15}.toolbar{margin:14px 0 16px}.periods{width:100%;padding:3px}.periods a{flex:1;display:flex;align-items:center;justify-content:center;min-height:44px;text-align:center;font-size:13px}.filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 8px}.field{gap:5px}.field label{font-size:10px}.field select,.theme{min-height:44px;height:44px;font-size:16px}.theme{grid-column:1/-1;width:100%}.totals{gap:8px;margin-bottom:14px}.stat{padding:13px 13px}.stat .k{font-size:10px;line-height:1.3}.stat .v{font-size:27px}.stat .s{font-size:12px}.source-overview{padding:14px;margin-bottom:14px}.source-heading span{font-size:11px}.source-legend{gap:10px 14px}.source-legend>div{font-size:12px}.source-legend strong{font-size:12px}.source-legend small{font-size:10px}.actions{margin-bottom:14px}.action,.action-none{font-size:12.5px;padding:12px 13px}.action-head b{font-size:13.5px}.action-do a{display:inline-block;min-height:32px;line-height:32px}.card{padding:16px 15px 17px;gap:12px}.chead{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px 12px}.hostwrap{display:contents}.host{grid-column:1/-1;font-size:16px;overflow-wrap:anywhere;word-break:normal}.spark,.spark-empty{grid-column:1;grid-row:2}.spark{width:132px}.nums{grid-column:2;grid-row:2;max-width:150px}.nums .big{font-size:25px}.nums .lbl{font-size:10px}.nums .pv{font-size:11px;white-space:normal}.search-summary{padding:10px}.search-summary strong{font-size:14px}.search-summary span{font-size:9px}.detail{border-top:1px solid var(--line);padding-top:0}.detail>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:44px;padding:8px 0;cursor:pointer;font-size:12px;color:var(--muted);line-height:1.35;list-style:none}.detail>summary::-webkit-details-marker{display:none}.summary-action{color:var(--traffic);font-weight:700;white-space:nowrap}.detail[open]>summary{margin-bottom:10px}.cols{grid-template-columns:1fr;gap:18px}.panel h3{font-size:10.5px}.pages-list{grid-template-columns:1fr}.pages-panel{margin-top:17px}.ref .row{min-height:36px;align-items:center;font-size:13px}.tag{font-size:9px}.metric-row{min-height:40px;align-items:center;padding-top:5px;padding-bottom:7px}.metric-name{font-size:13px}.metric-values strong{font-size:12px}.metric-values span{font-size:10px}.none{font-size:12px}footer{font-size:12px;line-height:1.55}}
 @media (max-width:360px){.wrap{padding-inline:12px}.totals{gap:7px}.stat{padding:12px 11px}.stat .v{font-size:25px}.source-legend{grid-template-columns:1fr}.search-summary{grid-template-columns:repeat(2,1fr);gap:10px 8px}}
+[hidden]{display:none!important}
 </style></head><body>
 <a class="skip" href="#main">Skip to dashboard</a>
 <div class="wrap">
@@ -790,12 +869,14 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div class="filters">
       <div class="field"><label for="domain-filter">Domain</label><select id="domain-filter" data-query="domain"><option value="">All domains</option>${data.allDomains.map((host) => `<option value="${esc(host)}" ${data.domain === host ? "selected" : ""}>${esc(host)}</option>`).join("")}</select></div>
       <div class="field"><label for="sort-filter">Sort</label><select id="sort-filter" data-query="sort"><option value="traffic" ${data.sort === "traffic" ? "selected" : ""}>Traffic</option><option value="change" ${data.sort === "change" ? "selected" : ""}>Biggest gain</option><option value="name" ${data.sort === "name" ? "selected" : ""}>Domain name</option></select></div>
+      <div class="field"><label for="traffic-view">Bot-resistant view</label><select id="traffic-view" title="Switch the numbers shown to a traffic slice a crawler can't fake — instant, no reload. Card order stays ranked by total traffic."><option value="all">All traffic</option><option value="search">Search traffic only</option><option value="referred">Referred traffic only</option></select></div>
       <button class="theme" id="theme-toggle" type="button" aria-label="Change color theme">◐ Theme</button>
     </div>
   </nav>
   <main id="main">
     ${insightsPanel(data.signals, totals, data.sites)}
     <section class="totals" aria-labelledby="overview-heading"><h2 class="sr-only" id="overview-heading">Traffic overview</h2>
+      ${sessionsTile}
       ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
     </section>
     ${sourceMix(totals)}
@@ -811,6 +892,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div><b>Cards are grouped by domain.</b> Every host of a registrable domain (freecapitalists.org covers wiki., forum., library. and the apex) sits in one block, blocks are ordered by that domain's own total, and hosts are ordered by theirs inside it — the same metric at both levels, so the sort control moves them together. Grouping happens within a measurement class, never across one: a domain with both a RUM host and a zone-log host appears in both sections, ranked against its own class each time, because sessions and HTTP requests are not the same quantity.</div>
     <div><b>Traffic sources</b> covers RUM sites only, and <b>Unattributed is a residual, not a channel</b>: it is the arithmetic gap between the sessions the traffic table counted and the referrer rows the referrer table stored, so it sits outside the mix bar with its causes named rather than competing with Direct and Search. <b>Internal</b> is sessions arriving from one of a site's own hostnames — an apex landing page handing off to the forum, say. Those were dropped rather than stored and reappeared inside the residual; they are recorded from 2026-08-13 forward. The channel is frozen into each stored row at write time, so it cannot be backfilled: over a window that reaches back before that date the channel is simply absent rather than shown as a measured zero.</div>
     <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count. For a site with at least ${RATIO_MIN_CLEAN_DAYS} clean days on record, the direct bucket is also given a ratio estimate — that site's own typical direct-to-referred split on ordinary days — and shown as "~" with its own margin; otherwise the day's sessions read as a floor (≥) rather than a count. Either way, pages/session divides by clean sessions only, and a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
+    <div><b>Bot-resistant view</b> (toolbar) switches every card, domain heading, and the Human sessions tile to a slice of RUM traffic a crawler is structurally unlikely to fake: <b>Search traffic only</b> is sessions that arrived from a Google/Bing results click, and <b>Referred traffic only</b> is any non-direct referrer (search, social, or an external link) — a crawler arrives without a referer, so both are already the crawler-clean part of the numbers above, flooded days included. It is instant and client-side, so it never re-sorts the cards (still ranked by total traffic) and carries no delta or 14-day mean, because no previous-period channel breakdown is stored to compare against. Zone-log hosts have no referrer dimension and show "not tracked by referrer" in both views.</div>
     <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. Flooded days are called out as "no like-for-like comparison" rather than quietly dropping off the list.</div>
     <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows. <b>Median search position</b> is the median across queries with at least ${fmt(POSITION_MIN_IMPRESSIONS)} impressions, not a mean: a mean across a branded position-1 query and a position-90 stray moves when the junk moves and stays put when the work lands. <b>Two populations, never mixed:</b> the <b>Search CTR</b> headline is every query on every property, tail included, but expected CTR needs a per-query position and the only per-query rows stored are the top queries Google returns per site. So the CTR comparison states both of its sides over those stored rows and reports what share of impressions they cover, and the position tile counts stored top queries rather than the whole estate. Comparing a top-query expectation against a whole-corpus actual made a roughly 6× gap read as 15×. <b>GSC figures are a rolling window, not a daily series</b> — each nightly snapshot asks Google for a three-day window that lags two days, so consecutive snapshots overlap by two days out of three; only trailing averages are taken from them, a snapshot-over-snapshot difference is never presented as a change, and every date shown here is the window Google measured rather than the night we asked.</div>
     <div><b>Forum activity</b> is read from each Discourse forum's own <code>/about.json</code>, the same rolling-window counters its admin dashboard shows (active users today / 7 days / 30 days, new signups on the same three windows) — not re-derived from the paginated admin user list. These are Discourse's own counts, not this dashboard's; no comparator or crawler-flood logic applies to them.</div>
@@ -855,6 +937,28 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     detail.addEventListener("toggle", update);
     update();
   });
+  // Bot-resistant traffic view: instant, client-side, no reload — every number
+  // it needs (site.sources, totals.sourceMix) is already in the rendered page.
+  // Only one of .tv-all/.tv-search/.tv-referred is ever unhidden at a time, on
+  // every element that carries the three variants (site cards, domain headings,
+  // the Human sessions tile); card order is left alone (still ranked by total
+  // traffic), and the source-mix bar just dims the channels the view excludes.
+  var trafficSelect = document.getElementById("traffic-view");
+  var applyTrafficView = function (view) {
+    ["all", "search", "referred"].forEach(function (name) {
+      document.querySelectorAll(".tv-" + name).forEach(function (el) { el.hidden = name !== view; });
+    });
+    document.documentElement.dataset.trafficView = view;
+  };
+  if (trafficSelect) {
+    var savedView = "all";
+    try { savedView = localStorage.getItem("stats-traffic-view") || "all"; } catch (_) {}
+    if (savedView !== "all") { trafficSelect.value = savedView; applyTrafficView(savedView); }
+    trafficSelect.addEventListener("change", function () {
+      try { localStorage.setItem("stats-traffic-view", trafficSelect.value); } catch (_) {}
+      applyTrafficView(trafficSelect.value);
+    });
+  }
 })();
 </script>
 </body></html>`;

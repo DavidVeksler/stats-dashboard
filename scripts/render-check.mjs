@@ -119,6 +119,9 @@ const fixture = {
         // channel — see the AI_ANSWER_ENGINES note in config.js.
         { referrer: "chatgpt.com", kind: "ai", visits: 55 },
       ],
+      // Matches the referrers above (ai folds into referral, same as
+      // summarizeSources in index.js): 700+250+80+55 = 1085 attributed of 1100.
+      sources: { direct: 700, search: 250, social: 80, referral: 55, internal: 0, unattributed: 15 },
       // One of each class plus one query that is already performing at its
       // position. Every badge must say which of the two problems it is: "rewrite
       // the title" and "the page ranks too deep to be seen" are not the same
@@ -158,6 +161,7 @@ const fixture = {
       pagesPerSession: 1.35, previousPagesPerSession: 1.3, pagesPerSessionDelta: .05,
       searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
       gscWindow: null, referrers: [], keywords: [], pages: [], cfPages: [],
+      sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 200 },
       spark: [{ date: "2026-07-15", visits: 25 }, { date: "2026-07-16", visits: 30 }],
     },
     // The sub-flood shape: 151 sessions from 54, flat, almost all direct, almost
@@ -170,6 +174,7 @@ const fixture = {
       pagesPerSession: 1, previousPagesPerSession: 1.4, pagesPerSessionDelta: -.4,
       searchSummary: null, gscWindow: null,
       referrers: [{ referrer: "(direct)", kind: "direct", visits: 136 }],
+      sources: { direct: 136, search: 0, social: 0, referral: 0, internal: 0, unattributed: 15 },
       keywords: [], pages: [],
       cfPages: [{ page: "/wiki/Main_Page", visits: 134, views: 134 },
         { page: "/sitemap.xml.gz", visits: 10, views: 10 }],
@@ -186,6 +191,7 @@ const fixture = {
       pagesPerSession: 2.05, previousPagesPerSession: 2, pagesPerSessionDelta: .05,
       searchSummary: null, gscWindow: null,
       referrers: [], keywords: [], pages: [], cfPages: [],
+      sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 40 },
       spark: [{ date: "2026-07-15", visits: 27 }, { date: "2026-07-16", visits: 40 }],
     },
     // The freecapitalists.org case: every day in view was flooded, so there is no
@@ -202,6 +208,9 @@ const fixture = {
       searchSummary: { clicks: 3, impressions: 100, ctr: .03, position: 39.8 },
       gscWindow: "2026-07-12–2026-07-14",
       referrers: [{ referrer: "www.google.com", kind: "search", visits: 17 }],
+      // estimatedDirect (13) is credited into direct here, same as
+      // summarizeSources does in index.js — see the comment on that param.
+      sources: { direct: 13, search: 17, social: 0, referral: 0, internal: 0, unattributed: 0 },
       keywords: [], pages: [], cfPages: [],
       spark: [{ date: "2026-07-15", visits: 24, flood: false }, { date: "2026-07-16", visits: 1689, flood: true }],
     },
@@ -388,8 +397,8 @@ const required = [
   // Cards are grouped under a heading naming the registrable domain and the
   // group's total in its own class's unit — a subdomain heads up under its
   // domain, not its own host, and a zone group counts zone visits, not sessions.
-  `id="domain-freecapitalists-org">freecapitalists.org<span>1 site &middot; 200 sessions`,
-  `id="domain-library-example">library.example<span>1 site &middot; 1,059 zone visits`,
+  `id="domain-freecapitalists-org">freecapitalists.org<span class="tv-all">1 site &middot; 200 sessions`,
+  `id="domain-library-example">library.example<span class="tv-all">1 site &middot; 1,059 zone visits`,
   "Cards are grouped by domain.",
   "Forum activity (Discourse)", "Example Forum",
   "https://forum.example/admin/users/list/active",
