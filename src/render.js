@@ -75,7 +75,7 @@ function actionsBlock(signals) {
       </li>`).join("")}</ol>`
     : `<p class="action-none">Nothing needs attention today.</p>`;
   return `<section class="actions" aria-labelledby="actions-heading">
-    <h2 class="section-heading" id="actions-heading">Today's actions</h2>
+    <h2 class="section-heading" id="actions-heading"><span class="dot danger" aria-hidden="true"></span>Today's actions</h2>
     ${body}
   </section>`;
 }
@@ -338,7 +338,7 @@ function sourceMix(totals) {
           ? "" : "; and sessions from a site's own alias hostnames were dropped rather than stored as an <i>internal</i> referral on days before that channel existed"}.</p>`
     : `<p class="source-note">Every measured session in this period is attributed to a channel.</p>`;
   return `<section class="source-overview" aria-labelledby="source-heading">
-    <div class="source-heading"><h2 id="source-heading">Traffic sources (RUM sites only)</h2><span>selected traffic period</span></div>
+    <div class="source-heading"><h2 id="source-heading"><span class="dot traffic" aria-hidden="true"></span>Traffic sources (RUM sites only)</h2><span>selected traffic period</span></div>
     <div class="source-bar" role="img" aria-label="Traffic source mix">${segments}</div>
     <div class="source-legend">${channels.map((channel) => `<div><i class="${channel.key}"></i><span>${esc(channel.label)}</span><strong>${fmt(channel.value)}</strong><small>${pct(channel.value / total, 1)}</small></div>`).join("")}</div>
     ${note}
@@ -522,10 +522,20 @@ const referredVisitsOf = (site) =>
 // the `hidden` attribute. Only the RUM ("sessions") unit gets search/referred
 // variants: a zone group has no referrer dimension to break out (same reason
 // zoneCrawlerPanel never claims a human count for a zone host).
+//
+// Each group is a native <details>, so collapsing it costs nothing extra: the
+// heading — countLabel and total included — is the <summary> and so stays
+// visible when closed, which is already "a single total sessions number" with
+// no separate collapsed rendering to keep in sync. `data-domain-key` is
+// `unit:domain` rather than the `id` above, because `id` is derived from the
+// domain name alone and a domain with both a RUM host and a zone-log host
+// would otherwise collide between the two sections; the bottom-of-page script
+// persists open/closed state per key and the collapse-all toggle reads it too.
 function domainGrids(sites, allSites, periodDays, unit) {
   const isRum = unit === "sessions";
   return domainRuns(sites).map((run) => {
     const id = `domain-${run.domain.replace(/[^a-z0-9]/gi, "-")}`;
+    const key = `${unit}:${run.domain}`;
     const total = run.sites.reduce((sum, site) => sum + (site.visits || 0), 0);
     const countLabel = `${run.sites.length} site${run.sites.length === 1 ? "" : "s"}`;
     const channelSpans = isRum ? (() => {
@@ -536,10 +546,10 @@ function domainGrids(sites, allSites, periodDays, unit) {
       return `<span class="tv-search" hidden>${countLabel} &middot; ${fmt(totalSearch)} search-referred sessions</span>
         <span class="tv-referred" hidden>${countLabel} &middot; ${fmt(totalReferred)} non-direct sessions</span>`;
     })() : "";
-    return `<section class="domain-group" aria-labelledby="${id}">
-      <h3 class="domain-heading" id="${id}">${esc(run.domain)}<span class="tv-all">${countLabel} &middot; ${fmt(total)} ${unit}</span>${channelSpans}</h3>
+    return `<details class="domain-group" data-domain-group data-domain-key="${esc(key)}" open>
+      <summary class="domain-heading" id="${id}">${esc(run.domain)}<span class="tv-all">${countLabel} &middot; ${fmt(total)} ${unit}</span>${channelSpans}</summary>
       <div class="grid">${run.sites.map((site) => siteCard(site, allSites.indexOf(site), periodDays)).join("")}</div>
-    </section>`;
+    </details>`;
   }).join("");
 }
 
@@ -694,7 +704,7 @@ function forumCard(f) {
 function forumSection(forums) {
   if (!forums?.length) return "";
   return `<section class="zone-section" aria-labelledby="forum-section-heading">
-    <h2 class="section-heading" id="forum-section-heading">Forum activity (Discourse)</h2>
+    <h2 class="section-heading" id="forum-section-heading"><span class="dot good" aria-hidden="true"></span>Forum activity (Discourse)</h2>
     <div class="grid">${forums.map(forumCard).join("")}</div>
   </section>`;
 }
@@ -773,9 +783,9 @@ export function renderDashboard(data) {
   // mixed" trap as numsBlocks above, just at the page level instead of the card
   // level.
   const sessionsTile = `<div class="stat">
-    <div class="k tv-all">Human sessions</div>
-    <div class="k tv-search" hidden>Search-referred sessions</div>
-    <div class="k tv-referred" hidden>Non-direct sessions</div>
+    <div class="k tv-all"><span class="dot traffic" aria-hidden="true"></span>Human sessions</div>
+    <div class="k tv-search" hidden><span class="dot search" aria-hidden="true"></span>Search-referred sessions</div>
+    <div class="k tv-referred" hidden><span class="dot social" aria-hidden="true"></span>Non-direct sessions</div>
     <div class="v tv-all">${fmt(totals.visits)}</div>
     <div class="v tv-search" hidden>${fmt(searchTotal)}</div>
     <div class="v tv-referred" hidden>${fmt(referredTotal)}</div>
@@ -783,10 +793,14 @@ export function renderDashboard(data) {
     <div class="s tv-search" hidden><span>RUM sessions with a search-engine referrer — any of them, not just Google and Bing. A crawler doesn't fake this, so it holds up even on a flooded day. Not the same measurement as the Google clicks / search impressions tiles below: those are Search Console's own click counts on their own rolling, lagged window.</span></div>
     <div class="s tv-referred" hidden><span>RUM sessions with any non-direct referrer (search, social, external link). Bots almost never carry one. Not the same measurement as the search tiles below, which come from Search Console's own click reporting.</span></div>
   </div>`;
+  // Fourth tuple item is the color of the small `.dot` icon rendered beside the
+  // label — traffic (blue) for volume tiles, search (amber) for anything pulled
+  // from GSC, good (green) for coverage/health — so the row can be scanned by
+  // color alone before reading a single label.
   const stats = [
-    ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>${meanNote(totals.views, trend.viewsPerDay, totals.daysAvailable, data.periodDays)}`],
-    ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>${meanNote(totals.search, trend.searchPerDay, totals.daysAvailable, data.periodDays)}`],
-    [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${domainSplit}</span>`],
+    ["Total pageviews", fmt(totals.views), `<span>${pagesPerSession.toFixed(1)} pages / session · RUM only</span>${meanNote(totals.views, trend.viewsPerDay, totals.daysAvailable, data.periodDays)}`, "traffic"],
+    ["Search sessions", fmt(totals.search), `<span>${pct(totals.searchShare, 1)} of all sessions</span>${meanNote(totals.search, trend.searchPerDay, totals.daysAvailable, data.periodDays)}`, "search"],
+    [data.domain ? "Domain selected" : "Domains shown", totals.domains, `<span>${domainSplit}</span>`, "good"],
   ];
   if (totals.searchDataDomains) {
     // Every GSC figure is a rolling three-day window that lags two days, and
@@ -824,14 +838,14 @@ export function renderDashboard(data) {
       ? `<a class="cmp" href="#${cardAnchor(opportunityHost ?? "")}" title="Ranked by lost clicks for snippet gaps and by potential clicks at position ${TARGET_POSITION} for ranking gaps — two classes, two remedies, two metrics.">${fmt(totals.snippetOpportunities ?? 0)} snippet · ${fmt(totals.rankOpportunities ?? 0)} rank</a>`
       : "";
     stats.push(
-      ["Google clicks", fmt(totals.gscClicks), `<span>${esc(gscWindow)} · rolling GSC window</span>${gscMean(trend.gscClicksPerSnapshot)}`],
-      ["Search impressions", fmt(totals.gscImpressions), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}</span>${gscMean(trend.gscImpressionsPerSnapshot)}`],
-      ["Search CTR", pct(totals.gscCtr, 1), `${expected}${trend.gscSnapshots > 1 ? cmp(`14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : ""}`],
+      ["Google clicks", fmt(totals.gscClicks), `<span>${esc(gscWindow)} · rolling GSC window</span>${gscMean(trend.gscClicksPerSnapshot)}`, "search"],
+      ["Search impressions", fmt(totals.gscImpressions), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}</span>${gscMean(trend.gscImpressionsPerSnapshot)}`, "search"],
+      ["Search CTR", pct(totals.gscCtr, 1), `${expected}${trend.gscSnapshots > 1 ? cmp(`14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : ""}`, "search"],
       ["Median search position", totals.gscMedianPosition ? totals.gscMedianPosition.toFixed(1) : "—",
         // "7 of 11 queries" read as though the estate had 11 queries; it is 11
         // STORED rows clearing the impression floor, out of a corpus of tens of
         // thousands of impressions. Name the population.
-        `<span>${fmt(totals.gscTop10Queries ?? 0)} of ${fmt(totals.gscPositionQueries ?? 0)} stored top queries in the top 10</span>${opportunityNote}`],
+        `<span>${fmt(totals.gscTop10Queries ?? 0)} of ${fmt(totals.gscPositionQueries ?? 0)} stored top queries in the top 10</span>${opportunityNote}`, "search"],
     );
   }
 
@@ -875,7 +889,7 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
 .spark-flood{fill:var(--paper);stroke:var(--social);stroke-width:1.6}
 .zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
-.zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line)}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
+.zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line);cursor:pointer;list-style:none}.domain-heading::-webkit-details-marker{display:none}.domain-heading::before{content:"▾";font-size:9px;color:var(--faint)}.domain-group:not([open])>.domain-heading::before{content:"▸"}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.internal,.source-legend i.internal{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.source-note{margin:10px 0 0;padding-top:9px;border-top:1px dashed var(--line);font-size:10.5px;line-height:1.5;color:var(--faint)}.source-note b{color:var(--muted);font-weight:650}
 html[data-traffic-view=search] .source-segment:not(.search),html[data-traffic-view=search] .source-legend>div:not(:has(i.search)){opacity:.32}html[data-traffic-view=referred] .source-segment.direct,html[data-traffic-view=referred] .source-legend>div:has(i.direct){opacity:.32}
@@ -883,7 +897,8 @@ html[data-traffic-view=search] .source-segment:not(.search),html[data-traffic-vi
 .insights{margin:0 0 18px}.insights>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;list-style:none;padding:2px 2px 11px;font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.insights>summary::-webkit-details-marker{display:none}.insights>summary::before{content:"▾";font-size:9px;margin-right:7px;color:var(--faint)}.insights:not([open])>summary::before{content:"▸"}.insights:not([open])>summary{padding-bottom:2px}.insights-label{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.insights-count{font-size:10px;text-transform:none;letter-spacing:0;font-weight:650;color:var(--muted);background:color-mix(in srgb,var(--line) 70%,transparent);border-radius:999px;padding:2px 8px}.insights-body{display:flex;flex-direction:column;gap:12px}.insights>summary .summary-action{text-transform:none;letter-spacing:0;font-weight:650;font-size:11.5px;color:var(--traffic)}
 .actions{margin:0}.action-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}.action{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);border-radius:var(--radius);box-shadow:var(--shadow);padding:11px 14px;font-size:12px;line-height:1.5;color:var(--muted)}.action.sev1{border-left-color:var(--danger)}.action.sev2{border-left-color:var(--search)}.action-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:3px}.action-head b{color:var(--ink);font-weight:650;font-size:13px}.sev-tag{font-size:8.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;border-radius:4px;padding:2px 5px;background:var(--line);color:var(--muted);flex:none}.action.sev1 .sev-tag{background:var(--danger-soft);color:var(--danger)}.action.sev2 .sev-tag{background:var(--search-soft);color:var(--search)}.sev-run{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;color:var(--faint)}.action-why{color:var(--muted)}.action-do{margin-top:4px;color:var(--ink)}.action-do a{color:var(--traffic);font-weight:650;text-decoration:none;white-space:nowrap}.action-do a:hover{text-decoration:underline}.action-none{margin:0;padding:11px 14px;background:var(--card);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:var(--radius);box-shadow:var(--shadow);font-size:12px;color:var(--muted)}
 .delta.small{background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);font-weight:650}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .big .spread{font-size:12px;font-weight:600;color:var(--faint);letter-spacing:normal;margin-left:3px;cursor:help}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}.dot.bing{background:var(--traffic)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px 20px;display:flex;flex-direction:column;gap:13px;min-width:0}.card.empty{opacity:.68}.chead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.hostwrap{display:flex;flex-direction:column;gap:6px;min-width:0}.host{font-size:15px;font-weight:700;letter-spacing:-.01em;word-break:break-word;margin:0}.host a{text-decoration:none}.host a:hover{text-decoration:underline}.spark{display:block;max-width:100%;height:auto}.spark-hit{fill:transparent;stroke:none}.spark-empty{font-size:10px;color:var(--faint);font-style:italic}.nums{text-align:right;white-space:nowrap}.nums .big{font-size:25px;font-weight:700;letter-spacing:-.035em}.nums .big .spread{font-size:12px;font-weight:600;color:var(--faint);letter-spacing:normal;margin-left:3px;cursor:help}.nums .lbl{font-size:9px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin-bottom:4px}.nums .pv{font-size:11px;color:var(--muted);margin-top:4px}.detail>summary{display:none}.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.panel{min-width:0}.panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 8px;display:flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block}.dot.traffic{background:var(--traffic)}.dot.search{background:var(--search)}.dot.good{background:var(--good)}.dot.bing{background:var(--traffic)}.dot.social{background:var(--social)}.dot.danger{background:var(--danger)}.dot.faint{background:var(--faint)}
+.k .dot,.section-heading .dot,.source-heading h2 .dot{margin-right:6px;vertical-align:1px}
 .ref-list,.metric-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}.ref{position:relative}.ref .bar{position:absolute;inset:0 auto 0 0;background:var(--traffic-soft);border-radius:5px;z-index:0}.ref.direct-row .bar{background:color-mix(in srgb,var(--direct) 14%,transparent)}.ref .row{position:relative;z-index:1;display:flex;justify-content:space-between;gap:8px;padding:4px 7px;font-size:12px}.ref .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ref .n{font-weight:650;color:var(--muted)}.tag{font-size:8px;text-transform:uppercase;letter-spacing:.06em;padding:1px 4px;border-radius:4px;font-weight:700;margin-left:5px}.tag.search{background:var(--search-soft);color:var(--search)}.tag.direct{background:color-mix(in srgb,var(--direct) 16%,transparent);color:var(--direct)}.tag.social{background:color-mix(in srgb,var(--social) 18%,transparent);color:var(--social)}.tag.ref{background:var(--good-soft);color:var(--good)}.tag.internal{background:color-mix(in srgb,var(--faint) 16%,transparent);color:var(--faint)}.tag.ai{background:color-mix(in srgb,var(--traffic) 18%,transparent);color:var(--traffic)}.scale-note{font-size:9px;color:var(--faint);margin-top:5px}
 .search-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:color-mix(in srgb,var(--search-soft) 55%,transparent);border-radius:8px;padding:8px 10px}.search-summary>div{display:flex;flex-direction:column;min-width:0}.search-summary strong{font-size:13px;color:var(--search);line-height:1.2}.search-summary span{font-size:8px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);white-space:nowrap}.search-summary.bing{grid-template-columns:repeat(3,1fr);background:color-mix(in srgb,var(--traffic-soft) 55%,transparent);margin-top:-3px}.search-summary.bing strong{color:var(--traffic)}.mini-h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 6px;display:flex;align-items:center;gap:6px;color:var(--muted)}.metric-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px dashed var(--line);padding:2px 0 5px;min-width:0}.metric-row:last-child{border-bottom:0}.metric-row.flagged{background:linear-gradient(90deg,var(--search-soft),transparent 72%);border-radius:5px;padding-left:5px}.metric-name{display:flex;align-items:center;gap:4px 6px;min-width:0;font-size:11.5px;flex-wrap:wrap}.truncate{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.metric-name .truncate{flex:1 1 120px;min-width:70px}.metric-name a{text-decoration:none}.metric-name a:hover{text-decoration:underline}.opportunity-tag{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none;cursor:help}.opportunity-tag.rank{color:var(--traffic);border-color:color-mix(in srgb,var(--traffic) 35%,transparent)}.metric-values{text-align:right;white-space:nowrap;display:flex;flex-direction:column;line-height:1.2}.metric-values strong{font-size:11px;color:var(--search)}.metric-values span{font-size:8.5px;color:var(--faint)}.pages-panel{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.pages-list{display:grid;grid-template-columns:1fr 1fr;gap:5px 16px}.none{font-size:11.5px;color:var(--faint);font-style:italic;margin:0;padding:3px 0}
 footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:5px}footer b{color:var(--ink);font-weight:650}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -897,7 +912,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
 <div class="wrap">
   <header class="top">
     <div><div class="eyebrow">Daily traffic &amp; search brief</div><h1>${data.domain ? esc(data.domain) : "All domains — one glance"}</h1>
-      <div class="ext-links"><a href="http://dashboard.davidveksler.com/" target="_blank" rel="noopener">Error dashboard</a><a href="https://search.google.com/search-console" target="_blank" rel="noopener">Search Console</a><a href="https://dash.cloudflare.com/556c237bf8cb62edb8f7b401499bb7a9/web-analytics" target="_blank" rel="noopener">Web Analytics</a></div>
+      <div class="ext-links"><a href="http://dashboard.davidveksler.com/" target="_blank" rel="noopener">Error dashboard</a><a href="https://dashboard.davidveksler.com/admin.php" target="_blank" rel="noopener">Admin links</a><a href="https://search.google.com/search-console" target="_blank" rel="noopener">Search Console</a><a href="https://dash.cloudflare.com/556c237bf8cb62edb8f7b401499bb7a9/web-analytics" target="_blank" rel="noopener">Web Analytics</a></div>
     </div>
     <div class="win">
       Traffic: <b>${esc(periodLabel)}</b> · ${esc(trafficWindow)}${coverageNote ? ` · ${esc(coverageNote)}` : ""}<br>
@@ -913,6 +928,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
       <div class="field"><label for="domain-filter">Domain</label><select id="domain-filter" data-query="domain"><option value="">All domains</option>${data.allDomains.map((host) => `<option value="${esc(host)}" ${data.domain === host ? "selected" : ""}>${esc(host)}</option>`).join("")}</select></div>
       <div class="field"><label for="sort-filter">Sort</label><select id="sort-filter" data-query="sort"><option value="traffic" ${data.sort === "traffic" ? "selected" : ""}>Traffic</option><option value="change" ${data.sort === "change" ? "selected" : ""}>Biggest gain</option><option value="name" ${data.sort === "name" ? "selected" : ""}>Domain name</option></select></div>
       <div class="field"><label for="traffic-view">Bot-resistant view</label><select id="traffic-view" title="Switch the numbers shown to a traffic slice a crawler can't fake — instant, no reload. Card order stays ranked by total traffic. These are Cloudflare RUM sessions classified by referrer, not Search Console/Bing click counts."><option value="all">All traffic</option><option value="search">Search traffic only</option><option value="referred">Referred traffic only</option></select></div>
+      <button class="theme" id="collapse-all-toggle" type="button" aria-label="Collapse or expand all domain sections">▾ Collapse all</button>
       <button class="theme" id="theme-toggle" type="button" aria-label="Change color theme">◐ Theme</button>
     </div>
   </nav>
@@ -920,12 +936,12 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     ${insightsPanel(data.signals, totals, data.sites)}
     <section class="totals" aria-labelledby="overview-heading"><h2 class="sr-only" id="overview-heading">Traffic overview</h2>
       ${sessionsTile}
-      ${stats.map((stat) => `<div class="stat"><div class="k">${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
+      ${stats.map((stat) => `<div class="stat"><div class="k"><span class="dot ${stat[3]}" aria-hidden="true"></span>${stat[0]}</div><div class="v">${stat[1]}</div><div class="s">${stat[2]}</div></div>`).join("")}
     </section>
     ${sourceMix(totals)}
     ${domainGrids(rumSites, data.sites, data.periodDays, "sessions")}
     ${hasZoneSite ? `<section class="zone-section" aria-labelledby="zone-section-heading">
-      <h2 class="section-heading" id="zone-section-heading">Zone-log measurement</h2>
+      <h2 class="section-heading" id="zone-section-heading"><span class="dot faint" aria-hidden="true"></span>Zone-log measurement</h2>
       ${domainGrids(zoneSites, data.sites, data.periodDays, "zone visits")}
     </section>` : ""}
     ${forumSection(data.forums)}
@@ -980,6 +996,53 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     detail.addEventListener("toggle", update);
     update();
   });
+  // Domain sections default open (unchanged page density on a fresh visit).
+  // Per-section collapse state is kept in localStorage per data-domain-key —
+  // same convention as stats-theme/stats-traffic-view above — so a domain
+  // collapsed today stays collapsed on tomorrow's SSR page load. The
+  // collapse-all button just flips every group to the opposite of whatever the
+  // majority currently is, same "flip the odd one out" logic a bulk toggle
+  // needs when individual sections can already differ.
+  (function () {
+    var groups = [].slice.call(document.querySelectorAll("[data-domain-group]"));
+    if (!groups.length) return;
+    var toggleBtn = document.getElementById("collapse-all-toggle");
+    var KEY = "stats-collapsed-domains";
+    var readCollapsed = function () {
+      try { return new Set(JSON.parse(localStorage.getItem(KEY) || "[]")); } catch (_) { return new Set(); }
+    };
+    var writeCollapsed = function (set) {
+      try { localStorage.setItem(KEY, JSON.stringify(Array.from(set))); } catch (_) {}
+    };
+    var updateToggleLabel = function () {
+      if (!toggleBtn) return;
+      var anyOpen = groups.some(function (g) { return g.open; });
+      toggleBtn.textContent = anyOpen ? "▾ Collapse all" : "▸ Expand all";
+    };
+    var collapsed = readCollapsed();
+    groups.forEach(function (details) {
+      if (collapsed.has(details.dataset.domainKey)) details.open = false;
+      details.addEventListener("toggle", function () {
+        var set = readCollapsed();
+        if (details.open) set.delete(details.dataset.domainKey); else set.add(details.dataset.domainKey);
+        writeCollapsed(set);
+        updateToggleLabel();
+      });
+    });
+    if (toggleBtn) {
+      toggleBtn.addEventListener("click", function () {
+        var next = !groups.some(function (g) { return g.open; });
+        var set = readCollapsed();
+        groups.forEach(function (details) {
+          details.open = next;
+          if (next) set.delete(details.dataset.domainKey); else set.add(details.dataset.domainKey);
+        });
+        writeCollapsed(set);
+        updateToggleLabel();
+      });
+    }
+    updateToggleLabel();
+  })();
   // Bot-resistant traffic view: instant, client-side, no reload — every number
   // it needs (site.sources, totals.sourceMix) is already in the rendered page.
   // Only one of .tv-all/.tv-search/.tv-referred is ever unhidden at a time, on
