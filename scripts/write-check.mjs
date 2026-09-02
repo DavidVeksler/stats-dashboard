@@ -72,6 +72,10 @@ let keywordRowLimits = [];
 // single fetch failing must not take the rest of that host's tables down too.
 let failGsc = null;
 
+// Same idea for Bing — set to { siteUrl, method: "summary" | "keywords" }
+// around a `runBing()` call, see part 3b below.
+let failBing = null;
+
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input?.url ?? input);
@@ -105,9 +109,15 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (url.includes("ssl.bing.com/webmaster/api.svc/json/GetRankAndTrafficStats")) {
+    if (failBing && new URL(url).searchParams.get("siteUrl") === failBing.siteUrl && failBing.method === "summary") {
+      return new Response("stub transient failure", { status: 503 });
+    }
     return json({ d: [{ Clicks: 5, Impressions: 50, Date: "/Date(1316156400000-0700)/" }] });
   }
   if (url.includes("ssl.bing.com/webmaster/api.svc/json/GetQueryStats")) {
+    if (failBing && new URL(url).searchParams.get("siteUrl") === failBing.siteUrl && failBing.method === "keywords") {
+      return new Response("stub transient failure", { status: 503 });
+    }
     return json({ d: [{ Query: "test query", Clicks: 1, Impressions: 10,
       AvgClickPosition: 5, AvgImpressionPosition: 6, Date: "/Date(1316156400000-0700)/" }] });
   }
@@ -380,6 +390,40 @@ const runBing = async (env) => {
   // Bing-table-only).
   check("the Bing run touches no non-Bing table",
     flat.every((s) => /daily_bing_(summary|keywords)/.test(s.sql)), true);
+}
+
+// ---- 3b. A transient per-host Bing failure must not erase existing data ---
+// Same fix as part 1b, for runBingDaily: each of daily_bing_summary/
+// daily_bing_keywords used to get an unconditional DELETE before the fetch
+// that feeds it ran, so a timeout or 5xx wiped that day's rows with nothing
+// to replace them. The DELETE now runs only once at least one of that host's
+// URL fetches for that table actually succeeded.
+{
+  // A single-URL site: with a multi-URL site (forum.objectivismonline.com has
+  // two), failing just one URL still leaves the other succeeding, so summaryOk
+  // stays true and the host writes normally — correct per "one URL failing
+  // costs that URL's share of the site, not the site" above. This test wants
+  // every URL for the host to fail, which for a single-URL site is the same
+  // thing.
+  const failing = BING_SITES.find((s) => bingUrlsOf(s).length === 1);
+  const failingUrl = bingUrlsOf(failing)[0];
+  failBing = { siteUrl: failingUrl, method: "summary" };
+  const { result, flat } = await runBing({ BING_API_KEY: "stub-key" });
+  failBing = null;
+
+  check("the Bing run reports the failure", result.ok, false);
+  check("daily_bing_summary is NOT deleted for the failed host (existing rows survive)",
+    flat.some((s) => s.sql.includes("DELETE FROM daily_bing_summary ") && s.binds[1] === failing.host), false);
+  check("...or written for it",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_bing_summary") && s.binds[1] === failing.host), false);
+  // Keywords are an independent fetch — a summary-only failure must not take
+  // them down too.
+  check("...but daily_bing_keywords is still written for it (its own fetch succeeded)",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_bing_keywords") && s.binds[1] === failing.host), true);
+  const otherHost = BING_SITES.find((s) => s.host !== failing.host)?.host;
+  check("a different Bing site's summary is unaffected",
+    otherHost != null && flat.some((s) => s.sql.startsWith("INSERT INTO daily_bing_summary") && s.binds[1] === otherHost),
+    true);
 }
 
 // No key: the pull is skipped cleanly, same shape as the no-GSC-key case above.

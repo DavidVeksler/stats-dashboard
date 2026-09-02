@@ -588,7 +588,15 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   pull's rows for that (date, host) in place — the next successful run still deletes and rewrites
   them wholesale, same idempotency as everywhere else. The delete-before-insert ordering rule for
   chunked writes (see `batchInChunks` above) is unchanged: it just applies per table now instead
-  of once per host.
+  of once per host. **`runBingDaily` gates the same way**, one level lower: `daily_bing_summary`/
+  `daily_bing_keywords` are deleted only once at least one of that host's Bing URLs (a host can
+  carry several, see the Bing paragraph above) actually returned for that table — `summaryOk`/
+  `keywordsOk`, set per URL fetch, not per row. `queryRankAndTraffic`/`queryKeywords` returning
+  null/empty rows on a *successful* call (Bing genuinely has no date for that property yet) still
+  clears and rewrites the table, same as an empty-but-real GSC pull — only a thrown fetch error
+  leaves the row alone. The opted-out-site cleanup loop below it (a host with no `bing` property
+  at all) is unrelated and stays unconditional: that is a deliberate "stop tracking this host"
+  delete, not a failed fetch, and must keep firing every run.
 - **WAF blocks bot user-agents.** Requests to `stats.davidveksler.com` (davidveksler.com zone)
   from a non-browser UA get Cloudflare error **1010**. Use a real browser `User-Agent` when
   curling/fetching `/run` or `/health`.

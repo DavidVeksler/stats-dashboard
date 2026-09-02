@@ -447,41 +447,57 @@ async function runBingDaily(env, now = new Date()) {
     for (const site of bingSites) {
       const host = site.host;
       const urls = bingUrlsOf(site);
-      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
-      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
+      // Same discipline as GSC's per-table gating in runDaily: each table's
+      // DELETE runs only once at least one of this host's URL fetches for that
+      // table actually succeeded (didn't throw), and sits immediately before
+      // that table's own INSERTs. `queryBingSummary`/`queryBingKeywords`
+      // returning null/empty on success (Bing genuinely has no date yet) is a
+      // real answer and still clears+rewrites the table; only a thrown error
+      // (timeout, 5xx) leaves the existing day's rows alone so a re-run can
+      // recover them instead of finding them already erased.
       const summaryParts = [];
+      let summaryOk = false;
       for (const url of urls) {
         try {
           summaryParts.push(await queryBingSummary(env.BING_API_KEY, url));
+          summaryOk = true;
         } catch (e) {
           notes.push(`bing summary ${host} (${url}): ${e.message}`.slice(0, 140));
         }
       }
-      const summary = mergeBingSummaries(summaryParts);
-      if (summary) {
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
-          ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
-        );
+      if (summaryOk) {
+        stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
+        const summary = mergeBingSummaries(summaryParts);
+        if (summary) {
+          stmts.push(
+            env.DB.prepare(
+              `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
+            ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
+          );
+        }
       }
       const keywordParts = [];
+      let keywordsOk = false;
       for (const url of urls) {
         try {
           keywordParts.push(await queryBingKeywords(env.BING_API_KEY, url));
+          keywordsOk = true;
         } catch (e) {
           notes.push(`bing keywords ${host} (${url}): ${e.message}`.slice(0, 140));
         }
       }
-      const { window: bingWindow, rows } = mergeBingKeywords(keywordParts);
-      for (const k of rows) {
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO daily_bing_keywords
-             (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
-             VALUES (?,?,?,?,?,?,?,?)`
-          ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
-        );
+      if (keywordsOk) {
+        stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
+        const { window: bingWindow, rows } = mergeBingKeywords(keywordParts);
+        for (const k of rows) {
+          stmts.push(
+            env.DB.prepare(
+              `INSERT INTO daily_bing_keywords
+               (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
+               VALUES (?,?,?,?,?,?,?,?)`
+            ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
+          );
+        }
       }
     }
 
