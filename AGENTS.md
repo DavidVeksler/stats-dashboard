@@ -578,6 +578,17 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   never truly "last 24h". The dashboard labels this.
 - **`runDaily` only deletes keyword rows inside the `if (env.GSC_SA_KEY)` block** — so a run with
   no GSC key refreshes traffic without wiping existing keywords. Preserve that guard.
+- **Within that block, each GSC table's DELETE is gated on its own fetch succeeding, not issued
+  up front.** `daily_keywords`/`daily_pages`/`daily_search_summary` used to each get an
+  unconditional DELETE at the top of the per-host loop, before `queryKeywords`/`queryPages`/
+  `querySearchSummary` ran — so a transient failure (timeout, 5xx) deleted that day's rows and
+  left nothing to replace them, and a retry via `npm run refresh` or `/run` had no prior data left
+  to recover. Each DELETE now sits immediately before its own table's INSERTs and only runs when
+  `keywordsOk`/`pagesOk`/`summary` is truthy, so a failed fetch leaves the previous successful
+  pull's rows for that (date, host) in place — the next successful run still deletes and rewrites
+  them wholesale, same idempotency as everywhere else. The delete-before-insert ordering rule for
+  chunked writes (see `batchInChunks` above) is unchanged: it just applies per table now instead
+  of once per host.
 - **WAF blocks bot user-agents.** Requests to `stats.davidveksler.com` (davidveksler.com zone)
   from a non-browser UA get Cloudflare error **1010**. Use a real browser `User-Agent` when
   curling/fetching `/run` or `/health`.

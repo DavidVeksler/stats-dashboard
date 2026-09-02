@@ -295,17 +295,21 @@ async function runDaily(env, now = new Date()) {
       const gscWindow = `${gStart}–${gEnd}`;
       for (const { host, gsc, gscPageFilter } of SITES) {
         if (!gsc) continue; // no Search Console property for this host (e.g. a zone-sourced file host)
-        // These three DELETEs are pushed BEFORE the INSERTs that follow them and
-        // must stay that way: the write is chunked (see batchInChunks), and
-        // sequential in-order execution is the only thing keeping a DELETE ahead
-        // of its INSERTs once a site's ~500 keyword rows straddle a chunk
-        // boundary. They also stay inside this `if (env.GSC_SA_KEY)` block, so a
-        // run with no GSC key refreshes traffic without wiping keyword history.
-        stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
-        stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
-        stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
+        // Each table's DELETE is pushed immediately before that table's own
+        // INSERTs, and only once the fetch that feeds it actually succeeded —
+        // never unconditionally up front. The write is chunked (see
+        // batchInChunks) and sequential in-order execution is what keeps a
+        // DELETE ahead of its INSERTs once a site's ~500 keyword rows straddle a
+        // chunk boundary, so a DELETE/INSERT pair for one table must still stay
+        // adjacent in the stream; but gating the DELETE on success is what stops
+        // a transient per-host failure (a timeout, a 5xx) from erasing that
+        // day's existing rows with nothing to replace them — which used to leave
+        // a real "retry the refresh" path (npm run refresh / /run) with no data
+        // to recover, because the DELETE had already run regardless. This block
+        // also stays inside the `if (env.GSC_SA_KEY)` guard, so a run with no
+        // GSC key refreshes traffic without wiping keyword history at all.
         let rows = [], pages = [], summary = null;
-        let keywordsOk = false;
+        let keywordsOk = false, pagesOk = false;
         try {
           rows = await queryKeywords(token, gsc, gStart, gEnd, KEYWORD_ROW_LIMIT, gscPageFilter);
           keywordsOk = true;
@@ -315,6 +319,7 @@ async function runDaily(env, now = new Date()) {
         }
         try {
           pages = await queryPages(token, gsc, gStart, gEnd, 15, gscPageFilter);
+          pagesOk = true;
         } catch (e) {
           notes.push(`gsc pages ${host}: ${e.message}`.slice(0, 140));
           gscFailedHosts.add(host);
@@ -335,21 +340,28 @@ async function runDaily(env, now = new Date()) {
             gscFailedHosts.add(host);
           }
         }
-        for (const k of rows) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_keywords (date,host,query,clicks,impressions,position,gsc_window) VALUES (?,?,?,?,?,?,?)`
-            ).bind(date, host, k.query, k.clicks, k.impressions, k.position, gscWindow),
-          );
+        if (keywordsOk) {
+          stmts.push(env.DB.prepare(`DELETE FROM daily_keywords WHERE date=? AND host=?`).bind(date, host));
+          for (const k of rows) {
+            stmts.push(
+              env.DB.prepare(
+                `INSERT INTO daily_keywords (date,host,query,clicks,impressions,position,gsc_window) VALUES (?,?,?,?,?,?,?)`
+              ).bind(date, host, k.query, k.clicks, k.impressions, k.position, gscWindow),
+            );
+          }
         }
-        for (const p of pages) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_pages (date,host,page,clicks,impressions,ctr,position,gsc_window) VALUES (?,?,?,?,?,?,?,?)`
-            ).bind(date, host, p.page, p.clicks, p.impressions, p.ctr, p.position, gscWindow),
-          );
+        if (pagesOk) {
+          stmts.push(env.DB.prepare(`DELETE FROM daily_pages WHERE date=? AND host=?`).bind(date, host));
+          for (const p of pages) {
+            stmts.push(
+              env.DB.prepare(
+                `INSERT INTO daily_pages (date,host,page,clicks,impressions,ctr,position,gsc_window) VALUES (?,?,?,?,?,?,?,?)`
+              ).bind(date, host, p.page, p.clicks, p.impressions, p.ctr, p.position, gscWindow),
+            );
+          }
         }
         if (summary) {
+          stmts.push(env.DB.prepare(`DELETE FROM daily_search_summary WHERE date=? AND host=?`).bind(date, host));
           stmts.push(
             env.DB.prepare(
               `INSERT INTO daily_search_summary (date,host,clicks,impressions,ctr,position,gsc_window) VALUES (?,?,?,?,?,?,?)`

@@ -66,6 +66,12 @@ const json = (body) => new Response(JSON.stringify(body), {
 // asserted as well as the stored side. Raising one without the other does nothing.
 let keywordRowLimits = [];
 
+// Simulates one host's query-dimension request failing transiently (a timeout,
+// a 5xx) — set to { siteUrl, dimension } around a `run()` call, see part 1b
+// below. Anything else about the pull is untouched, which is the point: a
+// single fetch failing must not take the rest of that host's tables down too.
+let failGsc = null;
+
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input?.url ?? input);
@@ -74,6 +80,9 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.includes("searchconsole.googleapis.com")) {
     const body = JSON.parse(init.body ?? "{}");
     const dimension = body.dimensions?.[0] ?? null;
+    if (failGsc && dimension === failGsc.dimension && url.includes(encodeURIComponent(failGsc.siteUrl))) {
+      return new Response("stub transient failure", { status: 503 });
+    }
     if (!dimension) return json({ rows: [{ clicks: 9, impressions: 2250, ctr: .004, position: 10.1 }] });
     // Return exactly as many rows as were asked for. A property with a deep tail
     // returns the full rowLimit, which is the case that matters here.
@@ -256,6 +265,38 @@ const runBing = async (env) => {
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_forum_activity")).length, FORUMS.length);
   check("...and is never deleted",
     flat.some((s) => s.sql.includes("DELETE FROM daily_forum_activity")), false);
+}
+
+// ---- 1b. A transient per-host GSC failure must not erase existing data ----
+// Before this fix, daily_keywords/daily_pages/daily_search_summary each got an
+// unconditional DELETE at the top of the per-host loop, before the fetch that
+// feeds that table ran — so a timeout or 5xx deleted that day's rows with
+// nothing to replace them, and a retry (npm run refresh / /run) had no prior
+// data left to recover. The DELETE now sits immediately before its own
+// table's INSERTs and only runs once that table's fetch actually succeeded.
+{
+  const failing = GSC_SITES[0];
+  failGsc = { siteUrl: failing.gsc, dimension: "query" };
+  const { result, flat } = await run({ GSC_SA_KEY });
+  failGsc = null;
+
+  check("the run reports the GSC pull as not fully ok", result.gscOk, false);
+  check("...and names the failing host", result.gscFailedHosts.includes(failing.host), true);
+  check("daily_keywords is NOT deleted for the failed host (existing rows survive)",
+    flat.some((s) => s.sql.includes("DELETE FROM daily_keywords ") && s.binds[1] === failing.host), false);
+  check("...or written for it",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_keywords") && s.binds[1] === failing.host), false);
+  // Pages and the summary are independent fetches — a keyword-only failure must
+  // not take them down too, and the derived-summary shortcut must fall back to
+  // the real summary request once queryKeywords itself failed.
+  check("...but daily_pages is still written for it (its own fetch succeeded)",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_pages") && s.binds[1] === failing.host), true);
+  check("...and daily_search_summary is still written for it too",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_search_summary") && s.binds[1] === failing.host), true);
+  const otherHost = GSC_SITES[1]?.host;
+  check("a different host's keywords are unaffected",
+    otherHost != null && flat.some((s) => s.sql.startsWith("INSERT INTO daily_keywords") && s.binds[1] === otherHost),
+    true);
 }
 
 // ---- 2. No GSC key: traffic refreshes, keywords survive -------------------
