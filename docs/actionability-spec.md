@@ -923,7 +923,27 @@ plus N inserts, in that order, in the same batch as the write it already checks.
 `runDaily` twice for the same date and signal set produces the same `daily_signals` rows, not
 duplicates or a primary-key violation.
 
-## 15. Real recurrence, read from `daily_signals`
+## 15. Real recurrence, read from `daily_signals` — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified. `loadDashboard` reads `daily_signals WHERE date BETWEEN historyStart AND
+> addDays(date, -1)` (never `date` itself) into a `Map<"kind|host", Set<date>>`, then decorates
+> `computeSignals`' output in a small block right after it returns: every signal except
+> `kind === "no-comparison"` gets `recurrence` set to the count of consecutive calendar days
+> immediately preceding `date` present in its own date set (0 if yesterday is missing), and
+> `severity` is decremented by one (never past 1) at `recurrence >= 3`. `no-comparison` is
+> untouched — it keeps `floodRun` over `floodDatesByHost`, per the item 11 note this item inherits.
+> One thing the spec didn't spell out: escalating severity after `computeSignals` already sorted its
+> output can reorder the list, so the decoration step re-sorts `signals` by severity alone afterward
+> (`Array#sort` is stable, so `computeSignals`' own weight-then-host ordering survives within an
+> unchanged severity band). Tested in `dashboard-check.mjs` against `malformed-urls` on
+> `MALFORMED_HOST` — chosen because it fires deterministically at severity 2 with no traffic/referrer
+> fixture needed, the same reason item 14's write-check fixture uses it: 3 consecutive prior days give
+> recurrence 3 and escalate to severity 1; a one-day gap (day 1 and day 3, day 2 absent) gives
+> recurrence 1, not 2; zero prior rows give recurrence 0, not null; and planting unrelated
+> `daily_signals` rows under `no-comparison`'s own `(host, kind)` does not change what `floodRun`
+> reports for it. `render-check.mjs` needed no new test — the existing "N days running" assertion
+> already covers rendering a non-null `recurrence`, and item 15 changes only where the value comes
+> from, not how it renders.
 
 **Symptom.** Every signal's `recurrence` field is `null` except `no-comparison`, which computes it
 by a different, narrower method (item 4's note: "a flooded day is precisely a day whose delta was

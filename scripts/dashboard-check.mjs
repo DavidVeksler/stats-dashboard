@@ -153,6 +153,11 @@ let forumActivityRows = FORUMS.map((f) => ({
   new_today: 0, new_7d: 1, new_30d: 2, posts_today: 0, posts_count: 10, topics_count: 2,
 }));
 
+// daily_signals rows (spec item 15's real recurrence), empty by default so
+// every recurrence in this file's other assertions stays 0 unless a section
+// deliberately populates it.
+let dailySignalRows = [];
+
 // ---- Search Console fixtures (spec items 7 and 8) -------------------------
 // The three queries in the spec's acceptance list, with their real 2026-08-13
 // numbers, plus enough neighbours on each host that "not in the top 5 by its
@@ -302,6 +307,7 @@ const db = {
       if (sql.includes("daily_zone_status")) return { results: between(ZONE_STATUSES, binds) };
       if (sql.includes("daily_bing_summary")) return { results: onDate(bingSummaryRows, binds) };
       if (sql.includes("daily_forum_activity")) return { results: between(forumActivityRows, binds) };
+      if (sql.includes("daily_signals")) return { results: between(dailySignalRows, binds) };
       if (sql.includes("daily_zone_bots")) {
         // A missing table is what D1 raises before the migration lands; the read
         // path has to survive it, not 500 the whole dashboard.
@@ -1162,6 +1168,67 @@ for (const period of [7, 30]) {
     check("restoring the tables clears all three", ["stale-pipeline", "bing-pipeline-stale", "forum-pipeline-stale"]
       .some((kind) => hasKind(data, kind)), false);
   }
+}
+
+// 16b. Real recurrence, read from daily_signals (spec item 15). malformed-urls
+//      on MALFORMED_HOST fires deterministically at severity 2 regardless of
+//      any traffic/referrer fixture, which makes it the simplest real rule to
+//      drive this through — same discipline as item 14's own write-check
+//      fixture.
+{
+  const saved = dailySignalRows;
+  const TODAY = "2026-08-09";
+
+  // 3 consecutive prior days (08-06, 07, 08) present: recurrence 3, and a
+  // severity-2 signal escalates to severity 1 (never past it).
+  dailySignalRows = ["2026-08-06", "2026-08-07", "2026-08-08"].map((date) => ({
+    date, host: MALFORMED_HOST, kind: "malformed-urls",
+  }));
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.host === MALFORMED_HOST && s.kind === "malformed-urls");
+    check("3 unbroken prior days produce recurrence 3", signal?.recurrence, 3);
+    check("...and escalate severity 2 to 1", signal?.severity, 1);
+  }
+
+  // A one-day gap (08-06 and 08-08 present, 08-07 absent): only the unbroken
+  // run immediately before today counts, so this is recurrence 1, not 2 —
+  // and no escalation, since 1 < 3.
+  dailySignalRows = ["2026-08-06", "2026-08-08"].map((date) => ({
+    date, host: MALFORMED_HOST, kind: "malformed-urls",
+  }));
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.host === MALFORMED_HOST && s.kind === "malformed-urls");
+    check("a one-day gap counts only the unbroken run before today", signal?.recurrence, 1);
+    check("...not the gapped day beyond it", signal?.recurrence === 2, false);
+    check("...and does not escalate below recurrence 3", signal?.severity, 2);
+  }
+
+  // No prior rows at all (the default for every other test in this file):
+  // recurrence 0, no escalation — a newly-added rule starts here and climbs,
+  // never backfilled.
+  dailySignalRows = [];
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.host === MALFORMED_HOST && s.kind === "malformed-urls");
+    check("no prior daily_signals rows means recurrence 0, not null or a guess", signal?.recurrence, 0);
+    check("...at its original severity", signal?.severity, 2);
+  }
+
+  // no-comparison keeps its OWN existing method (floodRun over floodDatesByHost)
+  // rather than reading daily_signals at all — planting daily_signals rows for
+  // its (host, kind) must not change what it reports.
+  dailySignalRows = ["2026-08-06", "2026-08-07", "2026-08-08"].map((date) => ({
+    date, host: HOST, kind: "no-comparison",
+  }));
+  {
+    const { data } = await load(`domain=${HOST}&period=1`);
+    const noComparison = (data.signals ?? []).find((s) => s.host === HOST && s.kind === "no-comparison");
+    check("no-comparison ignores daily_signals and keeps its own recurrence method",
+      noComparison?.recurrence, 2);
+  }
+  dailySignalRows = saved;
 }
 
 // 17. `/health` (spec item 13) reports pipeline age instead of the literal

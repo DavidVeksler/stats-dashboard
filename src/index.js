@@ -787,7 +787,17 @@ async function loadDashboard(env, options = {}) {
     `SELECT date,host,users_count,active_today,active_7d,active_30d,new_today,new_7d,new_30d,posts_today,posts_count,topics_count
      FROM daily_forum_activity WHERE date BETWEEN ? AND ? ORDER BY date ASC`
   ).bind(historyStart, date).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, hist, histRefs, run] = await Promise.all([
+  // Real recurrence (spec item 15), read from what item 14 persists. The
+  // window is the trailing history BEFORE today — up to and including
+  // `addDays(date, -1)`, never `date` itself, since today's own row for the
+  // signal currently being computed does not exist yet at read time. Same
+  // schema-tolerance .catch as every other table here: an estate that hasn't
+  // run a single night since item 14 shipped has no daily_signals rows yet,
+  // and every signal should read recurrence 0 rather than the page 500ing.
+  const dailySignalsQuery = env.DB.prepare(
+    `SELECT date,host,kind FROM daily_signals WHERE date BETWEEN ? AND ?`
+  ).bind(historyStart, addDays(date, -1)).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -807,6 +817,7 @@ async function loadDashboard(env, options = {}) {
     zoneStatusQuery,
     zoneBotsQuery,
     forumActivityQuery,
+    dailySignalsQuery,
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(baselineStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
@@ -1269,6 +1280,48 @@ async function loadDashboard(env, options = {}) {
     floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
     run, bingConfigured, bingHasRowsToday, forumsConfigured, forumHasRowsToday,
   });
+
+  // Real recurrence (spec item 15), decorated onto computeSignals' output
+  // rather than computed inside it — computeSignals stays a pure function of
+  // today's rows, and this is a read over yesterday-and-before from what item
+  // 14 persists. `no-comparison` keeps its own existing method (a flooded day
+  // IS a day whose delta was suppressed, so "flooded N days running" and
+  // "this fired N days running" are the same statement for that one rule).
+  // Every other rule starts at recurrence 0 the day it's introduced or its
+  // `kind` string changes — there is nothing to backfill from, and inventing
+  // a count would be exactly the kind of guess this signal engine rejects
+  // everywhere else.
+  {
+    const recurrenceDates = new Map(); // "kind|host" -> Set<date>
+    for (const row of dailySignals.results ?? []) {
+      const key = `${row.kind}|${row.host ?? ""}`;
+      const set = recurrenceDates.get(key) ?? new Set();
+      set.add(row.date);
+      recurrenceDates.set(key, set);
+    }
+    const consecutiveBefore = (dateSet) => {
+      let count = 0;
+      let cursor = addDays(date, -1);
+      while (dateSet.has(cursor)) {
+        count += 1;
+        cursor = addDays(cursor, -1);
+      }
+      return count;
+    };
+    for (const signal of signals) {
+      if (signal.kind === "no-comparison") continue;
+      const key = `${signal.kind}|${signal.host ?? ""}`;
+      const dateSet = recurrenceDates.get(key);
+      signal.recurrence = dateSet ? consecutiveBefore(dateSet) : 0;
+      // A repeating, unactioned signal is more urgent, not less — never past
+      // severity 1, and per item 11's already-agreed rule.
+      if (signal.recurrence >= 3 && signal.severity > 1) signal.severity -= 1;
+    }
+    // Escalation can change the ranking computeSignals already sorted by
+    // severity; Array#sort is stable, so re-sorting on severity alone
+    // preserves computeSignals' own weight-then-host ordering within a band.
+    signals.sort((a, b) => a.severity - b.severity);
+  }
 
   // Forum activity: independent of the RUM/zone measurement split above, so it
   // gets its own small shaping step rather than joining `sites`. Each row is a
