@@ -3,7 +3,8 @@
 Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
 `e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
 (2026-08-13), with item 8's comparator corrected in `c629dfa` and its stored-keyword coverage
-fixed in `3bd0838` (both 2026-08-13). Items 9, 10 and 11 proposed.
+fixed in `3bd0838` (both 2026-08-13). Items 9, 10, 11, and the P4 batch (12–16, added 2026-09-05)
+are proposed.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -742,6 +743,223 @@ schema change, and D1 retains everything already (there is no pruning anywhere i
 
 ---
 
+# P4. The dashboard noticing its own pipeline, and one more signal
+
+Added 2026-09-05. Items 14 and 15 below intentionally take item 11's persisted-table fallback
+rather than its read-side-first preference: item 14 is being built anyway (there is no other way to
+answer "did the Bing/forum pull even run last night"), and once it exists, recurrence is a trailing
+read over a tiny table instead of N re-runs of `computeSignals` over 180 days of raw traffic and
+referrer rows. Build in order: 12 and 13 are independent of everything else and of each other; 14
+must land before 15 (15 reads what 14 writes); 16 is independent and can land anywhere after 4.
+
+## 12. A signal for the pipeline itself going quiet
+
+**Symptom.** Every signal in `src/signals.js` is about a *site*. Nothing on the page or in the ntfy
+push notices when a pull stops running at all — GSC creds expiring, a Cloudflare token rotating out
+from under the Worker, a bug in `runBingDaily`, all fail silently from the reader's side. The three
+pulls fail independently and none of the three leaves a trace a reader would see: `runDaily` writes
+one `runs` row per invocation (`date, ok, note`, already read into `loadDashboard` as `run` — see
+`src/index.js:785` — but not used for anything besides `dataUpdatedAt`); `runBingDaily` writes no
+`runs` row at all (`AGENTS.md`: "does not touch `runs`"); the Discourse pull is a step inside
+`runDaily` with no row of its own either.
+
+**Change.** Three independent checks, each a `stale-pipeline` signal in `src/signals.js`, severity 1,
+`host: null` (these are estate-wide, not per-site — see the render note below) and `href: "/health"`
+(item 13 makes that page answer the question directly):
+
+- **Main pipeline** (traffic + GSC + Discourse, all inside `runDaily`): fire when `run` is null,
+  `run.ok` is falsy, or `run.run_at`'s date is more than `STALE_PIPELINE_DAYS` (2, one full missed
+  night plus slack for the UTC/cron boundary) days behind today. Evidence: the note stored on `run`,
+  which is already the same truncated-error string `sendNtfy`'s `gscWarn` branch uses.
+- **Bing pipeline**: fire when at least one `SITES` entry carries a `bing` field (so the pipeline is
+  expected to have written *something* tonight) and `bingSummaries.results` is empty for `date`.
+  `bingSummaries` is already read in `loadDashboard` (`WHERE date=?`, `src/index.js:720`) — no new
+  query. This can't distinguish "Bing had nothing to report" from "the pull never ran", but
+  `runBingDaily` always clears and rewrites every configured host's row every night per the write
+  gotcha in `AGENTS.md` ("`runBingDaily` gates the same way... only a thrown fetch error leaves the
+  row alone"), so a configured estate with zero rows for today is the pull not having run, not a
+  quiet night.
+- **Forum pipeline**: fire when `FORUMS` (from `src/config.js`) is non-empty and
+  `forumActivity.results` is empty for `date`. Same reasoning and same already-read query
+  (`forumActivityQuery`, `src/index.js`).
+
+**Render note.** Every existing signal has a real `host` and an anchored card (`cardAnchor(host)`
+from `src/signals.js`, used by `actionsBlock`). A `stale-pipeline` signal has neither — it is about
+the estate, not a card. Give `actionsBlock` (`src/render.js`) a branch for `host: null`: render the
+headline and action with no card-anchor link, `href` pointing at `/health` instead of a card id.
+Don't invent a synthetic host string (`"(pipeline)"` or similar) to force it through the existing
+per-host path — that would produce a `cardAnchor` call, `href`, and hover state pointing at a card
+that does not exist, the exact kind of assertion-with-no-referent this codebase avoids everywhere
+else (see the `Unattributed` and `internal` gotchas in `AGENTS.md` for the pattern this would
+repeat).
+
+**Acceptance.** `dashboard-check.mjs` gains three fixtures: a stubbed `runs` table with a >2-day-old
+last row (fires main), a `SITES`-with-`bing` fixture with zero `daily_bing_summary` rows for `date`
+(fires Bing), and the inverse (fresh `runs`, populated Bing/forum tables) producing none of the
+three. `render-check.mjs` asserts the action row renders without a card-anchor href for a `host:
+null` signal and does not throw building one.
+
+## 13. `/health` reports pipeline age instead of a constant
+
+**Symptom.** `GET /health` (`src/index.js`, the `url.pathname === "/health"` branch) returns the
+literal string `"ok"` unconditionally. It answers "is the Worker running" and nothing else — the
+question anyone actually pointing an uptime check at this URL wants answered is "did last night's
+pull succeed", which is exactly what item 12 needs a place to point `href` at.
+
+**Change.** Query `` env.DB.prepare(`SELECT run_at, ok FROM runs ORDER BY run_at DESC LIMIT 1`).first() ``
+directly in the `/health` handler — a single-row, indexed read, not `loadDashboard`, which does
+far more work than a health check needs. If the row is missing, `ok` is falsy, or `run_at` is more
+than `STALE_PIPELINE_DAYS` days old (the same exported constant item 12 uses — one threshold, not
+two), return **503** with a short JSON body: `{ ok: false, lastRunAt, ageHours, note }`. Otherwise
+return **200** with `{ ok: true, lastRunAt, ageHours }`. Keep the `content-type: text/plain` response
+gone in favor of `application/json` either way — this endpoint now has a body worth parsing.
+
+**Do not fold in Bing/forum freshness here.** `/health` answers "is the Worker's core pipeline
+alive", the same question an uptime monitor pings on a schedule tighter than a UTC day; item 12's
+per-source checks are richer (site-count-aware) and belong on the dashboard page a person reads,
+not in a machine-polled endpoint whose whole value is being fast and single-purpose.
+
+**Acceptance.** A stubbed stale `runs` row returns 503 with `ok: false`; a fresh one returns 200 with
+`ok: true`; both bodies parse as JSON. `curl -s https://stats.davidveksler.com/health` after deploy
+should currently return 200 (the pipeline runs nightly) — verify this the same way every other
+endpoint in this repo is verified, per `AGENTS.md`'s WAF note (a real browser `User-Agent`, or reuse
+whatever verification path `deploy.sh` already runs).
+
+## 14. Persist every computed signal, not just the top one
+
+**Symptom.** `runDaily` already calls `loadDashboard(env)` once per run to get the day's top
+severity-1 signal for the ntfy push (`src/index.js:400-402`: `const dashboard = await
+loadDashboard(env)...`, `dashboard?.signals`). Every other computed signal — severity 2 and 3, and
+every severity-1 signal past the first — is thrown away the moment that request finishes. There is
+no record of what the dashboard said yesterday, which is what item 15 needs and what a routine
+reading this dashboard's data (per the fleet's own standards in the global `CLAUDE.md`) would need
+to act on findings instead of re-deriving them.
+
+**Change.**
+
+- New table in `schema.sql` **and** the idempotent `ensureSchema` batch (`src/index.js:71` onward —
+  both, per the P0 gotcha in `AGENTS.md`; a table only in `schema.sql` cannot be applied with the
+  deploy token):
+  ```sql
+  CREATE TABLE IF NOT EXISTS daily_signals (
+    date     TEXT NOT NULL,
+    host     TEXT NOT NULL,   -- '' for an estate-wide signal (item 12), never NULL — see below
+    kind     TEXT NOT NULL,
+    severity INTEGER NOT NULL,
+    headline TEXT,
+    evidence TEXT,            -- JSON-encoded evidence object, exactly what the signal carried
+    PRIMARY KEY (date, host, kind)
+  );
+  CREATE INDEX IF NOT EXISTS idx_signals_dh ON daily_signals(date, host);
+  ```
+  `host` is `''` rather than `NULL` for item 12's estate-wide signals so the primary key stays
+  usable (SQLite treats `NULL` as distinct from itself in a way that would let duplicate estate-wide
+  rows silently coexist within one date).
+- At the existing call site (`src/index.js:400-402`), after `dashboard` resolves, write **every**
+  signal in `dashboard.signals` — not only the top one — as one `DELETE FROM daily_signals WHERE
+  date=?` (idempotency, same DELETE-then-INSERT convention as every other table) followed by one
+  `INSERT` per signal, batched with the existing `env.DB.batch()` machinery rather than a bare loop
+  of awaited single statements. This is a handful of rows a night (today's fixtures produce single
+  digits of signals across the whole estate), nowhere near `D1_MAX_BATCH_STATEMENTS` — `batchInChunks`
+  is not needed here, a single `env.DB.batch([...])` call is enough, but it still must follow the
+  DELETE-before-INSERT-in-the-same-batch ordering rule the rest of `runDaily` follows.
+- This write must not be allowed to fail the run: wrap it the same way `sendNtfy` is already
+  wrapped (non-fatal `.catch`), since `daily_signals` is a convenience record, not a data path
+  anything else in `runDaily` depends on.
+
+**Acceptance.** `scripts/write-check.mjs` (the only check that touches the write path — see
+`AGENTS.md`) gains an assertion that a run producing N signals writes a DELETE for `daily_signals`
+plus N inserts, in that order, in the same batch as the write it already checks. Re-running
+`runDaily` twice for the same date and signal set produces the same `daily_signals` rows, not
+duplicates or a primary-key violation.
+
+## 15. Real recurrence, read from `daily_signals`
+
+**Symptom.** Every signal's `recurrence` field is `null` except `no-comparison`, which computes it
+by a different, narrower method (item 4's note: "a flooded day is precisely a day whose delta was
+suppressed, so 'flooded N days running' and 'this fired N days running' are the same statement").
+Every other rule — `error-spike`, `likely-bot-subflood`, the two opportunity signals — has no memory
+of whether it fired yesterday, so a 404 spike in its fifth consecutive day reads exactly like a fresh
+one.
+
+**Change.** Once item 14 is landed and has been running for a few nights, `loadDashboard` reads
+`daily_signals` for the trailing window before today (`WHERE date BETWEEN ? AND ?`, `historyStart`
+through the day before `date` — never including `date` itself, since today's row for the signal
+currently being computed does not exist yet at read time), grouped into a `Map<"kind|host", Set<date>>`.
+For each freshly computed signal (except `no-comparison`, which keeps its existing method), set
+`recurrence` to the number of consecutive calendar days immediately preceding `date` that appear in
+that signal's date set — 0 if yesterday is missing, however far back the run of dates goes otherwise.
+Per item 11's already-agreed rule, **escalate severity by one level (never past 1) when `recurrence
+>= 3`** — a repeating, unactioned signal is more urgent, not less.
+
+**This is read-only against `daily_signals`; it does not change what `computeSignals` itself
+computes for "today".** `computeSignals` stays a pure function of already-loaded rows (see the
+module's own header comment on why: it's the same discipline that keeps `runDaily`'s ntfy finding
+from being a second copy of the rules). The recurrence lookup is a thin decoration applied to its
+output in `loadDashboard`, not a change to the rules themselves.
+
+**A newly-added rule, or one that changes its `kind` string, starts at `recurrence: 0` and climbs
+from there — do not backfill.** There is nothing to backfill from; `daily_signals` genuinely has no
+row for a kind that did not exist before item 14 shipped, and inventing one would be exactly the
+kind of guess item 4's original design (`AGENTS.md`, `docs/actionability-spec.md` item 4) explicitly
+rejected ("nothing here guesses").
+
+**Acceptance.** `dashboard-check.mjs` gains a fixture with `daily_signals` rows for the same
+`(host, kind)` on 3 consecutive prior days: the freshly computed signal for that `(host, kind)` today
+carries `recurrence: 3` and is escalated to severity 1 if it was severity 2. A one-day gap in the
+fixture (day 1 and day 3 present, day 2 absent) produces `recurrence: 1` (only the unbroken run
+immediately before today counts), not 2. `render-check.mjs` still asserts the existing `N days
+running` string renders for a signal carrying a non-null `recurrence`.
+
+## 16. `ai-referral-rise`: a signal for the AI-answer-engine channel actually growing
+
+**Symptom.** `classifyReferrer` (`src/config.js`) already tags a row `kind: "ai"` when the referrer
+is a recognized AI chat/answer-engine host (`AI_ANSWER_ENGINES`), and `AGENTS.md` documents at length
+why that badge is deliberately **not** promoted to a `sourceMix` channel — it undercounts, because
+most AI surfaces don't reliably send a `Referer` at all. That reasoning is sound and item 16 does not
+revisit it: `sourceMix` stays untouched. But the per-row badge that already exists is enough to
+answer a narrower, safer question a badge can't: *for a given site, did AI-tagged referrals rise
+notably against that site's own recent history* — the same "is this normal, what changed" test every
+other signal in this file applies, scoped to a channel your global `CLAUDE.md` already names as a KPI
+to track deliberately ("Optimize for AI answer engines as deliberately as for Google... treat it as a
+KPI").
+
+**Change.** In `src/signals.js`, a RUM-only rule (same measurement-class gate as every session-shaped
+rule — `AGENTS.md`'s "Signals respect measurement class" applies here exactly as it does to
+`traffic-rise`, since this is still a session count):
+
+- **Today's value**: sum of `visits` for rows with `kind: "ai"` for that host in the current period,
+  from the same `refs`/`site.referrerList` rows every other per-site referrer figure already reads —
+  no new query.
+- **Baseline**: the mean of the *same* per-host, per-day `kind: "ai"` sum over the trailing window
+  already read into `histRefs` in `loadDashboard` (`src/index.js`, grouped `date, host, kind`,
+  `BASELINE_LOOKBACK_DAYS` wide) — the same rows `classifyTraffic`'s flood baseline already reads,
+  filtered to `kind === "ai"` instead of used for direct-share. Both sides of the comparator are
+  RUM-only `daily_referrers` rows with the same `kind` filter, satisfying the "both sides of a
+  comparator must come from the same population" rule in `AGENTS.md` by construction.
+- **Gates, mirroring `traffic-rise`'s shape rather than inventing new constants**: relative rise
+  `>= RISE_MIN_DELTA` (reuse the existing exported constant) **and** absolute change
+  `>= AI_RISE_MIN_ABSOLUTE` (new, small — export it rather than inlining, e.g. 3: AI referral volume
+  is a small fraction of an already-small `ai` bucket on most sites in this estate, and
+  `DELTA_MIN_ABSOLUTE`'s 25 would suppress every real case in the current fixtures).
+- **Severity 3** (context, like `traffic-rise`, not an action item) — this is "worth noticing", not
+  "something is broken or recoverable today". `action`: "Check which AI answer engine sent it and
+  whether the page it landed on actually answers the query" (there is no fixed remedy the way
+  `snippet-gap`/`rank-gap` have one).
+- Mutually exclusive with nothing existing — a site can carry both `traffic-rise` (its RUM-only total
+  session count includes `ai`-tagged sessions folded into `referral`, per `summarizeSources`) and
+  `ai-referral-rise` at once; they are different populations answering different questions, unlike
+  `likely-bot-subflood`/`traffic-rise`, which are deliberately exclusive because they compete to
+  explain the *same* number.
+
+**Acceptance.** A fixture where a host's `kind: "ai"` sessions rise from a ~1/day baseline to 5+ in
+the current period produces exactly one `ai-referral-rise` signal at severity 3; a host with a flat
+or declining `ai` count, or one whose rise fails either gate, produces none. `dashboard-check.mjs`
+asserts the signal never fires for a zone-sourced host (no `daily_referrers` rows exist for one to
+read in the first place, so this should be true by construction — assert it stays that way).
+
+---
+
 # Test plan
 
 `npm run check` is the gate. Extend the three existing scripts rather than adding a framework.
@@ -759,10 +977,12 @@ schema change, and D1 retains everything already (there is no pruning anywhere i
   Cloudflare and Search Console. It is the only check that exercises the **write** path, and it is
   what makes the chunked batch safe to change — statement ordering across chunk boundaries, chunk
   sizes, the request-side row limit, and the `if (env.GSC_SA_KEY)` guard on the keyword DELETEs.
-  `--verbose` prints the shape of a night's write.
+  `--verbose` prints the shape of a night's write. Item 14 adds the `daily_signals` DELETE+INSERT
+  assertion here.
 
 Beyond the check scripts, verification stays end-to-end per `AGENTS.md`: deploy, hit `/run`, read
-the returned JSON. Remember the WAF blocks non-browser user agents on this host.
+the returned JSON. Remember the WAF blocks non-browser user agents on this host. Item 13's `/health`
+change is verified the same way, with a `curl` after deploy checking for a 200 with a JSON body.
 
 # Suggested order
 
@@ -771,7 +991,13 @@ the returned JSON. Remember the WAF blocks non-browser user agents on this host.
    actually arrives.
 3. ~~Items 6, 7, 8.~~ Done. Panels and metrics become judgeable.
 4. Items 9, 10. Buried data surfaces. Item 9 is the only one needing a schema change.
-5. Item 11. Recurrence.
+5. Item 11, or its persisted-table equivalent — see items 14 and 15, which supersede it in this
+   round: build 14 first (persist every signal), then 15 (real recurrence, reading what 14 writes).
+6. Items 12 and 13 (pipeline-health signal and `/health` body) are independent of everything above
+   and of each other, and can land in either order or in parallel with the rest of this batch.
+7. Item 16 (`ai-referral-rise`) is independent and can land anywhere after item 4 exists.
 
 Items 1 and 2 are worth shipping alone even if nothing else is built, because until they land the
-two largest numbers on the page do not mean what they say.
+two largest numbers on the page do not mean what they say. Within this round, items 12–14 are worth
+shipping even if 15 and 16 are dropped: a pipeline that fails silently is a bigger risk to the whole
+dashboard's credibility than any single missing signal.
