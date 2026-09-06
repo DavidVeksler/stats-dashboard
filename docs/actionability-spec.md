@@ -981,7 +981,26 @@ fixture (day 1 and day 3 present, day 2 absent) produces `recurrence: 1` (only t
 immediately before today counts), not 2. `render-check.mjs` still asserts the existing `N days
 running` string renders for a signal carrying a non-null `recurrence`.
 
-## 16. `ai-referral-rise`: a signal for the AI-answer-engine channel actually growing
+## 16. `ai-referral-rise`: a signal for the AI-answer-engine channel actually growing — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified. `loadDashboard` builds `aiCurrentByHost` from `refs.results` (already scoped
+> to the current display period) and `aiBaselineByHost` from `histRefs.results` (the wider
+> `BASELINE_LOOKBACK_DAYS` window already read for the flood baseline), both filtered to
+> `kind === "ai"` and summed per host — no new query, per the spec. The baseline mean divides by
+> every calendar day in the window (`baselineStart` through the day before `start`), not just the
+> days that happen to have an "ai" row, so a silent day is a real zero rather than excluded — the
+> same reasoning as `errorSeries`'s measured-vs-unmeasured distinction elsewhere in this file, applied
+> to a different table. `AI_RISE_MIN_ABSOLUTE` (3) and the reused `RISE_MIN_DELTA` gate the rule
+> inside the RUM branch of `computeSignals`, severity 3, mutually exclusive with nothing. Tested in
+> `dashboard-check.mjs` against a new `vellum.capital` fixture (a real `SITES` host with no other role
+> in that file): a day-per-row ~1/day "ai" baseline plus a 5-session current day fires the signal;
+> the pre-existing `SMALL_HOST` "ai" row (2 sessions, no baseline at all — an effectively-infinite
+> relative rise) correctly produces none, since it fails `AI_RISE_MIN_ABSOLUTE`; and the zone-sourced
+> `ZONE_HOST` produces none by construction, since it writes no `daily_referrers` rows at all. The
+> baseline fixture generates one row per day from 2026-01-01 through the day before "today" rather
+> than replicating `loadDashboard`'s exact `baselineStart` arithmetic in the test — the D1 stub's own
+> date-range filter clips it to whatever window is actually queried, so the mean comes out to exactly
+> 1/day regardless of the precise width.
 
 **Symptom.** `classifyReferrer` (`src/config.js`) already tags a row `kind: "ai"` when the referrer
 is a recognized AI chat/answer-engine host (`AI_ANSWER_ENGINES`), and `AGENTS.md` documents at length

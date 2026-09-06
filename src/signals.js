@@ -47,6 +47,13 @@ export const DELTA_MIN_ABSOLUTE = SIGNAL_MIN_ABSOLUTE_CHANGE;
 export const RISE_MIN_DELTA = 0.25;
 export const DROP_MAX_DELTA = -0.25;
 
+// ai-referral-rise (item 16). Mirrors traffic-rise's relative-rise gate
+// (RISE_MIN_DELTA, reused rather than duplicated) but needs its own absolute
+// floor: DELTA_MIN_ABSOLUTE (25) would suppress every real case in an "ai"
+// bucket, which is a small fraction of an already-small channel on most sites
+// in this estate.
+export const AI_RISE_MIN_ABSOLUTE = 3;
+
 // likely-bot-subflood: a crawler spike sitting just under FLOOD_MIN_VISITS, which
 // the flood classifier is right not to fire on (below 500 sessions a flood is
 // indistinguishable from noise on volume alone) but which the four shape tests
@@ -162,6 +169,7 @@ function weigh(kind, site, extra) {
     case "snippet-gap":
     case "rank-gap": return extra.clicks;
     case "no-comparison": return Number(site.visits || 0);
+    case "ai-referral-rise": return Math.abs(extra.absolute);
     // Pipeline-health signals (item 12) are estate-wide, not site-shaped, so
     // their weight is a fixed ordering among themselves (main > Bing > forum)
     // rather than a measured quantity — severity already puts them ahead of
@@ -194,11 +202,14 @@ function daysBetween(a, b) {
  * @param {boolean} input.bingHasRowsToday `daily_bing_summary` has a row for `date`
  * @param {boolean} input.forumsConfigured `FORUMS` is non-empty
  * @param {boolean} input.forumHasRowsToday `daily_forum_activity` has a row for `date`
+ * @param {Map}    input.aiCurrentByHost  Map<host, ai-kind session sum> for the current period
+ * @param {Map}    input.aiBaselineByHost Map<host, trailing daily mean of the same sum>
  */
 export function computeSignals({ sites = [], date = null, periodDays = 1,
   zoneStatusRows = [], trafficRows = [], floodDatesByHost = new Map(),
   run = null, bingConfigured = false, bingHasRowsToday = false,
-  forumsConfigured = false, forumHasRowsToday = false } = {}) {
+  forumsConfigured = false, forumHasRowsToday = false,
+  aiCurrentByHost = new Map(), aiBaselineByHost = new Map() } = {}) {
   const ranked = [];
   const add = (signal, weight) => ranked.push({ signal, weight });
 
@@ -382,6 +393,30 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
         action: "Check which referrer drove it before counting it as growth.",
         href, recurrence: null,
       }, weigh("traffic-rise", site, { absolute }));
+    }
+
+    // ai-referral-rise (item 16): the AI-answer-engine referral badge
+    // (classifyReferrer's "ai" kind, see config.js) rising against this host's
+    // own recent history. Deliberately not a promotion of "ai" to a sourceMix
+    // channel — that stays untouched, and AGENTS.md explains at length why
+    // (most AI surfaces don't reliably send a Referer at all, so the badge
+    // undercounts). This only asks whether the badge itself is rising, a
+    // narrower and safer question. Mutually exclusive with nothing: a site can
+    // carry both traffic-rise (its RUM total, "ai" folded into "referral") and
+    // this at once — different populations answering different questions.
+    const aiCurrent = Number(aiCurrentByHost.get(host) || 0);
+    const aiBaseline = Number(aiBaselineByHost.get(host) || 0);
+    const aiAbsolute = aiCurrent - aiBaseline;
+    const aiDelta = aiBaseline > 0 ? aiAbsolute / aiBaseline : (aiCurrent > 0 ? Infinity : 0);
+    if (aiDelta >= RISE_MIN_DELTA && aiAbsolute >= AI_RISE_MIN_ABSOLUTE) {
+      add({
+        severity: 3, kind: "ai-referral-rise", host,
+        headline: `${host} AI-answer-engine referrals rose to ${num(aiCurrent)}`,
+        evidence: `${num(aiCurrent)} sessions this period tagged as arriving from an AI answer ` +
+          `engine, against a trailing baseline of about ${aiBaseline.toFixed(1)}/day.`,
+        action: "Check which AI answer engine sent it and whether the page it landed on actually answers the query.",
+        href, recurrence: null,
+      }, weigh("ai-referral-rise", site, { absolute: aiAbsolute }));
     }
 
     // no-comparison. Says out loud what the page used to leave silent: a flooded

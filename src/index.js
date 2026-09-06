@@ -1273,12 +1273,45 @@ async function loadDashboard(env, options = {}) {
   const forumsConfigured = FORUMS.length > 0;
   const forumHasRowsToday = (forumActivity.results ?? []).some((r) => r.date === date);
 
+  // ai-referral-rise inputs (spec item 16): per-host AI-answer-engine referral
+  // sums for the current period and its trailing baseline, both from rows
+  // already read for other purposes — no new query. `refs` is already scoped
+  // to the current display period (start..date); `histRefs` is the wider
+  // baseline window already read for the flood classifier's baseline, grouped
+  // by kind, filtered here to "ai" instead of used for direct-share. Both
+  // sides are RUM daily_referrers rows with the same kind filter, so the
+  // "both sides of a comparator from the same population" rule holds by
+  // construction.
+  const aiCurrentByHost = new Map();
+  for (const row of refs.results ?? []) {
+    if (row.kind !== "ai") continue;
+    aiCurrentByHost.set(row.host, (aiCurrentByHost.get(row.host) ?? 0) + Number(row.visits || 0));
+  }
+  const aiBaselineDaily = new Map(); // host -> Map<date, sum>
+  for (const row of histRefs.results ?? []) {
+    if (row.kind !== "ai" || row.date >= start) continue;
+    const perDate = aiBaselineDaily.get(row.host) ?? new Map();
+    perDate.set(row.date, (perDate.get(row.date) ?? 0) + Number(row.visits || 0));
+    aiBaselineDaily.set(row.host, perDate);
+  }
+  // The mean divides by every day in the baseline window, not just the days
+  // that happen to have an "ai" row — a day with none is a real zero, and
+  // excluding it would inflate the baseline and make a real rise harder to see.
+  const aiBaselineDates = [];
+  for (let d = baselineStart; d < start; d = addDays(d, 1)) aiBaselineDates.push(d);
+  const aiBaselineByHost = new Map();
+  for (const [host, perDate] of aiBaselineDaily) {
+    const sum = aiBaselineDates.reduce((total, d) => total + (perDate.get(d) ?? 0), 0);
+    aiBaselineByHost.set(host, aiBaselineDates.length ? sum / aiBaselineDates.length : 0);
+  }
+
   const signals = computeSignals({
     sites, date, periodDays,
     zoneStatusRows: zoneStatuses.results ?? [],
     trafficRows: hist.results ?? [],
     floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
     run, bingConfigured, bingHasRowsToday, forumsConfigured, forumHasRowsToday,
+    aiCurrentByHost, aiBaselineByHost,
   });
 
   // Real recurrence (spec item 15), decorated onto computeSignals' output

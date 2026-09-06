@@ -1170,7 +1170,7 @@ for (const period of [7, 30]) {
   }
 }
 
-// 16b. Real recurrence, read from daily_signals (spec item 15). malformed-urls
+// 17. Real recurrence, read from daily_signals (spec item 15). malformed-urls
 //      on MALFORMED_HOST fires deterministically at severity 2 regardless of
 //      any traffic/referrer fixture, which makes it the simplest real rule to
 //      drive this through — same discipline as item 14's own write-check
@@ -1231,7 +1231,7 @@ for (const period of [7, 30]) {
   dailySignalRows = saved;
 }
 
-// 17. `/health` (spec item 13) reports pipeline age instead of the literal
+// 18. `/health` (spec item 13) reports pipeline age instead of the literal
 //     string "ok" it used to. A single `runs` row read, exercised directly
 //     against `worker.fetch` rather than through `load`'s /api/json path.
 {
@@ -1274,6 +1274,44 @@ for (const period of [7, 30]) {
   }
 
   runsRow = saved;
+}
+
+// 19. ai-referral-rise (spec item 16): the AI-answer-engine referral badge
+//     (classifyReferrer's "ai" kind) rising against a host's own recent
+//     history. AI_HOST carries no other fixture data in this file, so it can
+//     be given a clean ~1/day baseline without perturbing anything else.
+{
+  const AI_HOST = "vellum.capital";
+  // A day-per-row baseline of 1 "ai" session covering every day this file's
+  // widest read could possibly ask for (BASELINE_LOOKBACK_DAYS reaches back up
+  // to 180 days) is simpler and more robust than replicating loadDashboard's
+  // exact baselineStart arithmetic here — the stub's date-range filter clips
+  // it to whatever loadDashboard actually queries, so the mean comes out to
+  // exactly 1/day regardless of the exact window width.
+  const AI_BASELINE_CUTOFF = "2026-08-08"; // the day before today (2026-08-09)
+  for (let i = 0; dayAfter("2026-01-01", i) <= AI_BASELINE_CUTOFF; i += 1) {
+    referrers.push({ date: dayAfter("2026-01-01", i), host: AI_HOST, referrer: "chatgpt.com", kind: "ai", visits: 1 });
+  }
+  // Today: 5 sessions, well past both the relative (RISE_MIN_DELTA) and
+  // absolute (AI_RISE_MIN_ABSOLUTE) floors against a ~1/day baseline.
+  referrers.push({ date: "2026-08-09", host: AI_HOST, referrer: "chatgpt.com", kind: "ai", visits: 5 });
+
+  const { data } = await load("period=1");
+  const signal = (data.signals ?? []).find((s) => s.host === AI_HOST && s.kind === "ai-referral-rise");
+  check("a rise from a ~1/day ai baseline to 5+ fires ai-referral-rise", Boolean(signal), true);
+  check("...at severity 3 (context, not an action item)", signal?.severity, 3);
+  check("...naming the current count", signal?.evidence.includes("5 sessions"), true);
+
+  // SMALL_HOST already carries a single "ai" row (2 sessions, no prior-day
+  // history at all) — a rise that fails the absolute floor (AI_RISE_MIN_ABSOLUTE)
+  // even though its relative delta is technically infinite.
+  check("a rise that fails the absolute floor produces no signal",
+    (data.signals ?? []).some((s) => s.host === SMALL_HOST && s.kind === "ai-referral-rise"), false);
+
+  // A zone-sourced host writes no daily_referrers rows at all (see AGENTS.md),
+  // so this must be true by construction — asserted here to keep it that way.
+  check("a zone-sourced host never gets ai-referral-rise",
+    (data.signals ?? []).some((s) => s.host === ZONE_HOST && s.kind === "ai-referral-rise"), false);
 }
 
 if (failures) {
