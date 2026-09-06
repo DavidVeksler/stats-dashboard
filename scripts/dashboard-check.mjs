@@ -11,6 +11,8 @@ import { looksMalformed } from "../src/urls.js";
 import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS,
   POSITION_MIN_IMPRESSIONS, RANK_MAX_POSITION, OPPORTUNITY_MIN_IMPRESSIONS } from "../src/opportunities.js";
 import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
+import { SITES, FORUMS } from "../src/config.js";
+import { bingUrlsOf } from "../src/bing.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -134,6 +136,22 @@ let zoneBotsTableExists = true;
 // missing row without disturbing every other test in this file, which reads
 // the fixed fresh value.
 let runsRow = { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
+
+// Default daily_bing_summary/daily_forum_activity rows for EVERY real
+// `bing`-configured SITES entry and every real FORUMS entry, dated to match
+// MAX(date) above ("2026-08-09"). Without these, the stale-pipeline signals
+// (item 12) would fire on every single test in this file, since the real
+// config.js SITES/FORUMS this stub reads are non-empty but this file's
+// other fixtures never populate those two tables. Mutable so the item-12
+// tests below can empty either one out to prove the signal fires, then
+// restore it so nothing else here is perturbed.
+let bingSummaryRows = SITES.filter((s) => bingUrlsOf(s).length).map((s) => ({
+  date: "2026-08-09", host: s.host, clicks: 1, impressions: 10, ctr: .1, bing_window: "2026-08-08–2026-08-09",
+}));
+let forumActivityRows = FORUMS.map((f) => ({
+  date: "2026-08-09", host: f.host, users_count: 100, active_today: 1, active_7d: 3, active_30d: 5,
+  new_today: 0, new_7d: 1, new_30d: 2, posts_today: 0, posts_count: 10, topics_count: 2,
+}));
 
 // ---- Search Console fixtures (spec items 7 and 8) -------------------------
 // The three queries in the spec's acceptance list, with their real 2026-08-13
@@ -282,6 +300,8 @@ const db = {
       // Read over the whole history window now, not just the latest day: the
       // error-spike baseline lives in these rows.
       if (sql.includes("daily_zone_status")) return { results: between(ZONE_STATUSES, binds) };
+      if (sql.includes("daily_bing_summary")) return { results: onDate(bingSummaryRows, binds) };
+      if (sql.includes("daily_forum_activity")) return { results: between(forumActivityRows, binds) };
       if (sql.includes("daily_zone_bots")) {
         // A missing table is what D1 raises before the migration lands; the read
         // path has to survive it, not 500 the whole dashboard.
@@ -524,7 +544,14 @@ const load = async (query) => {
     for (const field of ["severity", "kind", "host", "headline", "evidence", "action", "href", "recurrence"]) {
       check(`every signal carries ${field} (${signal.kind}/${signal.host})`, field in signal, true);
     }
-    check(`${signal.kind} links at the card anchor`, signal.href.startsWith("#site-"), true);
+    // Estate-wide signals (item 12's stale-pipeline family) have no card to
+    // anchor to and link at /health instead — see the render note on why a
+    // synthetic host/card-anchor is not invented for them.
+    if (signal.host) {
+      check(`${signal.kind} links at the card anchor`, signal.href.startsWith("#site-"), true);
+    } else {
+      check(`${signal.kind} is estate-wide and links at /health`, signal.href, "/health");
+    }
     check(`${signal.kind} never fabricates a recurrence`,
       signal.recurrence === null || Number.isInteger(signal.recurrence), true);
   }
@@ -1064,7 +1091,80 @@ for (const period of [7, 30]) {
   readWidths = [];
 }
 
-// 16. `/health` (spec item 13) reports pipeline age instead of the literal
+// 16. Stale-pipeline signals (spec item 12): the dashboard noticing its own
+//     three independent pulls have stopped, not just a site's traffic. Every
+//     other test in this file relies on the default bingSummaryRows/
+//     forumActivityRows fixtures above (dated to match MAX(date)) so none of
+//     these ever fire by accident; this section is the only place either one
+//     is emptied out.
+{
+  const savedRuns = runsRow;
+  const savedBing = bingSummaryRows;
+  const savedForum = forumActivityRows;
+  const hasKind = (data, kind) => (data.signals ?? []).some((s) => s.kind === kind);
+
+  // Baseline: fresh run, populated Bing/forum tables — none of the three fire.
+  {
+    const { data } = await load("period=1");
+    check("no stale-pipeline signal with a fresh run and populated tables",
+      hasKind(data, "stale-pipeline"), false);
+    check("...no bing-pipeline-stale either", hasKind(data, "bing-pipeline-stale"), false);
+    check("...no forum-pipeline-stale either", hasKind(data, "forum-pipeline-stale"), false);
+  }
+
+  // Main pipeline: a runs row more than STALE_PIPELINE_DAYS old.
+  runsRow = { run_at: "2026-08-06T13:00:00Z", ok: 1, note: "ok" };
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.kind === "stale-pipeline");
+    check("a >2-day-old runs row fires stale-pipeline", Boolean(signal), true);
+    check("...at severity 1", signal?.severity, 1);
+    check("...with host null (estate-wide, not a site)", signal?.host, null);
+    check("...pointing at /health", signal?.href, "/health");
+  }
+  runsRow = savedRuns;
+
+  // A run that IS today's but reports failure must fire it too.
+  runsRow = { run_at: "2026-08-09T13:00:00Z", ok: 0, note: "gsc pull failed" };
+  {
+    const { data } = await load("period=1");
+    check("a failed run fires stale-pipeline even if recent",
+      hasKind(data, "stale-pipeline"), true);
+  }
+  runsRow = savedRuns;
+
+  // Bing pipeline: at least one SITES entry has `bing` configured (true of the
+  // real config.js this stub reads), but daily_bing_summary has no row today.
+  bingSummaryRows = [];
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.kind === "bing-pipeline-stale");
+    check("zero daily_bing_summary rows for today fires bing-pipeline-stale", Boolean(signal), true);
+    check("...at severity 1", signal?.severity, 1);
+    check("...with host null", signal?.host, null);
+  }
+  bingSummaryRows = savedBing;
+
+  // Forum pipeline: FORUMS is non-empty (true of the real config.js), but
+  // daily_forum_activity has no row today.
+  forumActivityRows = [];
+  {
+    const { data } = await load("period=1");
+    const signal = (data.signals ?? []).find((s) => s.kind === "forum-pipeline-stale");
+    check("zero daily_forum_activity rows for today fires forum-pipeline-stale", Boolean(signal), true);
+    check("...at severity 1", signal?.severity, 1);
+  }
+  forumActivityRows = savedForum;
+
+  // Restored: back to the baseline, nothing fires.
+  {
+    const { data } = await load("period=1");
+    check("restoring the tables clears all three", ["stale-pipeline", "bing-pipeline-stale", "forum-pipeline-stale"]
+      .some((kind) => hasKind(data, kind)), false);
+  }
+}
+
+// 17. `/health` (spec item 13) reports pipeline age instead of the literal
 //     string "ok" it used to. A single `runs` row read, exercised directly
 //     against `worker.fetch` rather than through `load`'s /api/json path.
 {

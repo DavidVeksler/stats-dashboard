@@ -694,6 +694,29 @@ if (!contextOnlyHtml.includes("Nothing needs attention today.")) {
   throw new Error("Severity-3-only signals must still read as nothing to act on");
 }
 
+// An estate-wide signal (item 12's stale-pipeline family) has host: null and no
+// card to anchor to — it must render without throwing and without a card-anchor
+// href, pointing at /health instead.
+const pipelineSignal = {
+  severity: 1, kind: "stale-pipeline", host: null,
+  headline: "The main data pipeline looks stale",
+  evidence: "Last run 2026-07-10T13:00:00Z (ok): ok.",
+  action: "Check /health and wrangler tail for what's failing.",
+  href: "/health", recurrence: null,
+};
+const pipelineHtml = renderDashboard({ ...fixture, signals: [pipelineSignal, ...fixture.signals] });
+const pipelineActionsAt = pipelineHtml.indexOf(`class="actions"`);
+const pipelineActionsHtml = pipelineHtml.slice(pipelineActionsAt, pipelineHtml.indexOf("</section>", pipelineActionsAt));
+if (!pipelineActionsHtml.includes("The main data pipeline looks stale")) {
+  throw new Error("An estate-wide signal must still render in Today's actions");
+}
+if (/href="#site-[a-z0-9-]*null/i.test(pipelineActionsHtml) || pipelineActionsHtml.includes("Open null")) {
+  throw new Error("An estate-wide (host: null) signal must not render a card-anchor link or \"Open null\"");
+}
+if (!pipelineActionsHtml.includes(`href="/health"`)) {
+  throw new Error("An estate-wide signal must link at /health, not a card anchor");
+}
+
 // ---- Absolute-change floor on the delta badge (spec item 4) ---------------
 // 40 sessions from 27 is +48%, an absolute change of 13. The percentage is real
 // and the movement is not, so the badge shows the raw change, muted.

@@ -162,8 +162,23 @@ function weigh(kind, site, extra) {
     case "snippet-gap":
     case "rank-gap": return extra.clicks;
     case "no-comparison": return Number(site.visits || 0);
+    // Pipeline-health signals (item 12) are estate-wide, not site-shaped, so
+    // their weight is a fixed ordering among themselves (main > Bing > forum)
+    // rather than a measured quantity — severity already puts them ahead of
+    // every per-site signal.
+    case "stale-pipeline": return 3;
+    case "bing-pipeline-stale": return 2;
+    case "forum-pipeline-stale": return 1;
     default: return 0;
   }
+}
+
+// Whole calendar days between two YYYY-MM-DD strings (b - a). Used only by the
+// stale-pipeline checks below, which compare a stored run's date against
+// today's without pulling in index.js's date helpers — computeSignals stays a
+// pure function of the rows/values it's handed.
+function daysBetween(a, b) {
+  return Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000);
 }
 
 /**
@@ -174,11 +189,69 @@ function weigh(kind, site, extra) {
  * @param {Array}  input.zoneStatusRows  {date,host,status,requests} over the history window
  * @param {Array}  input.trafficRows     {date,host,visits,views} over the history window
  * @param {Map}    input.floodDatesByHost Map<host, Set<date>>
+ * @param {object|null} input.run   latest `runs` row ({run_at, ok, note}) or null
+ * @param {boolean} input.bingConfigured   at least one SITES entry carries a `bing` property
+ * @param {boolean} input.bingHasRowsToday `daily_bing_summary` has a row for `date`
+ * @param {boolean} input.forumsConfigured `FORUMS` is non-empty
+ * @param {boolean} input.forumHasRowsToday `daily_forum_activity` has a row for `date`
  */
 export function computeSignals({ sites = [], date = null, periodDays = 1,
-  zoneStatusRows = [], trafficRows = [], floodDatesByHost = new Map() } = {}) {
+  zoneStatusRows = [], trafficRows = [], floodDatesByHost = new Map(),
+  run = null, bingConfigured = false, bingHasRowsToday = false,
+  forumsConfigured = false, forumHasRowsToday = false } = {}) {
   const ranked = [];
   const add = (signal, weight) => ranked.push({ signal, weight });
+
+  // ---- Estate-wide: is the pipeline itself running? (item 12) --------------
+  // These are about the whole estate, not one site: host is null (never a
+  // synthetic string like "(pipeline)") and href points at /health (item 13)
+  // rather than a card anchor that does not exist for them. See the render
+  // note in the spec for why — the same discipline `Unattributed`/`internal`
+  // follow elsewhere in this codebase: never assert a measurement or a
+  // referent that isn't really there.
+  if (date) {
+    const runDateStr = run?.run_at ? String(run.run_at).slice(0, 10) : null;
+    const runAgeDays = runDateStr ? daysBetween(runDateStr, date) : null;
+    const mainStale = !run || !run.ok || runAgeDays === null || runAgeDays > STALE_PIPELINE_DAYS;
+    if (mainStale) {
+      add({
+        severity: 1, kind: "stale-pipeline", host: null,
+        headline: "The main data pipeline looks stale",
+        evidence: run
+          ? `Last run ${run.run_at} (${run.ok ? "ok" : "failed"})${run.note ? `: ${run.note}` : ""}.`
+          : "No run has ever been recorded.",
+        action: "Check /health and wrangler tail for what's failing.",
+        href: "/health", recurrence: null,
+      }, weigh("stale-pipeline", null, {}));
+    }
+
+    // Bing has its own invocation and writes no `runs` row (see AGENTS.md), but
+    // it always clears and rewrites every configured host's row every night
+    // (a thrown fetch error is the one exception, and that leaves a note in its
+    // own return value, not here) — so a configured estate with zero rows for
+    // today is the pull not having run, not a quiet night with nothing to say.
+    if (bingConfigured && !bingHasRowsToday) {
+      add({
+        severity: 1, kind: "bing-pipeline-stale", host: null,
+        headline: "The Bing pull looks stale",
+        evidence: "At least one site carries a `bing` property, but daily_bing_summary has no row for today.",
+        action: "Check /health and wrangler tail for the Bing invocation.",
+        href: "/health", recurrence: null,
+      }, weigh("bing-pipeline-stale", null, {}));
+    }
+
+    // Same reasoning for the Discourse forum pull, a step inside runDaily with
+    // no row of its own to check either.
+    if (forumsConfigured && !forumHasRowsToday) {
+      add({
+        severity: 1, kind: "forum-pipeline-stale", host: null,
+        headline: "The forum activity pull looks stale",
+        evidence: "At least one forum is configured, but daily_forum_activity has no row for today.",
+        action: "Check /health and wrangler tail for the forum pull inside runDaily.",
+        href: "/health", recurrence: null,
+      }, weigh("forum-pipeline-stale", null, {}));
+    }
+  }
 
   for (const site of sites) {
     const host = site.host;
@@ -329,6 +402,8 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
   }
 
   ranked.sort((a, b) => a.signal.severity - b.signal.severity || b.weight - a.weight
-    || a.signal.host.localeCompare(b.signal.host));
+    // host is null for estate-wide pipeline signals (item 12) — compare the
+    // empty string in that case rather than throwing on null.localeCompare.
+    || (a.signal.host ?? "").localeCompare(b.signal.host ?? ""));
   return ranked.map((entry) => entry.signal);
 }

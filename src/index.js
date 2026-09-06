@@ -1222,11 +1222,22 @@ async function loadDashboard(env, options = {}) {
   // that does not exist. The engine is a pure function of rows already read here
   // (the classifier window reaches back 30 days), so runDaily can reuse it for the
   // ntfy push without a second copy of the rules.
+  // Pipeline-health inputs for the estate-wide stale-pipeline signals (item
+  // 12) — all rows already read above, no new query. `bingSummaries` is
+  // already filtered to `date=?` in SQL (see the query comment), so any row
+  // in it is a row for today; `forumActivity` spans the history window, so it
+  // needs its own date filter here.
+  const bingConfigured = SITES.some((s) => bingUrlsOf(s).length > 0);
+  const bingHasRowsToday = (bingSummaries.results ?? []).length > 0;
+  const forumsConfigured = FORUMS.length > 0;
+  const forumHasRowsToday = (forumActivity.results ?? []).some((r) => r.date === date);
+
   const signals = computeSignals({
     sites, date, periodDays,
     zoneStatusRows: zoneStatuses.results ?? [],
     trafficRows: hist.results ?? [],
     floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
+    run, bingConfigured, bingHasRowsToday, forumsConfigured, forumHasRowsToday,
   });
 
   // Forum activity: independent of the RUM/zone measurement split above, so it

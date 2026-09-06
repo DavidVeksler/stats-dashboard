@@ -752,7 +752,29 @@ read over a tiny table instead of N re-runs of `computeSignals` over 180 days of
 referrer rows. Build in order: 12 and 13 are independent of everything else and of each other; 14
 must land before 15 (15 reads what 14 writes); 16 is independent and can land anywhere after 4.
 
-## 12. A signal for the pipeline itself going quiet
+## 12. A signal for the pipeline itself going quiet — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified, with one necessary deviation from the literal phrase "each a `stale-pipeline`
+> signal": the three checks use three distinct `kind` strings (`stale-pipeline`, `bing-pipeline-stale`,
+> `forum-pipeline-stale`), all `host: ""` in `daily_signals` (`null` in the in-memory signal — see
+> below) and `severity: 1`. One shared kind would have let two of the three fire on the same date and
+> collide on item 14's `(date, host, kind)` primary key, since all three carry the same empty host.
+> `computeSignals` gained `run`, `bingConfigured`, `bingHasRowsToday`, `forumsConfigured`,
+> `forumHasRowsToday` params, all rows/values `loadDashboard` already had in hand (no new query).
+> `weigh()` gives the three a fixed ordering (3/2/1) among themselves since they have no per-site
+> magnitude to rank by. The sort in `computeSignals` did `a.signal.host.localeCompare(...)` as its
+> final tiebreaker, which throws on a `null` host — fixed to `(a.signal.host ?? "").localeCompare(...)`
+> in the same commit, since it would otherwise have crashed on the first estate-wide signal.
+> `render.js`'s `actionsBlock` renders `Check pipeline health →` linking at `signal.href` (`/health`)
+> instead of `Open ${host} →` when `signal.host` is falsy. `dashboard-check.mjs` needed a bigger fixture
+> change than the spec anticipated: the real `src/config.js` `SITES`/`FORUMS` (not a fixture) drive
+> `bingConfigured`/`forumsConfigured`, so every test in that file would have tripped both stale signals
+> by accident without default `daily_bing_summary`/`daily_forum_activity` rows for every real
+> Bing-configured site and forum, dated to the fixture's `MAX(date)`. Added `bingSummaryRows`/
+> `forumActivityRows` as the new defaults, mutable so the item's own test section can empty either one
+> out and restore it. The existing generic `${signal.kind} links at the card anchor` assertion (loops
+> over every signal) also needed a `host` branch, since a `/health` href correctly fails a `#site-`
+> prefix check.
 
 **Symptom.** Every signal in `src/signals.js` is about a *site*. Nothing on the page or in the ntfy
 push notices when a pull stops running at all — GSC creds expiring, a Cloudflare token rotating out

@@ -71,7 +71,14 @@ function actionsBlock(signals) {
           <b>${esc(signal.headline)}</b>${signal.recurrence && signal.recurrence > 1
             ? `<span class="sev-run">${signal.recurrence} days running</span>` : ""}</div>
         <div class="action-why">${esc(signal.evidence)}</div>
-        <div class="action-do">${esc(signal.action)} <a href="${esc(signal.href)}">Open ${esc(signal.host)} &rarr;</a></div>
+        <div class="action-do">${esc(signal.action)} ${signal.host
+          // Estate-wide signals (item 12's stale-pipeline family) have no card
+          // to anchor to — href points at /health instead. Rendering "Open
+          // null" or a cardAnchor("null") link would assert a referent that
+          // doesn't exist, the same mistake `Unattributed`/`internal` avoid
+          // elsewhere in this codebase.
+          ? `<a href="${esc(signal.href)}">Open ${esc(signal.host)} &rarr;</a>`
+          : `<a href="${esc(signal.href)}">Check pipeline health &rarr;</a>`}</div>
       </li>`).join("")}</ol>`
     : `<p class="action-none">Nothing needs attention today.</p>`;
   return `<section class="actions" aria-labelledby="actions-heading">
