@@ -9,7 +9,7 @@ import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeyw
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
-import { computeSignals } from "./signals.js";
+import { computeSignals, STALE_PIPELINE_DAYS } from "./signals.js";
 import { renderDashboard } from "./render.js";
 
 // How many trailing days every KPI comparator averages over. One number, so the
@@ -1286,8 +1286,23 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Answers "did last night's pull succeed", not just "is the Worker
+    // running" (spec item 13) — the question anyone pointing an uptime check
+    // at this URL actually wants answered, and the place item 12's
+    // stale-pipeline signal points its href at. A single indexed row read,
+    // not loadDashboard, which does far more work than a health check needs.
     if (url.pathname === "/health") {
-      return new Response("ok", { headers: { "content-type": "text/plain" } });
+      const row = await env.DB.prepare(`SELECT run_at, ok FROM runs ORDER BY run_at DESC LIMIT 1`).first();
+      const lastRunAt = row?.run_at ?? null;
+      const ageHours = lastRunAt ? (Date.now() - new Date(lastRunAt).getTime()) / 3600000 : null;
+      const stale = !row || !row.ok || ageHours === null || ageHours > STALE_PIPELINE_DAYS * 24;
+      if (stale) {
+        const note = !row ? "no runs recorded"
+          : !row.ok ? "last run reported a failure"
+          : `last run is more than ${STALE_PIPELINE_DAYS} days old`;
+        return Response.json({ ok: false, lastRunAt, ageHours, note }, { status: 503 });
+      }
+      return Response.json({ ok: true, lastRunAt, ageHours });
     }
 
     if (url.pathname === "/robots.txt") {

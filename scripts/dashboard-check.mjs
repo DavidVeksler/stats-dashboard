@@ -129,6 +129,12 @@ const ZONE_STATUSES = [
 // before ensureSchema has created daily_zone_bots.
 let zoneBotsTableExists = true;
 
+// The single `runs` row `/health` (item 13) and loadDashboard's `run` field
+// both read. Mutable so the /health tests below can swap in a stale/failed/
+// missing row without disturbing every other test in this file, which reads
+// the fixed fresh value.
+let runsRow = { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
+
 // ---- Search Console fixtures (spec items 7 and 8) -------------------------
 // The three queries in the spec's acceptance list, with their real 2026-08-13
 // numbers, plus enough neighbours on each host that "not in the top 5 by its
@@ -259,7 +265,7 @@ const db = {
     let binds = [];
     const run = () => {
       if (sql.includes("MAX(date)")) return { d: DAYS.at(-1).date };
-      if (sql.includes("FROM runs")) return { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
+      if (sql.includes("FROM runs")) return runsRow;
       if (sql.includes("daily_traffic")) return { results: between(traffic, binds) };
       if (sql.includes("daily_referrers")) return { results: between(referrers, binds) };
       // The three GSC reads are NOT the same width, and that asymmetry is load
@@ -1056,6 +1062,51 @@ for (const period of [7, 30]) {
   check("the daily_traffic read for the classifier reaches back past the 30-day floor",
     readWidths.some((r) => r.table === "daily_traffic" && r.binds[0] <= "2026-03-01"), true);
   readWidths = [];
+}
+
+// 16. `/health` (spec item 13) reports pipeline age instead of the literal
+//     string "ok" it used to. A single `runs` row read, exercised directly
+//     against `worker.fetch` rather than through `load`'s /api/json path.
+{
+  const health = async () => {
+    const res = await worker.fetch(new Request("https://stats.test/health"), { DB: db });
+    return { status: res.status, body: await res.json() };
+  };
+  const saved = runsRow;
+
+  runsRow = { run_at: new Date().toISOString(), ok: 1, note: "ok" };
+  {
+    const { status, body } = await health();
+    check("/health: a fresh, ok run is 200", status, 200);
+    check("...and reports ok:true", body.ok, true);
+    check("...with the run's timestamp", body.lastRunAt, runsRow.run_at);
+    check("...and a small age in hours", body.ageHours < 1, true);
+  }
+
+  runsRow = { run_at: new Date(Date.now() - 5 * 86400000).toISOString(), ok: 1, note: "ok" };
+  {
+    const { status, body } = await health();
+    check("/health: a run more than STALE_PIPELINE_DAYS old is 503", status, 503);
+    check("...and reports ok:false", body.ok, false);
+    check("...with a note explaining why", typeof body.note, "string");
+  }
+
+  runsRow = { run_at: new Date().toISOString(), ok: 0, note: "gsc failed" };
+  {
+    const { status, body } = await health();
+    check("/health: a recent but failed run is still 503", status, 503);
+    check("...ok:false even though it just ran", body.ok, false);
+  }
+
+  runsRow = null;
+  {
+    const { status, body } = await health();
+    check("/health: no runs recorded at all is 503", status, 503);
+    check("...with lastRunAt null", body.lastRunAt, null);
+    check("...and ageHours null", body.ageHours, null);
+  }
+
+  runsRow = saved;
 }
 
 if (failures) {

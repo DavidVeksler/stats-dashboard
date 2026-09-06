@@ -799,7 +799,16 @@ last row (fires main), a `SITES`-with-`bing` fixture with zero `daily_bing_summa
 three. `render-check.mjs` asserts the action row renders without a card-anchor href for a `host:
 null` signal and does not throw building one.
 
-## 13. `/health` reports pipeline age instead of a constant
+## 13. `/health` reports pipeline age instead of a constant — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified: `STALE_PIPELINE_DAYS` (2) lives in `src/signals.js` rather than `src/index.js`
+> so item 12's stale-pipeline signals and this endpoint share the one constant, not two. The handler
+> reads only `run_at, ok` from `runs` (no `note` column, matching the spec's literal query) and
+> synthesizes its own short `note` string for the 503 body — missing row, failed run, or stale run
+> are the three cases, distinguished in the handler rather than read off the stored `runs.note`
+> (that string belongs to item 12's evidence, not to this endpoint). Tested directly against
+> `worker.fetch` in `dashboard-check.mjs` (a mutable `runsRow` the stub's `FROM runs` branch reads),
+> not through the `/api/json` path — fresh/stale/failed/missing-row cases all covered.
 
 **Symptom.** `GET /health` (`src/index.js`, the `url.pathname === "/health"` branch) returns the
 literal string `"ok"` unconditionally. It answers "is the Worker running" and nothing else — the

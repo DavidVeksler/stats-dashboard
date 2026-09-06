@@ -76,6 +76,12 @@ export const ERROR_MIN_REQUESTS = 50;
 
 export const MALFORMED_MIN_PATHS = 3;
 
+// Pipeline-health threshold, shared between the stale-pipeline signals (item 12,
+// below) and `GET /health` (src/index.js) so there is one number to tune, not
+// two that can drift apart. 2 days = one full missed night of the nightly cron
+// plus slack for the UTC/cron boundary.
+export const STALE_PIPELINE_DAYS = 2;
+
 // The card anchor renderer and engine agree on. Exported so render.js builds its
 // section ids from the same function the hrefs are built from.
 export const cardAnchor = (host) => `site-${String(host).replace(/[^a-z0-9]/gi, "-")}`;
