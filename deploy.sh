@@ -135,7 +135,7 @@ step "Verify live"
 sleep 3
 HEALTH="$(curl -fsS -A "$UA" "$URL/health" || echo FAIL)"
 echo "GET /health -> $HEALTH"
-[ "$HEALTH" = "ok" ] || { echo "health check failed" >&2; exit 1; }
+echo "$HEALTH" | grep -q '"ok":true' || { echo "health check failed" >&2; exit 1; }
 
 if [ "$DO_REFRESH" = "1" ]; then
   step "Triggering live pull (/run)"
