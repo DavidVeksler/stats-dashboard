@@ -277,6 +277,102 @@ const runBing = async (env) => {
     flat.some((s) => s.sql.includes("DELETE FROM daily_forum_activity")), false);
 }
 
+// ---- 1c. daily_signals persistence (spec item 14) --------------------------
+// runDaily's final loadDashboard() call already computes every signal for the
+// ntfy push (part 1 above exercises that with the shared `db`, whose reads are
+// unconditionally empty — a dashboard with no date at all, so `dashboard.signals`
+// is always `[]` and this write is just a DELETE with nothing to insert). To
+// prove the write actually persists a real signal, this section drives runDaily
+// against its OWN small D1 stub that answers just enough to produce one: a
+// fresh `runs` row (so the item-12 main-pipeline signal stays quiet) and three
+// malformed daily_cf_pages rows for one real RUM host, which is enough to fire
+// `malformed-urls` (src/signals.js) with no traffic or referrer rows needed at
+// all. The real SITES/FORUMS this stub can't populate (daily_bing_summary,
+// daily_forum_activity) are genuinely empty, so the two pipeline-stale signals
+// from item 12 fire alongside it — expected, not a leak, and useful evidence
+// that item 12's estate-wide signals persist through this same path too.
+{
+  const SIGNAL_HOST = SITES.find((s) => s.trafficSource !== "zone").host;
+  // runDaily writes under its own `date` (today, from `now` — real wall-clock
+  // time by default), independent of whatever loadDashboard's MAX(date) read
+  // returns for computing signals. Using the real today for both keeps every
+  // date this fixture touches consistent with what runDaily actually writes.
+  const SIGNAL_DATE = new Date().toISOString().slice(0, 10);
+  const MALFORMED_PAGES = [
+    "/category/a/%3E%C3%97%3C/span%3E1%3C/span%3E",
+    "/category/b/%3E%C3%97%3C/span%3E2%3C/span%3E",
+    "/category/c/%3E%C3%97%3C/span%3E3%3C/span%3E",
+  ];
+  let seqS = 0;
+  let batchesS = [];
+  const dbS = {
+    prepare(sql) {
+      const stmt = { sql, binds: [], seq: seqS += 1 };
+      stmt.bind = (...args) => { stmt.binds = args; return stmt; };
+      stmt.all = async () => {
+        if (sql.includes("FROM daily_cf_pages")) {
+          return { results: MALFORMED_PAGES.map((page) => ({
+            date: SIGNAL_DATE, host: SIGNAL_HOST, page, visits: 1, views: 1 })) };
+        }
+        return { results: [] };
+      };
+      stmt.first = async () => {
+        if (sql.includes("MAX(date)")) return { d: SIGNAL_DATE };
+        if (sql.includes("FROM runs")) return { run_at: `${SIGNAL_DATE}T13:00:00Z`, ok: 1, note: "ok" };
+        return null;
+      };
+      stmt.run = async () => ({ success: true });
+      return stmt;
+    },
+    async batch(list) { batchesS.push(list); return list.map(() => ({ success: true })); },
+  };
+  const runSignals = async () => {
+    seqS = 0;
+    batchesS = [];
+    const res = await worker.fetch(
+      new Request("https://stats.test/run?key=k"), { DB: dbS, REFRESH_KEY: "k", CF_API_TOKEN: "cf" });
+    await res.json();
+    return batchesS.filter((list) => !/CREATE TABLE|CREATE INDEX/i.test(list[0].sql)).flat();
+  };
+
+  const flatS = await runSignals();
+  const deleteIdx = flatS.findIndex((s) => s.sql === "DELETE FROM daily_signals WHERE date=?");
+  const inserts = flatS.filter((s) => s.sql.startsWith("INSERT INTO daily_signals"));
+  check("a run that computes signals writes a daily_signals DELETE", deleteIdx >= 0, true);
+  check("...for today's date", flatS[deleteIdx]?.binds[0], SIGNAL_DATE);
+  check("...followed by one INSERT per computed signal, in the same batch",
+    inserts.length > 0 && inserts.every((s) => flatS.indexOf(s) > deleteIdx), true);
+  // The fixture is built to produce exactly three: the per-site malformed-urls
+  // signal, plus item 12's bing- and forum-pipeline-stale (this stub's
+  // daily_bing_summary/daily_forum_activity are genuinely empty, and the real
+  // SITES/FORUMS this stub reads are non-empty, so both are expected to fire).
+  check("exactly the three signals this fixture is built to produce are persisted",
+    inserts.length, 3);
+  const malformed = inserts.find((s) => s.binds[2] === "malformed-urls");
+  check("the malformed-urls signal for the fixture host is among them", Boolean(malformed), true);
+  check("...at the fixture host, not an estate-wide row", malformed?.binds[1], SIGNAL_HOST);
+  check("...at severity 2", malformed?.binds[3], 2);
+  let evidenceParses = true;
+  try { JSON.parse(malformed?.binds[5]); } catch { evidenceParses = false; }
+  check("...with its evidence JSON-encoded", evidenceParses, true);
+  const pipelineRows = inserts.filter((s) => s.binds[1] === "");
+  check("item 12's estate-wide signals persist with host '' (never NULL)", pipelineRows.length, 2);
+  check("...covering bing and forum, not main (the runs row is fresh)",
+    pipelineRows.map((s) => s.binds[2]).sort().join(","), "bing-pipeline-stale,forum-pipeline-stale");
+
+  // Re-running for the same date must not duplicate or collide on the primary
+  // key (date, host, kind) — the DELETE-then-INSERT convention every other
+  // table follows. This stub doesn't enforce uniqueness itself (it just
+  // records statements), so what's asserted is that runDaily's own output is
+  // stable across repeats: the same DELETE and the same three INSERTs, not six.
+  const flatS2 = await runSignals();
+  const inserts2 = flatS2.filter((s) => s.sql.startsWith("INSERT INTO daily_signals"));
+  check("re-running for the same date produces the same row count, not double",
+    inserts2.length, inserts.length);
+  check("...the same set of kinds", inserts2.map((s) => s.binds[2]).sort().join(","),
+    inserts.map((s) => s.binds[2]).sort().join(","));
+}
+
 // ---- 1b. A transient per-host GSC failure must not erase existing data ----
 // Before this fix, daily_keywords/daily_pages/daily_search_summary each got an
 // unconditional DELETE at the top of the per-host loop, before the fetch that

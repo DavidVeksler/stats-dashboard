@@ -856,7 +856,26 @@ should currently return 200 (the pipeline runs nightly) — verify this the same
 endpoint in this repo is verified, per `AGENTS.md`'s WAF note (a real browser `User-Agent`, or reuse
 whatever verification path `deploy.sh` already runs).
 
-## 14. Persist every computed signal, not just the top one
+## 14. Persist every computed signal, not just the top one — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified: `daily_signals(date, host, kind, severity, headline, evidence)` with `host: ''`
+> for an estate-wide signal, `PRIMARY KEY (date, host, kind)`, in both `schema.sql` and `ensureSchema`
+> in `src/index.js`. The DELETE-then-INSERT for `date` runs as one plain `env.DB.batch([...])` right
+> after the existing `sendNtfy` call, wrapped in `.catch()` the same non-fatal way — a write failure
+> here appends a note but never fails the run. `evidence` is stored as `JSON.stringify(signal.evidence)`
+> exactly as carried (currently always a string, since no rule builds a structured evidence object
+> yet — `JSON.stringify` of a string is still valid JSON, satisfying "exactly what the signal carried"
+> for whatever shape a future rule gives it). Testing this needed more than the shared stub `db` in
+> `scripts/write-check.mjs`: that stub's reads are unconditionally empty, so `loadDashboard`'s
+> `MAX(date)` read returns nothing and `dashboard.signals` is always `[]` — a real DELETE-with-zero-
+> inserts case, but not proof the INSERT path works. Part 1c drives `runDaily` against its own small
+> D1 stub (a fresh `runs` row plus three malformed `daily_cf_pages` rows for one real RUM host, enough
+> to fire `malformed-urls` with no traffic or referrer rows needed) and asserts the DELETE precedes
+> every INSERT, the malformed-urls row carries its host/severity/JSON-parseable evidence correctly,
+> and — since this stub's `daily_bing_summary`/`daily_forum_activity` are genuinely empty against the
+> real non-empty `SITES`/`FORUMS` it reads — that item 12's two pipeline-stale signals persist
+> alongside it with `host: ''`. A second run against the same date produces the same three kinds, not
+> six, proving the DELETE-then-INSERT convention holds under a re-run the way every other table's does.
 
 **Symptom.** `runDaily` already calls `loadDashboard(env)` once per run to get the day's top
 severity-1 signal for the ntfy push (`src/index.js:400-402`: `const dashboard = await

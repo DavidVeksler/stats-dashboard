@@ -158,6 +158,23 @@ CREATE TABLE IF NOT EXISTS runs (
   note   TEXT
 );
 
+-- Every signal computeSignals produced for a date, not just the one severity-1
+-- finding runDaily used to pick out for the ntfy push (spec item 14). Read back
+-- by item 15's real recurrence. host is '' rather than NULL for an estate-wide
+-- signal (item 12's stale-pipeline family) so the primary key stays usable --
+-- SQLite treats NULL as distinct from itself, which would let duplicate
+-- estate-wide rows silently coexist within one date.
+CREATE TABLE IF NOT EXISTS daily_signals (
+  date     TEXT NOT NULL,
+  host     TEXT NOT NULL,   -- '' for an estate-wide signal, never NULL
+  kind     TEXT NOT NULL,
+  severity INTEGER NOT NULL,
+  headline TEXT,
+  evidence TEXT,            -- JSON-encoded evidence, exactly what the signal carried
+  PRIMARY KEY (date, host, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_signals_dh ON daily_signals(date, host);
+
 CREATE INDEX IF NOT EXISTS idx_traffic_date ON daily_traffic(date);
 CREATE INDEX IF NOT EXISTS idx_ref_dh ON daily_referrers(date, host);
 CREATE INDEX IF NOT EXISTS idx_kw_dh  ON daily_keywords(date, host);

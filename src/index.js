@@ -150,6 +150,14 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, query)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_bing_keywords_dh ON daily_bing_keywords(date, host)`),
+    // Every computed signal, not just the top one (spec item 14) — see the
+    // comment on this table in schema.sql for why host is '' rather than NULL.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_signals (
+      date TEXT NOT NULL, host TEXT NOT NULL, kind TEXT NOT NULL,
+      severity INTEGER NOT NULL, headline TEXT, evidence TEXT,
+      PRIMARY KEY (date, host, kind)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signals_dh ON daily_signals(date, host)`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -400,6 +408,28 @@ async function runDaily(env, now = new Date()) {
   const dashboard = await loadDashboard(env).catch(() => null);
   const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
   await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal);
+
+  // 5. Persist every computed signal, not just the top one picked out above
+  // (spec item 14) — the record item 15's recurrence reads, and what a
+  // routine acting on this dashboard's findings (per the fleet's own
+  // standards) would read instead of re-deriving the rules. DELETE-then-
+  // INSERT for the date, same idempotency convention as every other table,
+  // in one batch (a handful of rows a night, nowhere near
+  // D1_MAX_BATCH_STATEMENTS — batchInChunks is not needed here) — but still
+  // DELETE-before-INSERT in that one batch, the same ordering rule the rest
+  // of this function follows. host is '' rather than NULL for an estate-wide
+  // signal (item 12) so the primary key (date, host, kind) stays usable — see
+  // schema.sql. Non-fatal: this is a convenience record, not a data path
+  // anything else in this function depends on, so a write failure here must
+  // never fail the run, the same discipline sendNtfy above already follows.
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM daily_signals WHERE date=?`).bind(date),
+    ...(dashboard?.signals ?? []).map((signal) =>
+      env.DB.prepare(
+        `INSERT INTO daily_signals (date,host,kind,severity,headline,evidence) VALUES (?,?,?,?,?,?)`
+      ).bind(date, signal.host ?? "", signal.kind, signal.severity,
+        signal.headline ?? null, JSON.stringify(signal.evidence ?? null))),
+  ]).catch((e) => notes.push(`daily_signals write: ${e.message}`.slice(0, 140)));
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
