@@ -386,6 +386,28 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   as-is (a raw pass-through, the same as every other field), and `bingPos()` in `render.js` is what turns
   a negative value into "—" instead of a literal `-1.0`. If a future pull shows real (non-negative) click
   positions for some site, that is new information, not a regression to "fix" back to always-hidden.
+- **Bing's own API throttle is a separate ceiling from Cloudflare's subrequest budget, and it can
+  outlast a single invocation.** On 2026-09-09 the scheduled `BING_CRON` run failed every one of its
+  ~36 calls (18 properties × summary + keywords) with Bing's undocumented `ErrorCode 17
+  "ThrottleIP"` (one property, peikofflibrary.com, got `ErrorCode 4 "ThrottleUser"` instead). This is
+  Bing's own rate limit on the calling side, unrelated to the 50-subrequest-per-invocation ceiling
+  documented above — `runBingDaily` was nowhere near that ceiling (36 of 50). The calls are already
+  sequential and awaited, never concurrent (see the per-URL loops in `runBingDaily`), so this is not
+  the "thousands of requests per second" burst Microsoft's own throttle guidance describes — either
+  Bing's real per-second threshold is much lower than that, or (more likely, since Cloudflare Workers
+  egress from a shared, high-traffic IP pool) the throttle is on an IP this Worker doesn't control the
+  rest of the traffic on. **The throttle outlasted the burst**: a single isolated `GET /bing-sites`
+  call (one `GetUserSites` request, nothing else in flight) still failed with the same `ThrottleIP`
+  20+ minutes after the last of the ~70 calls made that morning (the scheduled run plus two manual
+  `/run-bing` triggers made while diagnosing this). **Do not spam `/run-bing` or `/bing-sites` while
+  throttled** — each retry is itself another call against whatever window Bing is counting, so
+  repeated manual triggers can only extend the block, never shorten it; wait and re-check later
+  instead. `src/bing.js`'s `call()` now waits `BING_CALL_DELAY_MS` (300ms) before every request as a
+  cheap, low-risk spacing measure per Microsoft's guidance, but this is unverified against the live
+  throttle (a delay this short cannot fix an IP-pool-wide or longer-window block) — it is a
+  precaution, not a confirmed fix. If this recurs, the next things to check are whether it clears on
+  its own within a day (a rolling/daily window) and whether it happens again at a lower property
+  count (isolating whether growth to 18 properties pushed this over a real quota).
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB

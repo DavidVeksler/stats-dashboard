@@ -10,7 +10,17 @@
 // https://learn.microsoft.com/en-us/dotnet/api/microsoft.bing.webmaster.api.interfaces.iwebmasterapi
 const BASE = "https://ssl.bing.com/webmaster/api.svc/json";
 
+// Bing has been observed throttling this Worker's calls (undocumented
+// `ErrorCode 17 "ThrottleIP"` / `ErrorCode 4 "ThrottleUser"`) even though
+// every call here is awaited sequentially, never concurrent -- see the
+// 2026-09-09 note in AGENTS.md. Spacing calls out is Microsoft's own
+// guidance for these codes; this is a cheap precaution, not a confirmed fix,
+// since the observed throttle outlasted a 20+ minute gap on its own.
+export const BING_CALL_DELAY_MS = 300;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function call(method, apiKey, params = {}) {
+  await sleep(BING_CALL_DELAY_MS);
   const url = new URL(`${BASE}/${method}`);
   url.searchParams.set("apikey", apiKey);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
