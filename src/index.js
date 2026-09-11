@@ -449,6 +449,70 @@ async function runDaily(env, now = new Date()) {
 // GSC failure mode. It writes to daily_bing_summary/daily_bing_keywords only —
 // disjoint tables from everything runDaily touches — so the two invocations
 // never contend for the same row even if their schedules overlap.
+// Shared by runBingDaily (live Worker-side fetch — see the ThrottleIP note on
+// it below, it is expected to fail) and ingestBingDaily (the primary path: a
+// GitHub Action fetches Bing from a non-Cloudflare IP and POSTs the same
+// per-URL results to /ingest-bing). Both hand this the same shape a
+// queryRankAndTraffic/queryKeywords call produces, one entry per URL, so the
+// merge logic and the delete-immediately-before-insert ordering rule (see
+// AGENTS.md's chunked-write gotcha) only exist once. `summaryOk`/`keywordsOk`
+// mean "at least one URL fetch for this table did not throw" — see the
+// per-table gating note above the original call site for why that, and not
+// "every URL succeeded", is the right gate.
+function applyBingHostWrite(env, date, host, { summaryParts = [], summaryOk = false, keywordParts = [], keywordsOk = false }, stmts) {
+  if (summaryOk) {
+    stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
+    const summary = mergeBingSummaries(summaryParts);
+    if (summary) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
+        ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
+      );
+    }
+  }
+  if (keywordsOk) {
+    stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
+    const { window: bingWindow, rows } = mergeBingKeywords(keywordParts);
+    for (const k of rows) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_bing_keywords
+           (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
+           VALUES (?,?,?,?,?,?,?,?)`
+        ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
+      );
+    }
+  }
+}
+
+// A site that used to carry a `bing` property and no longer does
+// (davidveksler.com, whose apex property turned out to report its subdomain's
+// traffic — see config.js) would otherwise keep the rows an earlier run wrote
+// for today: the write loop only deletes for hosts it is about to rewrite.
+// Clearing the current date for opted-out hosts costs 2 statements each and
+// keeps "no Bing property" from looking, on the card, exactly like "Bing had
+// nothing today". Only today's rows; stored history is never deleted here.
+function clearBingForOptedOutSites(env, date, stmts) {
+  for (const site of SITES.filter((s) => !bingUrlsOf(s).length)) {
+    stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, site.host));
+    stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, site.host));
+  }
+}
+
+// NOTE (2026-09-11): confirmed this always fails from inside the Worker.
+// Bing's `ErrorCode 17 "ThrottleIP"` is not this project's account, key, or
+// volume being throttled — the identical GetUserSites call, same key, from a
+// non-Cloudflare IP succeeded instantly, while every call routed through
+// Cloudflare Workers' shared egress pool 400s. That pool is shared across
+// every Workers customer, so this is a structural block on Cloudflare's IP
+// range from Bing's side, not something pacing or a key rotation can fix (see
+// the 2026-09-09 AGENTS.md note this superseded). The primary path is now
+// ingestBingDaily below, fed by scripts/bing-pull.mjs running in GitHub
+// Actions (a different, unflagged IP). This function and the BING_CRON
+// scheduled trigger are gone from wrangler.jsonc; `/run-bing` is kept only as
+// a manual diagnostic (e.g. to re-test whether Cloudflare's range is ever
+// unblocked) and is expected to report ThrottleIP failures until it is.
 async function runBingDaily(env, now = new Date()) {
   await ensureSchema(env);
   const date = utcDate(now);
@@ -479,12 +543,12 @@ async function runBingDaily(env, now = new Date()) {
       const urls = bingUrlsOf(site);
       // Same discipline as GSC's per-table gating in runDaily: each table's
       // DELETE runs only once at least one of this host's URL fetches for that
-      // table actually succeeded (didn't throw), and sits immediately before
-      // that table's own INSERTs. `queryBingSummary`/`queryBingKeywords`
-      // returning null/empty on success (Bing genuinely has no date yet) is a
-      // real answer and still clears+rewrites the table; only a thrown error
-      // (timeout, 5xx) leaves the existing day's rows alone so a re-run can
-      // recover them instead of finding them already erased.
+      // table actually succeeded (didn't throw). `queryBingSummary`/
+      // `queryBingKeywords` returning null/empty on success (Bing genuinely
+      // has no date yet) is a real answer and still clears+rewrites the
+      // table; only a thrown error (timeout, 5xx) leaves the existing day's
+      // rows alone so a re-run can recover them instead of finding them
+      // already erased.
       const summaryParts = [];
       let summaryOk = false;
       for (const url of urls) {
@@ -493,17 +557,6 @@ async function runBingDaily(env, now = new Date()) {
           summaryOk = true;
         } catch (e) {
           notes.push(`bing summary ${host} (${url}): ${e.message}`.slice(0, 140));
-        }
-      }
-      if (summaryOk) {
-        stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, host));
-        const summary = mergeBingSummaries(summaryParts);
-        if (summary) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_bing_summary (date,host,clicks,impressions,ctr,bing_window) VALUES (?,?,?,?,?,?)`
-            ).bind(date, host, summary.clicks, summary.impressions, summary.ctr, summary.window),
-          );
         }
       }
       const keywordParts = [];
@@ -516,34 +569,10 @@ async function runBingDaily(env, now = new Date()) {
           notes.push(`bing keywords ${host} (${url}): ${e.message}`.slice(0, 140));
         }
       }
-      if (keywordsOk) {
-        stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, host));
-        const { window: bingWindow, rows } = mergeBingKeywords(keywordParts);
-        for (const k of rows) {
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO daily_bing_keywords
-               (date,host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window)
-               VALUES (?,?,?,?,?,?,?,?)`
-            ).bind(date, host, k.query, k.clicks, k.impressions, k.avgClickPosition, k.avgImpressionPosition, bingWindow),
-          );
-        }
-      }
+      applyBingHostWrite(env, date, host, { summaryParts, summaryOk, keywordParts, keywordsOk }, stmts);
     }
 
-    // A site that used to carry a `bing` property and no longer does
-    // (davidveksler.com, whose apex property turned out to report its
-    // subdomain's traffic — see config.js) would otherwise keep the rows an
-    // earlier run wrote for today: the loop above only deletes for hosts it is
-    // about to rewrite. Clearing the current date for opted-out hosts costs 2
-    // statements each and keeps "no Bing property" from looking, on the card,
-    // exactly like "Bing had nothing today". Inside this branch on purpose — a
-    // run with no API key refreshes nothing and so must delete nothing. Only
-    // today's rows; stored history is never deleted here.
-    for (const site of SITES.filter((s) => !bingUrlsOf(s).length)) {
-      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_summary WHERE date=? AND host=?`).bind(date, site.host));
-      stmts.push(env.DB.prepare(`DELETE FROM daily_bing_keywords WHERE date=? AND host=?`).bind(date, site.host));
-    }
+    clearBingForOptedOutSites(env, date, stmts);
   }
 
   const batches = await batchInChunks(env.DB, stmts);
@@ -559,6 +588,51 @@ async function runBingDaily(env, now = new Date()) {
   return { date, sites: bingSites.map((s) => s.host),
     properties: bingSites.reduce((sum, s) => sum + bingUrlsOf(s).length, 0),
     batches, ok: notes.length === 0, notes };
+}
+
+// The primary Bing write path as of 2026-09-11 (see the note on runBingDaily
+// above): `/ingest-bing` receives already-fetched per-URL results from
+// scripts/bing-pull.mjs running as a scheduled GitHub Action, and this
+// function only does the merge-and-write half — no fetch, no Bing IP to be
+// throttled on. `results` is `[{ host, summaryOk, summaryParts, keywordsOk,
+// keywordParts, errors }]`, one entry per SITES host, in the exact shape
+// applyBingHostWrite already expects (each part is whatever
+// queryRankAndTraffic/queryKeywords returned for one Bing URL, or omitted if
+// that URL's fetch threw) — the Action reuses those same two functions from
+// src/bing.js so this Worker-side code never re-implements Bing's wire shape.
+// Only hosts SITES actually configures with a `bing` property are written;
+// anything else in the payload is reported and ignored rather than trusted,
+// since this endpoint is reachable by anyone with REFRESH_KEY, not just the
+// one Action that is supposed to call it.
+async function ingestBingDaily(env, date, results) {
+  await ensureSchema(env);
+  const notes = [];
+  const stmts = [];
+  const bingHosts = new Set(SITES.filter((s) => bingUrlsOf(s).length).map((s) => s.host));
+  const seen = new Set();
+  for (const entry of Array.isArray(results) ? results : []) {
+    const host = entry?.host;
+    if (!host || !bingHosts.has(host)) {
+      notes.push(`ingest-bing: ignored result for unconfigured host "${host}"`.slice(0, 140));
+      continue;
+    }
+    seen.add(host);
+    for (const err of entry.errors ?? []) notes.push(String(err).slice(0, 140));
+    applyBingHostWrite(env, date, host, {
+      summaryParts: entry.summaryParts, summaryOk: !!entry.summaryOk,
+      keywordParts: entry.keywordParts, keywordsOk: !!entry.keywordsOk,
+    }, stmts);
+  }
+  // A host configured with a `bing` property but missing from this payload
+  // (the Action itself failed before reaching it, or was run with a stale
+  // SITES list) keeps its existing rows rather than being silently cleared —
+  // same "no fetch, no delete" rule runBingDaily uses for a thrown error.
+  for (const host of bingHosts) {
+    if (!seen.has(host)) notes.push(`ingest-bing: no result for ${host} — its rows for ${date} are unchanged`);
+  }
+  clearBingForOptedOutSites(env, date, stmts);
+  const batches = await batchInChunks(env.DB, stmts);
+  return { date, sites: [...seen], batches, ok: notes.length === 0, notes };
 }
 
 // Re-read the trailing history and split today into human vs crawler traffic.
@@ -1399,15 +1473,16 @@ Content-Signal: search=no, ai-input=no, ai-train=no
 Disallow: /
 `;
 
-// The second cron string in wrangler.jsonc's `triggers.crons` — kept as one
-// named constant so the branch below and the config it depends on can't drift
-// apart silently. See runBingDaily for why this needs to be its own scheduled
-// invocation rather than a second phase inside runDaily.
-const BING_CRON = "10 13 * * *";
-
 export default {
+  // A single cron now (see wrangler.jsonc) — the second one that used to fire
+  // runBingDaily was removed 2026-09-11: Bing throttles every call routed
+  // through Cloudflare Workers' shared egress IPs (see the note on
+  // runBingDaily), so scheduling it here could only ever produce a nightly
+  // failure. scripts/bing-pull.mjs, on its own GitHub Actions schedule, is the
+  // replacement — it fetches from outside Cloudflare and POSTs the results to
+  // /ingest-bing.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(event.cron === BING_CRON ? runBingDaily(env) : runDaily(env));
+    ctx.waitUntil(runDaily(env));
   },
 
   async fetch(request, env) {
@@ -1460,19 +1535,48 @@ export default {
       return Response.json(result);
     }
 
+    // Primary Bing write path (see the 2026-09-11 note on runBingDaily above):
+    // POST /ingest-bing?key=<REFRESH_KEY> with { date, results } from
+    // scripts/bing-pull.mjs, run on a schedule outside Cloudflare (GitHub
+    // Actions) because Bing throttles every call routed through Cloudflare
+    // Workers' shared egress IPs regardless of key or pacing. This endpoint
+    // does no fetching of its own — see ingestBingDaily.
+    if (url.pathname === "/ingest-bing") {
+      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "invalid JSON body" }, { status: 400 });
+      }
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(body?.date) ? body.date : utcDate(new Date());
+      const result = await ingestBingDaily(env, date, body?.results);
+      return Response.json(result);
+    }
+
     // Which SITES rows Bing still verifies, reconciled against their `bing`
     // fields. Read-only and writes nothing — AGENTS.md asks for this re-sync
     // periodically (the account's verified list grew from 9 sites to 24 in a
     // single day), and this makes it one request instead of a script with a
     // live key pasted into it. Guarded by the same REFRESH_KEY as /run: the
     // response names every site in the Bing account, which is not public.
+    // Wrapped in try/catch (added 2026-09-11): getBingSites throwing used to
+    // surface as an uncaught exception -> a bare Cloudflare error 1101 instead
+    // of a readable error, which is exactly what a ThrottleIP failure did.
     if (url.pathname === "/bing-sites") {
       if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
         return new Response("forbidden", { status: 403 });
       }
       if (!env.BING_API_KEY) return Response.json({ error: "BING_API_KEY not set" }, { status: 503 });
-      const verified = await getBingSites(env.BING_API_KEY);
-      return Response.json({ count: verified.length, verified, diff: diffBingSites(SITES, verified) });
+      try {
+        const verified = await getBingSites(env.BING_API_KEY);
+        return Response.json({ count: verified.length, verified, diff: diffBingSites(SITES, verified) });
+      } catch (e) {
+        return Response.json({ error: e.message }, { status: 502 });
+      }
     }
 
     const dashboardOptions = {

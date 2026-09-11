@@ -23,6 +23,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | Forum user login/activity stats | `src/discourse.js` + `FORUMS` in `src/config.js` — no API key, see the note below |
 | Bing Search stats | `src/bing.js` + `bing` field in `src/config.js` — a flat API key (`BING_API_KEY`), not OAuth, see the note below |
+| Why the Bing pull runs in GitHub Actions instead of the Worker's own cron | the note on `runBingDaily` in `src/index.js`, and `scripts/bing-pull.mjs` / `.github/workflows/bing-pull.yml` |
 | Re-checking which sites Bing verifies, against `SITES` | `GET /bing-sites?key=…` (`diffBingSites` in `src/bing.js`) |
 | How the cards are grouped and ordered on the page | `groupByDomain` in `src/index.js` (+ `registrableDomain` in `src/config.js`) |
 | Everything else | this file |
@@ -80,12 +81,18 @@ The Worker has three entry points in `src/index.js`:
   2. `queryKeywords()` (`gsc.js`) → Google Search Console → top keywords (only if `GSC_SA_KEY` set).
   3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_keywords`), plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
-- **`scheduled`** on a SECOND cron (`10 13 * * *`, `BING_CRON` in `src/index.js`) and **`GET /run-bing?key=…`**
-  both call `runBingDaily(env)` instead — a deliberately separate invocation from `runDaily` above, not a
-  second phase inside it, so Bing's subrequests spend their own fresh 50/request budget rather than
-  runDaily's, which the GSC pull already runs close to. See the Bing paragraph and the subrequest-budget
-  gotcha below. It writes only `daily_bing_summary`/`daily_bing_keywords` and does not touch `runs` or
-  send an ntfy push.
+- **Bing's pull is a scheduled GitHub Action, not a Worker cron** (`.github/workflows/bing-pull.yml`,
+  `scripts/bing-pull.mjs`) — moved out 2026-09-11 after confirming Bing throttles every call routed
+  through Cloudflare Workers' shared egress IPs (`ErrorCode 17 "ThrottleIP"`), independent of this
+  account, key, or pacing: the identical `GetUserSites` call from a non-Cloudflare IP succeeded
+  instantly. The Action fetches with the same `queryRankAndTraffic`/`queryKeywords` from `src/bing.js`
+  and **`POST`s the raw per-URL results** to `POST /ingest-bing?key=…`, which does only the
+  merge-and-write half (`ingestBingDaily` in `src/index.js`) — no fetch, no Bing IP to be throttled on.
+  `runBingDaily(env)` and **`GET /run-bing?key=…`** still exist (kept as a manual diagnostic, e.g. to
+  re-test whether Cloudflare's range is ever unblocked) but are expected to fail with `ThrottleIP` from
+  inside the Worker. There is no longer a second cron in `wrangler.jsonc`. Writes only
+  `daily_bing_summary`/`daily_bing_keywords` and does not touch `runs` or send an ntfy push, same as
+  before.
 - **`GET /bing-sites?key=…`** (same `REFRESH_KEY` guard, writes nothing) returns Bing's
   `GetUserSites` list plus `diffBingSites(SITES, verified)` — `ok` / `stale` (a config string Bing no
   longer returns, with the URL it does have for that host) / `missing` (a host this dashboard already
@@ -408,6 +415,30 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   precaution, not a confirmed fix. If this recurs, the next things to check are whether it clears on
   its own within a day (a rolling/daily window) and whether it happens again at a lower property
   count (isolating whether growth to 18 properties pushed this over a real quota).
+- **RESOLVED 2026-09-11: the throttle was never about this account, key, or volume — it is Cloudflare
+  Workers' shared egress IP pool.** The block above was still failing 4 days later, across every
+  scheduled run, with a brand-new `BING_API_KEY`. The same `GetUserSites` call, same key, made
+  directly from a non-Cloudflare machine, returned `200` instantly. Bing (or whatever's fronting it)
+  has flagged the IP range Cloudflare Workers share across every one of its customers, which no
+  amount of pacing, key rotation, or waiting inside the Worker can fix — it isn't this project's
+  traffic being throttled. **Fix: the Bing pull no longer runs inside the Worker at all.**
+  `.github/workflows/bing-pull.yml` runs `scripts/bing-pull.mjs` on GitHub's own runners (a different,
+  unflagged IP) on the same daily schedule the old `BING_CRON` used, and `POST`s the fetched results to
+  `POST /ingest-bing?key=…`, a new endpoint that only merges and writes them (`ingestBingDaily` in
+  `src/index.js` — the same `applyBingHostWrite`/`mergeBingSummaries`/`mergeBingKeywords` logic
+  `runBingDaily` always used, extracted so both callers share it rather than diverging). `runBingDaily`
+  and `/run-bing` still exist and are still wired to the real Bing API — kept only as a manual way to
+  re-test whether Cloudflare's range is ever unblocked — but are expected to keep failing with
+  `ThrottleIP` from inside the Worker. If a *new* IP-shaped throttle ever shows up against GitHub's
+  runners too, don't repeat the pacing/key-rotation cycle above — check from a third, unrelated network
+  first, the same way this was root-caused.
+- **`/ingest-bing` trusts the request body's shape but not its content.** It writes only to hosts
+  already in `SITES` with a `bing` property (`ingestBingDaily` filters everything else out and reports
+  it in `notes` rather than trusting the caller) — the endpoint is reachable by anyone holding
+  `REFRESH_KEY`, the same guard `/run` and `/run-bing` use, not restricted to the one Action that is
+  supposed to call it. A host present in `SITES` but missing from a payload keeps its existing rows for
+  that date rather than being cleared, the same "no fetch, no delete" rule `runBingDaily` always applied
+  to a thrown per-URL error — a partial or crashed Action run must not erase yesterday's-still-good data.
 - **Row growth is unpruned and that is a deliberate, human decision.** There is no retention deletion
   anywhere in this codebase. At 25 rows a site `daily_keywords` grew about 110k rows a year; at 500
   it is up to 6,000 rows a night, about **2.2M rows a year** (a few hundred MB against D1's 10 GB

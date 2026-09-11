@@ -118,8 +118,10 @@ npm run tail      # live logs
 
 Secrets (set once via `wrangler secret put`, or auto-provisioned by `deploy.sh`):
 - `CF_API_TOKEN` — Cloudflare token with **Account Analytics: Read** (the Worker's GraphQL calls). ✅ set
-- `REFRESH_KEY` — protects `GET /run`. ✅ set (saved locally in `.deploy/refresh_key.txt`, gitignored)
+- `REFRESH_KEY` — protects `GET /run` and `POST /ingest-bing`. ✅ set (saved locally in `.deploy/refresh_key.txt`, gitignored)
 - `GSC_SA_KEY` — Google service-account JSON. ✅ set
+- `BING_API_KEY` — Bing Webmaster Tools API key. Set for `/bing-sites` and the (expected-to-fail,
+  diagnostic-only) `/run-bing` — see below for why the real nightly Bing pull doesn't use it from here.
 
 > Note: the analytics token deploys the Worker and binds D1 at runtime, but is **not** scoped
 > for D1 management writes, so `d1 execute --remote` / `--schema` can fail with codes `10000`
@@ -127,6 +129,13 @@ Secrets (set once via `wrangler secret put`, or auto-provisioned by `deploy.sh`)
 > runtime D1 binding before a data pull.
 
 Vars (in `wrangler.jsonc`): `NTFY_TOPIC = david-stats-cf-serp`.
+
+**The Bing pull runs in GitHub Actions, not on a Worker cron** (`.github/workflows/bing-pull.yml`,
+`scripts/bing-pull.mjs`) — Bing throttles every call routed through Cloudflare Workers' shared egress
+IPs (`ErrorCode 17 "ThrottleIP"`), confirmed 2026-09-11 to be independent of the account, key, or
+pacing. The Action fetches from Bing and `POST`s the results to `POST /ingest-bing?key=<REFRESH_KEY>`,
+which only writes them to D1. Requires two **GitHub repo secrets** (Settings → Secrets and variables →
+Actions): `BING_API_KEY` and `STATS_REFRESH_KEY` (the same value as the Worker's `REFRESH_KEY`).
 
 ## Resources (created 2026-07-16)
 

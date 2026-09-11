@@ -1,0 +1,34 @@
+name: Bing pull
+
+# Fetches Bing Webmaster Tools stats and POSTs them to the Worker's
+# /ingest-bing endpoint. Runs here, not as a Cloudflare Worker cron, because
+# Bing throttles every call routed through Cloudflare Workers' shared egress
+# IPs (ErrorCode 17 "ThrottleIP") regardless of this account, key, or pacing —
+# confirmed 2026-09-11 by the same call succeeding instantly from a
+# non-Cloudflare IP. See the note on runBingDaily in src/index.js.
+#
+# Requires two repo secrets:
+#   BING_API_KEY      - Bing Webmaster Tools API key (Settings -> API Access)
+#   STATS_REFRESH_KEY - the Worker's REFRESH_KEY (see .deploy/refresh_key.txt)
+
+on:
+  schedule:
+    # 13:10 UTC daily -- 10 minutes after the Worker's own nightly pull
+    # (0 13 * * * in wrangler.jsonc), the same offset the old in-Worker
+    # BING_CRON used, so Bing data lands shortly after everything else.
+    - cron: "10 13 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Pull Bing stats and ingest into D1
+        env:
+          BING_API_KEY: ${{ secrets.BING_API_KEY }}
+          STATS_REFRESH_KEY: ${{ secrets.STATS_REFRESH_KEY }}
+        run: node scripts/bing-pull.mjs
