@@ -432,6 +432,31 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `ThrottleIP` from inside the Worker. If a *new* IP-shaped throttle ever shows up against GitHub's
   runners too, don't repeat the pacing/key-rotation cycle above — check from a third, unrelated network
   first, the same way this was root-caused.
+- **The `/ingest-bing` POST itself then hit a second, unrelated block: `stats.davidveksler.com`'s zone
+  has Bot Fight Mode on, and it JS-challenges the GitHub Actions runner even with a browser
+  `User-Agent`.** This surfaced immediately after the fix above shipped: the Action's Bing fetch
+  succeeded every time (16/16 sites), but the `POST /ingest-bing` got a Cloudflare "Just a moment…"
+  challenge page back (HTTP 403), the same template `bots-check`-style WAF blocks use but from a
+  different mechanism. Confirmed by checking the zone's actual settings, not guessing: `browser_check`
+  was `on` and a WAF Custom Rule scoped to the exact path (`skip` action, `products: [..., "bic",
+  "securityLevel", ...]`) and a Page Rule (`security_level: essentially_off`) both failed to let it
+  through — because neither addresses Bot Fight Mode, which came back `"fight_mode": true` from
+  `GET /zones/{id}/bot_management` and, on the Free plan, has **no per-path exception at all** (that
+  needs the paid Super Bot Fight Mode, which does support Configuration Rule-style overrides — an
+  actual Configuration Rule attempt here also 403'd with `request is not authorized`, i.e. blocked by
+  plan, not by token scope). **Fix: `wrangler.jsonc` now also serves the Worker on its own
+  `*.workers.dev` URL** (`workers_dev: true`, `preview_urls: false` to avoid enabling extra per-deploy
+  URLs) — Cloudflare's own domain, not this zone, so Bot Fight Mode never sees it. The GitHub Actions
+  workflow points `STATS_INGEST_BING_URL` at that URL instead of the custom domain (see the env var in
+  `.github/workflows/bing-pull.yml`); `scripts/bing-pull.mjs`'s default endpoint stays
+  `stats.davidveksler.com` for local/manual runs, which keep working from a residential/dev-machine IP
+  the same zone doesn't challenge — Bot Fight Mode's decision is evidently IP-reputation-based, not a
+  blanket non-browser block. `/ingest-bing` (and every other route) is reachable at **both** hostnames
+  now; `REFRESH_KEY` is what actually gates it either way, so this doesn't weaken auth — it only routes
+  around a challenge a script can never complete. If Bot Fight Mode is ever needed to *stay off* the
+  workers.dev hostname too (e.g. it starts getting scraped), the two Cloudflare artifacts created and
+  then reverted while diagnosing this — a `http_request_firewall_custom` skip rule and a Page Rule on
+  `/ingest-bing` — are not the answer; they were confirmed not to touch Bot Fight Mode at all.
 - **`/ingest-bing` trusts the request body's shape but not its content.** It writes only to hosts
   already in `SITES` with a `bing` property (`ingestBingDaily` filters everything else out and reports
   it in `notes` rather than trusting the caller) — the endpoint is reachable by anyone holding

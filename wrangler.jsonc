@@ -41,6 +41,17 @@
     { "pattern": "stats.davidveksler.com", "custom_domain": true }
   ],
 
+  // Also serve on *.workers.dev. This zone's Bot Fight Mode (zone-wide, not
+  // path-scoped on the Free plan) JS-challenges any non-browser client
+  // hitting stats.davidveksler.com, including the GitHub Actions runner that
+  // POSTs to /ingest-bing (.github/workflows/bing-pull.yml). workers.dev is
+  // Cloudflare's own domain, not this zone, so it isn't behind that
+  // challenge -- /ingest-bing (and /run-bing, /run) stay REFRESH_KEY-gated
+  // regardless of which hostname reaches them. See the Bing paragraph in
+  // AGENTS.md for the full story.
+  "workers_dev": true,
+  "preview_urls": false,
+
   "observability": { "enabled": true },
 
   "vars": {

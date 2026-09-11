@@ -28,6 +28,14 @@ import { fileURLToPath } from "node:url";
 import { SITES } from "../src/config.js";
 import { bingUrlsOf, queryRankAndTraffic, queryKeywords } from "../src/bing.js";
 
+// stats.davidveksler.com's zone has Bot Fight Mode on (zone-wide, no
+// per-path exception on the Free plan), which JS-challenges requests from
+// IPs it doesn't trust -- it let this pass from a residential/dev-machine
+// IP but not from GitHub Actions' runner IP, even with an identical browser
+// User-Agent. The GitHub Actions workflow overrides this via
+// STATS_INGEST_BING_URL to the Worker's *.workers.dev URL instead, which
+// isn't behind that zone's challenge; REFRESH_KEY still gates the endpoint
+// either way. See wrangler.jsonc's `workers_dev` comment and AGENTS.md.
 const DEFAULT_ENDPOINT = "https://stats.davidveksler.com/ingest-bing";
 const DEFAULT_TIMEOUT_SECONDS = 60;
 // The zone's WAF blocks non-browser user agents (Cloudflare error 1010/a JS

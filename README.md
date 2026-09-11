@@ -137,6 +137,12 @@ pacing. The Action fetches from Bing and `POST`s the results to `POST /ingest-bi
 which only writes them to D1. Requires two **GitHub repo secrets** (Settings → Secrets and variables →
 Actions): `BING_API_KEY` and `STATS_REFRESH_KEY` (the same value as the Worker's `REFRESH_KEY`).
 
+The Action posts to the Worker's `*.workers.dev` URL, not `stats.davidveksler.com` — that zone has
+Bot Fight Mode on, which JS-challenges the GitHub runner's IP (a separate issue from the Bing-side
+throttle above, found right after that fix shipped). `workers_dev: true` in `wrangler.jsonc` serves
+the same Worker there too; `REFRESH_KEY` still gates `/ingest-bing` regardless of hostname. See the
+`AGENTS.md` gotcha for the full diagnosis.
+
 ## Resources (created 2026-07-16)
 
 - Worker: `stats-dashboard` on account **David Veksler's Websites** (`556c237bf8cb62edb8f7b401499bb7a9`)

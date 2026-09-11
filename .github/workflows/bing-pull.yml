@@ -7,6 +7,13 @@ name: Bing pull
 # confirmed 2026-09-11 by the same call succeeding instantly from a
 # non-Cloudflare IP. See the note on runBingDaily in src/index.js.
 #
+# Posts to the *.workers.dev URL, not stats.davidveksler.com: that custom
+# domain's zone has Bot Fight Mode on (zone-wide, no per-path exception on
+# the Free plan), which JS-challenges any non-browser client -- including
+# this runner. workers.dev is Cloudflare's own domain, not that zone, so it
+# isn't behind the challenge; /ingest-bing is still REFRESH_KEY-gated either
+# way. See wrangler.jsonc's `workers_dev` comment and AGENTS.md.
+#
 # Requires two repo secrets:
 #   BING_API_KEY      - Bing Webmaster Tools API key (Settings -> API Access)
 #   STATS_REFRESH_KEY - the Worker's REFRESH_KEY (see .deploy/refresh_key.txt)
@@ -31,4 +38,5 @@ jobs:
         env:
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
           STATS_REFRESH_KEY: ${{ secrets.STATS_REFRESH_KEY }}
+          STATS_INGEST_BING_URL: "https://stats-dashboard.david-veksler-s-websites.workers.dev/ingest-bing"
         run: node scripts/bing-pull.mjs
