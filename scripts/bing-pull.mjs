@@ -30,6 +30,12 @@ import { bingUrlsOf, queryRankAndTraffic, queryKeywords } from "../src/bing.js";
 
 const DEFAULT_ENDPOINT = "https://stats.davidveksler.com/ingest-bing";
 const DEFAULT_TIMEOUT_SECONDS = 60;
+// The zone's WAF blocks non-browser user agents (Cloudflare error 1010/a JS
+// challenge page) -- see the WAF gotcha in AGENTS.md. Node's default fetch UA
+// trips it, so scripts/refresh-stats.mjs's same convention applies here.
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -153,7 +159,7 @@ async function run(opts) {
 
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": BROWSER_USER_AGENT },
     body: JSON.stringify({ date, results }),
     signal: AbortSignal.timeout(DEFAULT_TIMEOUT_SECONDS * 1000),
   });
