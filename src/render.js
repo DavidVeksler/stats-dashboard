@@ -756,6 +756,15 @@ export function renderDashboard(data) {
   const zoneSites = data.sites.filter((site) => site.zoneSourced);
   const hasZoneSite = zoneSites.length > 0;
   const hasBingSite = data.sites.some((site) => site.bingSummary || site.bingKeywords.length);
+  // The page-level "Search clicks"/"Search impressions" tiles are the one place
+  // Google and Bing ARE added together — unlike every per-site card, which keeps
+  // them on separate rows (see AGENTS.md: two engines, two tools, never merged
+  // there). At the estate level the reader wants "how much search traffic did
+  // the estate get", and CTR/position stay Google-only right below since Bing's
+  // reported fields (no position on the summary, a per-query -1 "not reported"
+  // sentinel) aren't comparable enough to fold into those same curves.
+  const bingClicksTotal = data.sites.reduce((sum, site) => sum + Number(site.bingSummary?.clicks || 0), 0);
+  const bingImpressionsTotal = data.sites.reduce((sum, site) => sum + Number(site.bingSummary?.impressions || 0), 0);
   const rumDomains = totals.rumDomains ?? rumSites.length;
   const pagesPerSession = totals.pagesPerSession ?? (totals.visits ? totals.views / totals.visits : 0);
   const updatedAt = data.dataUpdatedAt || data.run?.run_at;
@@ -844,14 +853,23 @@ export function renderDashboard(data) {
     const opportunityNote = totals.opportunities
       ? `<a class="cmp" href="#${cardAnchor(opportunityHost ?? "")}" title="Ranked by lost clicks for snippet gaps and by potential clicks at position ${TARGET_POSITION} for ranking gaps — two classes, two remedies, two metrics.">${fmt(totals.snippetOpportunities ?? 0)} snippet · ${fmt(totals.rankOpportunities ?? 0)} rank</a>`
       : "";
+    const bingBreakdown = (googleValue, bingValue) => hasBingSite
+      ? ` (${fmt(googleValue)} Google clicks + ${fmt(bingValue)} Bing)` : "";
+    const bingImpressionBreakdown = hasBingSite
+      ? ` (${fmt(totals.gscImpressions)} Google + ${fmt(bingImpressionsTotal)} Bing)` : "";
     stats.push(
-      ["Google clicks", fmt(totals.gscClicks), `<span>${esc(gscWindow)} · rolling GSC window</span>${gscMean(trend.gscClicksPerSnapshot)}`, "search"],
-      ["Search impressions", fmt(totals.gscImpressions), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}</span>${gscMean(trend.gscImpressionsPerSnapshot)}`, "search"],
-      ["Search CTR", pct(totals.gscCtr, 1), `${expected}${trend.gscSnapshots > 1 ? cmp(`14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : ""}`, "search"],
-      ["Median search position", totals.gscMedianPosition ? totals.gscMedianPosition.toFixed(1) : "—",
+      ["Search clicks", fmt(totals.gscClicks + bingClicksTotal), `<span>${esc(gscWindow)} · rolling GSC window${bingBreakdown(totals.gscClicks, bingClicksTotal)}</span>${gscMean(trend.gscClicksPerSnapshot)}`, "search"],
+      ["Search impressions", fmt(totals.gscImpressions + bingImpressionsTotal), `<span>across ${fmt(totals.searchDataDomains)} domain${totals.searchDataDomains === 1 ? "" : "s"}${bingImpressionBreakdown}</span>${gscMean(trend.gscImpressionsPerSnapshot)}`, "search"],
+      [hasBingSite ? "Search CTR (Google only)" : "Search CTR", pct(totals.gscCtr, 1), `${expected}${trend.gscSnapshots > 1 ? cmp(`14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : ""}`, "search"],
+      [hasBingSite ? "Median search position (Google only)" : "Median search position", totals.gscMedianPosition ? totals.gscMedianPosition.toFixed(1) : "—",
         // "7 of 11 queries" read as though the estate had 11 queries; it is 11
         // STORED rows clearing the impression floor, out of a corpus of tens of
-        // thousands of impressions. Name the population.
+        // thousands of impressions. Name the population. Unlike the clicks/
+        // impressions tiles above, CTR and position stay Google-only: Bing's
+        // summary carries no position field at all, and its per-query rows use a
+        // -1 "not reported" sentinel that can't be folded into a median or the
+        // expectedCtr() position curve (which is itself sourced from a
+        // Google-CTR study — see AGENTS.md).
         `<span>${fmt(totals.gscTop10Queries ?? 0)} of ${fmt(totals.gscPositionQueries ?? 0)} stored top queries in the top 10</span>${opportunityNote}`, "search"],
     );
   }
@@ -964,7 +982,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     <div><b>Forum activity</b> is read from each Discourse forum's own <code>/about.json</code>, the same rolling-window counters its admin dashboard shows (active users today / 7 days / 30 days, new signups on the same three windows) — not re-derived from the paginated admin user list. These are Discourse's own counts, not this dashboard's; no comparator or crawler-flood logic applies to them.</div>
     <div><b>Search opportunities come in two classes with two different remedies, ranked by two different metrics.</b> A <b>snippet</b> gap is a query at position ${SNIPPET_MAX_POSITION} or better taking under ${pct(SNIPPET_CTR_RATIO, 0)} of the click-through its rank would ordinarily deliver: the ranking is already there, so the fix is the title and meta description, and these are ranked by <b>lost clicks</b> — impressions × (expected CTR − actual CTR) — which is what is recoverable without moving at all. A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}, where nobody ever saw the snippet, so the fix is content and internal links, and these are ranked by <b>potential clicks</b> — what the query would earn at position ${TARGET_POSITION}, less what it earns now. Ranking both classes by lost clicks would guarantee that a deep, valuable query always lost to a shallow trivial one. Both classes need at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions and at least ${MIN_ACTIONABLE_CLICKS} clicks of gain over the window; past position ${RANK_MAX_POSITION} a query is neither badged nor counted. Expected CTR by position is approximated from the SISTRIX 2020 CTR study (~80M keywords; positions 1, 2, 3 and 10 measured, the rest interpolated and the tail past 10 estimated), so it is a comparator and never a target — that is why no number derived from it is shown to more than one decimal place. Where a site sets <code>queryDenyPatterns</code> in <code>src/config.js</code>, matching queries still appear in the list and carry no badge.</div>
     ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other. The crawler-flood classifier cannot run on them either — it needs a referrer dimension the zone log does not have — so each zone card carries its own two-lens accounting instead: <b>verified crawlers</b>, from the categories Cloudflare cryptographically verifies, which is a floor on crawler volume rather than a bot/human split (this plan does not expose bot scores, so unverified crawlers are unmeasurable and sit in the same bucket as real readers), and <b>non-content requests</b>, meaning crawler-protocol and asset paths plus every response ≥ 400. The two overlap, so they are never added, and no human count is claimed for a zone host at all.</div>` : ""}
-    ${hasBingSite ? `<div><b>Bing Search</b> is pulled from Bing Webmaster Tools, a separate account-wide API key rather than GSC's OAuth. It is never added to the Google figures above — a different engine's audience, measured by a different tool. The site-wide summary (clicks, impressions, CTR) updates daily; per-query rows update weekly, so a query list can be several days further behind than the summary beside it — each carries its own window. Bing reports two positions per query (where clicks landed, and where every impression landed) rather than GSC's one, shown as reported rather than averaged into a single figure. Only sites with a verified Bing Webmaster Tools property (<code>bing</code> in <code>src/config.js</code>) are pulled; page-level Bing data is not collected, to stay within the Worker's per-invocation subrequest budget.</div>` : ""}
+    ${hasBingSite ? `<div><b>Bing Search</b> is pulled from Bing Webmaster Tools, a separate account-wide API key rather than GSC's OAuth. Per site, it stays on its own card row, never merged into that site's Google figures — a different engine's audience, measured by a different tool. Only the estate-wide "Search clicks"/"Search impressions" tiles above add the two together, so a reader asking "how much search traffic in total" isn't stuck summing two tiles by hand; CTR and median position stay Google-only there, because Bing reports no per-query position curve to fold into either. The site-wide summary (clicks, impressions, CTR) updates daily; per-query rows update weekly, so a query list can be several days further behind than the summary beside it — each carries its own window. Bing reports two positions per query (where clicks landed, and where every impression landed) rather than GSC's one, shown as reported rather than averaged into a single figure. Only sites with a verified Bing Webmaster Tools property (<code>bing</code> in <code>src/config.js</code>) are pulled; page-level Bing data is not collected, to stay within the Worker's per-invocation subrequest budget.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics, Google Search Console${hasBingSite ? ", and Bing Webmaster Tools" : ""}.</div>
   </footer>
 </div>

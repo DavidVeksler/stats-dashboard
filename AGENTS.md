@@ -167,9 +167,18 @@ loudly (a note in the `runs` table) rather than silently zeroing — see `parseA
 **Bing Search is a fourth, independent pull**, per-site rather than estate-wide like Discourse —
 sites opt in via an optional `bing` property in `src/config.js`, pulled by `src/bing.js`, stored in
 `daily_bing_summary`/`daily_bing_keywords`, and rendered on that site's own card (a "Bing Search"
-stat row plus a "Top search queries (Bing)" panel) rather than merged into the Google Search figures
-above it. It is a different search engine's audience measured by a different tool, and combining the
-two would repeat the RUM/zone population-mismatch mistake documented above. Auth is a single flat
+stat row plus a "Top search queries (Bing)" panel) rather than merged into that site's Google Search
+figures above it. Per site it is a different search engine's audience measured by a different tool,
+and combining the two there would repeat the RUM/zone population-mismatch mistake documented above.
+**The one deliberate exception is the page-level "Search clicks"/"Search impressions" KPI tiles**
+(`render.js`, `renderDashboard`): those two sum Google's `daily_search_summary` totals with every
+site's `bingSummary` clicks/impressions, because at the estate level "how much search traffic in
+total" is a real question a reader asks, and it's summed there instead of forcing them to add two
+tiles by hand. Both tiles' subtitles name the Google/Bing split whenever any site has Bing data
+(`hasBingSite`), so the combination is never silent. CTR and median-position stay Google-only, both
+there and on every card — Bing's summary has no position field at all, and per-query rows carry a
+`-1` "not reported" sentinel, so neither can be folded into a median or into `expectedCtr()`'s
+position curve (itself sourced from a Google-CTR study). Auth is a single flat
 `BING_API_KEY` (Settings → API Access in Bing Webmaster Tools), not OAuth, and one key covers every
 site verified under that Bing account — see `getUserSites` in `bing.js` for discovering the exact
 `Url` string a site is registered under (Bing 400s on anything else, the same intolerance GSC has

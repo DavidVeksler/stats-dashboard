@@ -326,7 +326,13 @@ const required = [
   "Open wiki.example &rarr;", `href="#site-wiki-example"`,
   "library.example error responses are 12.9% of requests",
   "davidveksler.freecapitalists.org is serving 8 malformed URLs",
-  "Google clicks", "Search impressions",
+  "Search clicks", "Search impressions",
+  // Item: the estate-wide clicks/impressions tiles add Google + Bing together
+  // (46 Google + 26 Bing = 72 clicks; 2200 Google + 839 Bing = 3039 impressions),
+  // and say so — CTR/position stay Google-only right below since Bing has no
+  // per-query position curve to fold into either.
+  ">72<", ">3,039<", "(46 Google clicks + 26 Bing)", "(2,200 Google + 839 Bing)",
+  "Search CTR (Google only)", "Median search position (Google only)",
   // Item 6: the panel is RUM-only, the residual is named and moved out of the bar.
   "Traffic sources (RUM sites only)",
   "<b>Unattributed: 80 sessions (6.2%)</b>",
