@@ -1066,7 +1066,7 @@ Actions for an unrelated IP-throttle reason). `write-check.mjs` currently assert
 the Bing invocation; item 17's acceptance adds the same assertion for `runDaily`, because 47 is a
 number that will otherwise be discovered the way vellum.capital's missing summary was.
 
-## 17. Join query to page — IMPLEMENTED (commit sha added after commit)
+## 17. Join query to page — IMPLEMENTED (`df749cb`, 2026-09-18)
 
 > Landed as specified, with three deviations worth recording. (1) `site.queryPages` is not a `Map`
 > on the shaped row: the page is attached directly to each opportunity row and to each of the twelve
