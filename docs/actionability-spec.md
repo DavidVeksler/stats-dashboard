@@ -3,8 +3,8 @@
 Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
 `e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
 (2026-08-13), with item 8's comparator corrected in `c629dfa` and its stored-keyword coverage
-fixed in `3bd0838` (both 2026-08-13). Items 9, 10, 11, and the P4 batch (12–16, added 2026-09-05)
-are proposed.
+fixed in `3bd0838` (both 2026-08-13). Items 9, 10, 11 and the P5 batch (17–18, added 2026-09-18) are proposed; the P4 batch
+(12–16, added 2026-09-05) is implemented.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -1049,6 +1049,294 @@ read in the first place, so this should be true by construction — assert it st
 
 ---
 
+# P5. Search data that names the page, and remembers last month
+
+Added 2026-09-18 against `master` @ `28e848c`. Two items, in order: 17 first (it changes the
+nightly GSC pull and is what makes the two search signals name a page), then 18 (its own weekly
+invocation, plus a backfill). Neither touches the RUM/zone/Bing/forum paths.
+
+**The budget fact that shapes both items.** `runDaily` is at roughly **47 of 50 subrequests**
+tonight, not the "close" the `AGENTS.md` bullet was written at: 4 RUM (`CF_ACCOUNTS`) + ~5 zone
+(library) + 1 GSC token exchange + 17 × 2 GSC (`SITES` has grown from 12 to 17 `gsc` properties since
+that bullet; the summary call is already derived) + 2 forums + 1 ntfy. **Neither item may add a
+per-site fetch to `runDaily`.** Item 17 gets its data by *changing* what one existing call asks for;
+item 18 runs as its own invocation with its own budget, the way `runBingDaily` was designed (the
+budget reasoning there applies unchanged, even though the Bing fetch itself later moved to GitHub
+Actions for an unrelated IP-throttle reason). `write-check.mjs` currently asserts a budget only for
+the Bing invocation; item 17's acceptance adds the same assertion for `runDaily`, because 47 is a
+number that will otherwise be discovered the way vellum.capital's missing summary was.
+
+## 17. Join query to page
+
+**Symptom.** `daily_keywords` and `daily_pages` are two lists that never meet. `snippet-gap` says
+"rewrite the title and meta description for those pages" and `rank-gap` says "strengthen those
+pages", and neither can say *which* pages, because no stored row carries both a query and a page.
+Every action the search rules produce therefore starts with the reader opening Search Console and
+doing the join by hand, which is the work the dashboard exists to remove. Two further questions are
+unanswerable for the same reason: which single page carries the most recoverable clicks (a page
+with twelve queries at positions 6–15 is a better afternoon than any one query), and whether two of
+a site's pages are splitting one query's impressions between them (cannibalization, the one
+ranking problem where "strengthen the page" is the wrong fix and consolidating is the right one).
+
+**Root cause.** `queryKeywords` (`src/gsc.js`) asks for `dimensions: ["query"]`. Search Console
+accepts `["query", "page"]` in one request at the same `rowLimit`, and returns one row per pair with
+the same `clicks / impressions / ctr / position` fields.
+
+**Change.**
+
+- **`queryKeywords` becomes a pair pull.** In `src/gsc.js`, `querySearchAnalytics` takes a
+  `dimensions` array rather than one `dimension` (every existing caller passes a one-element
+  array; `querySearchSummary` passes none). A new `queryQueryPages(token, siteUrl, start, end,
+  rowLimit, pageFilter)` requests `["query", "page"]` and returns `{ query, page, clicks,
+  impressions, position }` rows. `gscPageFilter` still applies unchanged (it is a `page` dimension
+  filter and composes with any dimension set).
+- **Query rows are derived from the pairs, not fetched separately.** A new `summarizeQueryPages(
+  pairs)` groups by `query`, sums clicks and impressions, and takes the impression-weighted mean
+  position — the same arithmetic and the same exactness argument as `summarizeKeywordRows`, and for
+  the same reason: when the pair pull is **not truncated**, the pairs *are* the whole corpus, so the
+  per-query sums reproduce exactly what a `["query"]` request would have returned. This is not a
+  population change: both a `["query"]` request and a `["query", "page"]` request omit Google's
+  anonymized queries, so `daily_keywords` keeps meaning what it means today. (`daily_pages` is
+  different — a `["page"]` request *includes* anonymized-query traffic in each page's totals — and
+  that is why `queryPages` stays a separate call and is **not** derived from the pairs; see the
+  population note below.)
+- **`daily_search_summary` derivation is unchanged in principle**: `summarizeKeywordRows` over the
+  derived query rows when the pair pull was untruncated, otherwise the separate summary request,
+  exactly as today.
+- **Truncation.** Pairs outnumber queries (a query that ranks two pages is two rows), so at the same
+  cap the pair pull truncates sooner. Set `QUERY_PAGE_ROW_LIMIT = 1000` beside `KEYWORD_ROW_LIMIT`,
+  with the same "one constant because one decision" comment; every site stores well under 500
+  queries today (`AGENTS.md`, `KEYWORD_ROW_LIMIT` bullet), so no site is expected to truncate at
+  1,000 pairs. When one does (`pairs.length === QUERY_PAGE_ROW_LIMIT`), the derived query rows are
+  incomplete for whichever queries lost pairs to the cut, and `runDaily` falls back to the old
+  `["query"]` request for that host — one extra call for that host only, the same shape as the
+  existing summary fallback. Report it in `notes` (`gsc pairs truncated <host>`) so the budget
+  cost is visible in the `runs` row, and measure the pair count per site on the first live pull
+  before deciding whether 1,000 is right. Do not raise it pre-emptively.
+- **Storage.** New table in `schema.sql` and in the idempotent `ensureSchema` batch (D1 gotcha in
+  `AGENTS.md`: the deploy token cannot apply `schema.sql`):
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS daily_query_pages (
+    date        TEXT NOT NULL,   -- snapshot date (matches daily_keywords)
+    host        TEXT NOT NULL,
+    query       TEXT NOT NULL,
+    page        TEXT NOT NULL,   -- full URL as GSC returns it, same as daily_pages.page
+    clicks      INTEGER NOT NULL DEFAULT 0,
+    impressions INTEGER NOT NULL DEFAULT 0,
+    position    REAL NOT NULL DEFAULT 0,
+    gsc_window  TEXT,
+    PRIMARY KEY (date, host, query, page)
+  );
+  CREATE INDEX IF NOT EXISTS idx_qp_dh ON daily_query_pages(date, host);
+  ```
+
+  Written in `runDaily` under the same `if (env.GSC_SA_KEY)` guard, DELETE-the-day-then-INSERT per
+  host, the DELETE gated on the pair fetch succeeding and pushed immediately before its INSERTs — the
+  per-table rule from the "each GSC table's DELETE is gated on its own fetch" bullet, applied to a
+  fourth table. `daily_keywords` continues to be written (from the derived rows) so every existing
+  reader is untouched. Row growth: pairs run roughly 1.2–1.5× queries, so this adds on the order of
+  the existing `daily_keywords` volume again (a few million rows a year, still far inside D1's
+  limit). If that ever needs trimming, the lever is to store only pairs with `impressions >=
+  OPPORTUNITY_MIN_IMPRESSIONS` — nothing below that can carry a badge — but that is a retention
+  decision and stays David's, per the unpruned-growth bullet in `AGENTS.md`.
+- **Read.** `loadDashboard` reads `daily_query_pages` for the **latest date only**, same width as
+  `daily_keywords`/`daily_pages` and for the same cost reason; `dashboard-check.mjs` asserts the bind
+  width for it as it does for the other three. Per site:
+  - `site.queryPages`: a `Map<query, [{ page, clicks, impressions, position, share }]>` sorted by
+    impressions desc, `share` = that page's fraction of the query's stored impressions.
+  - Every row in `site.opportunities.snippet` / `.rank` gains `page` (the top-share page for that
+    query) and `pageShare`. `classifyOpportunity` itself does not change — it stays a pure function
+    of the query row — the page is attached beside it in `loadDashboard`.
+  - `site.pageOpportunities = { snippet: [...], rank: [...] }`: the two opportunity classes grouped
+    by `page`, each entry `{ page, queries: n, lostClicks }` or `{ page, queries: n, potentialClicks
+    }`, ranked by its own class's metric. **Two lists, two metrics, never summed** — item 7's rule
+    survives the change of grain from query to page unchanged, and for the same reason: a page's
+    lost clicks and its potential clicks answer different questions with different fixes.
+  - `site.cannibalized`: queries with `impressions >= CANNIBAL_MIN_IMPRESSIONS` (new, exported,
+    e.g. 20) where **two or more** pages each hold `>= CANNIBAL_MIN_SHARE` (e.g. 0.25) of the
+    query's stored impressions, ranked by impressions. Both constants live in `src/opportunities.js`
+    beside the thresholds they resemble, and both are interpolated into the footer prose (the
+    "footer prose is interpolated, not retyped" rule; `render-check.mjs` asserts it).
+- **Signals** (`src/signals.js`, RUM branch, same measurement-class gate as today):
+  - `snippet-gap` and `rank-gap` keep their kind, severity and metric, and their `evidence`
+    gains the page: `led by "<query>" at position 12.3 on <path>`. Their `action` becomes concrete:
+    snippet — `Rewrite the title and meta description on <path> (and N other pages)`; rank —
+    `Strengthen <path> and link to it from the strongest related page on the site`. The `href`
+    stays the site card.
+  - New `query-cannibalization`, **severity 3** to start (observe tier — the rule has never been
+    run against live data and a false positive here tells the reader to merge two pages), firing
+    when `site.cannibalized` is non-empty: headline `<host> has N queries split across pages`,
+    evidence naming the top query and its two pages with shares, action `Pick one page to rank
+    for it, consolidate the other into it or canonical to it`. Mutually exclusive with nothing.
+    Promote to severity 2 only after a real case has been confirmed by eye.
+- **Render** (`src/render.js`): each badged query row shows its page's path (strip the site's own
+  origin, the same way the `daily_pages` list already displays a page); a `Pages to fix` panel per
+  card with the top five entries of each `pageOpportunities` class under its own class heading and
+  its own unit (`~3.2 clicks a window recoverable` vs `~4.1 clicks a window out of reach`), and a
+  `Split queries` list when `cannibalized` is non-empty. Each page-level figure is labelled `over
+  stored queries` — see the population note. `/api/json` carries the same new fields.
+- **Population note, to preserve.** `daily_pages` totals include anonymized-query traffic;
+  `daily_query_pages` sums per page do not. So a page's clicks in the existing `Top pages` list and
+  its lost-clicks sum in `Pages to fix` are **different populations** and must never be printed as
+  numerator and denominator of one ratio or as before/after on one line. Same rule as the Search CTR
+  tile's two sides, same fix: label which rows each figure is drawn from.
+
+**Acceptance.**
+
+- `write-check.mjs`: the GSC stub answers `["query","page"]` with a fixture in which one query spans
+  two pages; assert `daily_keywords` INSERTs carry the summed clicks/impressions and the
+  impression-weighted position for that query, that `daily_query_pages` gets one INSERT per pair,
+  that its DELETE sits immediately before its INSERTs and inside the `GSC_SA_KEY` guard, that a
+  pair-fetch 503 leaves that host's `daily_query_pages` *and* `daily_keywords` rows alone (no DELETE
+  for either — the query rows are derived from the failed fetch), and that a fixture returning
+  exactly `QUERY_PAGE_ROW_LIMIT` rows triggers the `["query"]` fallback and the note. **Add a fetch
+  counter to the stub and assert `runDaily`'s total fetches `<= 50` with the real `SITES`, printing
+  the number under `--verbose`** — this is the assertion that should already exist.
+- `dashboard-check.mjs`: a fixture where one query's stored impressions split 60/40 across two
+  pages produces one `cannibalized` entry and one `query-cannibalization` signal at severity 3; a
+  70/30 split at fewer than `CANNIBAL_MIN_IMPRESSIONS` impressions produces none; the existing
+  `snippet`/`rank` fixtures now carry a `page`; `pageOpportunities.snippet` ranks by summed
+  `lostClicks` and `.rank` by summed `potentialClicks`, and no field sums the two. Assert the
+  `daily_query_pages` bind width is the latest date only.
+- `render-check.mjs`: the `snippet-gap` action text contains the page path; a `Pages to fix` block
+  renders both class headings with their different units; the footer names `CANNIBAL_MIN_SHARE`
+  from the import; no `Pages to fix` figure appears on the same line as a `Top pages` figure.
+- Live: after one `/run`, compare the estate's pair count per site against `QUERY_PAGE_ROW_LIMIT`
+  and record it in this item's implementation note. If any site truncates, the note says which and
+  what the fallback cost the budget.
+
+## 18. Query and page history, weekly, backfilled from Search Console's own 16 months
+
+**Symptom.** Every temporal question about search is unanswerable: which queries are rising,
+which fell out of the top ten last month, which pages have been losing clicks for six weeks (the
+"refresh this" list), and whether a title rewrite did anything. The page is deliberately
+latest-day-only for `daily_keywords`/`daily_pages` — `AGENTS.md`'s read-width bullet prices a
+naive widening at 180,000 rows a load — and even if it were widened, the rows would not answer the
+question: each snapshot is a 3-day window overlapping its neighbours by two days, so a day-over-day
+difference "is not a like-for-like change" (the rolling-window gotcha), and the tables only exist
+since 2026-08. Three separate obstacles, one design that clears all three.
+
+**Change.**
+
+1. **A weekly pull over a non-overlapping window, in its own invocation.** `runWeeklySearch(env,
+   weekStart?)` in `src/index.js`, on its own cron (`0 14 * * 1`, an hour after the nightly, in
+   `wrangler.jsonc` — `scheduled` dispatches on `event.cron`, which it does not yet do; add the
+   switch) and its own guarded endpoint `GET /run-weekly?key=…[&week=YYYY-MM-DD]`. Its window is
+   the most recent complete Monday–Sunday week that ends at least 3 days before today (GSC's lag),
+   so consecutive weeks share no days and a week-over-week difference is a real change. Per `gsc`
+   site it makes two calls, `["query"]` at `KEYWORD_ROW_LIMIT` and `["page"]` at a new
+   `WEEKLY_PAGE_ROW_LIMIT` (200 — the nightly stores 15 pages, which is a "top pages" list; decay
+   detection needs the middle of the distribution, where the decaying pages are), plus one token
+   exchange: **1 + 17 × 2 = 35 of 50**, with the same assertion in `write-check.mjs` the Bing
+   invocation has. Nothing about `runDaily` changes.
+2. **Two tables**, `weekly_keywords` and `weekly_pages`, same columns as their daily counterparts
+   with `week_start TEXT` in place of `date` (PK `(week_start, host, query)` / `(week_start, host,
+   page)`, indexed on `(week_start, host)`), plus `gsc_window` as always, because a human reading a
+   date reads what Google measured. DELETE-the-week-then-INSERT per (table, host), gated on that
+   table's fetch, chunked through `batchInChunks` like everything else. Growth: 52 × 17 × ~700 rows,
+   about 600k rows a year — small next to the nightly keyword tables.
+3. **Backfill from Google, not from our own history.** Search Console retains 16 months, so the
+   history does not have to be waited for. `scripts/gsc-backfill.mjs` (Node, local) computes the
+   list of complete weeks from 16 months ago to the most recent eligible one (~70 weeks) and calls
+   `GET /run-weekly?key=…&week=<monday>` for each, **sequentially**, with a short pause, reading
+   `.deploy/refresh_key.txt` the way `refresh-stats.mjs` does. Each call is its own invocation with
+   its own budget, the service-account key never leaves Cloudflare, and there is no new ingest
+   endpoint or new secret to manage. Use the `workers.dev` hostname or a browser `User-Agent`
+   (WAF gotcha). Idempotent by construction (DELETE-then-INSERT per week), so a partial backfill is
+   re-run, not repaired. Weeks with no rows for a site (a property that did not exist yet) write
+   nothing and are not an error.
+4. **Movers are computed in the weekly run and persisted, never on page load.** After writing the
+   week, `runWeeklySearch` reads the trailing `MOVE_BASELINE_WEEKS` (8) weeks of both tables for
+   each host — roughly 100k rows once a week in the write path, which is cheap; the same read on
+   every `GET /` is exactly what the read-width bullet forbids — and writes one small table:
+
+   ```sql
+   CREATE TABLE IF NOT EXISTS weekly_search_moves (
+     week_start    TEXT NOT NULL,
+     host          TEXT NOT NULL,
+     kind          TEXT NOT NULL,   -- query-drop | query-rise | query-new | page-decay
+     key           TEXT NOT NULL,   -- the query or the page URL
+     clicks_now    INTEGER NOT NULL DEFAULT 0,
+     clicks_base   REAL NOT NULL DEFAULT 0,   -- baseline median, measured weeks only
+     position_now  REAL,
+     position_base REAL,
+     impressions   INTEGER NOT NULL DEFAULT 0,
+     weeks_running INTEGER NOT NULL DEFAULT 1, -- consecutive weeks the condition held
+     gsc_window    TEXT,
+     PRIMARY KEY (week_start, host, kind, key)
+   );
+   ```
+
+   `loadDashboard` and `summarizeToday` (both — the two independent windows lesson from the
+   `BASELINE_LOOKBACK_DAYS` bullet) read only the **latest week's** rows of this table, a few
+   hundred rows, and `computeSignals` stays a pure function of what was read.
+
+   The rules, each with an absolute floor (the "every ratio rule carries an absolute floor" rule),
+   each with the baseline built from **measured weeks only** (the `errorSeries` lesson: an absent
+   week is absent, not zero), and each requiring at least `MOVE_MIN_BASELINE_WEEKS` (3) measured
+   baseline weeks or it does not fire:
+   - `query-drop`: query with `>= MOVE_MIN_IMPRESSIONS` (20) impressions this week **and** a
+     baseline median of `>= MOVE_MIN_CLICKS` (5) clicks, whose position worsened by `>=
+     POSITION_MOVE_MIN` (3.0) against the baseline median position. Ranked by `clicks_base -
+     clicks_now`. **Severity 2.** Action: `Open <query>'s page (item 17 names it) and check what
+     changed — content, a lost internal link, a new competitor`.
+   - `query-rise`: the mirror, position improved by `>= POSITION_MOVE_MIN`, ranked by clicks
+     gained. **Severity 3.** Context, not an action; it is also how a title rewrite's effect is seen.
+   - `query-new`: first appearance across all stored weeks for that host, with `>=
+     MOVE_MIN_IMPRESSIONS` impressions and position `<= RANK_MAX_POSITION`. Only fires when the host
+     has `>= MOVE_MIN_BASELINE_WEEKS` stored weeks, or the first week after a backfill gap would
+     declare everything new. **Severity 3.**
+   - `page-decay`: page whose clicks this week are `<= DECAY_RATIO` (0.6) × its baseline median,
+     with baseline median `>= DECAY_MIN_CLICKS` (10), **for two consecutive weeks** — the second week
+     is what separates a page that dipped from a page that is decaying, and the weekly rows are right
+     there to check it, so this is measured, not inferred. `weeks_running` carries the count.
+     Ranked by clicks lost. **Severity 2.** Action: `Refresh the content and confirm it still ranks
+     for its main queries; if it was superseded, redirect it`. A page can be in `page-decay` and one
+     of its queries in `query-drop` at once; they are different grains explaining possibly the same
+     loss, and the reader sees both — unlike `likely-bot-subflood`/`traffic-rise`, which compete to
+     explain one number and are exclusive for that reason.
+
+   All constants exported from a new `src/moves.js` (the rule set is big enough to be its own
+   module, the way `opportunities.js` is), interpolated into the footer prose, and the movers are
+   RUM-only by construction (only `gsc` sites are pulled; the zone host has a `gsc` property but the
+   RUM branch gate in `computeSignals` still applies).
+5. **Render.** A `This week in search` panel per card: up to three entries per kind, each with
+   `clicks_now` vs `clicks_base` and the two positions, labelled with the week's `gsc_window` —
+   never a bare `week_start`, which is only when we asked. The two severity-2 kinds feed `Today's
+   actions` through the existing ranking; the two severity-3 kinds render in the panel only. Where
+   item 17's pairs name a page for a moved query, show it.
+
+**Not in scope, noted so it is not re-derived.** Year-over-year search totals per host fall out
+of the backfilled `weekly_pages` rows for free when a host's page pull is untruncated (a `["page"]`
+request includes anonymized-query traffic, so summing its untruncated rows is exact — the
+`summarizeKeywordRows` argument again, on the other dimension), and would give the search tiles a
+`vs same week last year` comparator. A third weekly call per site for a true summary would push
+the invocation to 52 of 50, so if this is wanted it is the derivation or nothing. Leave it for a
+later item.
+
+**Acceptance.**
+
+- `write-check.mjs`: drive `runWeeklySearch` against the stub with a fixed `weekStart`; assert the
+  window is Monday–Sunday and ends `>= 3` days before "today", that the two tables' DELETE/INSERT
+  pairs are ordered and gated per table, that a fixture of 9 stored weeks with one page at 4 clicks
+  against a median of 12 for the latest **two** weeks yields exactly one `page-decay` row with
+  `weeks_running = 2` and a single such week yields none, that a query at position 4.0 against a
+  baseline median of 9.5 yields `query-rise` and the reverse `query-drop`, that a host with 2
+  stored weeks yields no moves of any kind, and that the invocation's fetch count with the real
+  `SITES` is `<= 50` (print it under `--verbose`).
+- `dashboard-check.mjs`: `weekly_search_moves` is read for the latest week only (bind width
+  asserted); a `page-decay` row yields a severity-2 signal in `Today's actions` and a `query-rise`
+  row does not; the zone host yields none.
+- `render-check.mjs`: the panel shows the `gsc_window`, not `week_start`; the footer names
+  `DECAY_RATIO` and `POSITION_MOVE_MIN` from the import.
+- Live: run `scripts/gsc-backfill.mjs`, then confirm `SELECT host, COUNT(DISTINCT week_start) FROM
+  weekly_keywords GROUP BY host` shows ~70 weeks for the older properties and fewer for the four
+  added 2026-08-27, and that the first scheduled Monday run appends exactly one week per host.
+  Record the pair and row counts in this item's implementation note.
+
+---
+
 # Test plan
 
 `npm run check` is the gate. Extend the three existing scripts rather than adding a framework.
@@ -1085,6 +1373,9 @@ change is verified the same way, with a `curl` after deploy checking for a 200 w
 6. Items 12 and 13 (pipeline-health signal and `/health` body) are independent of everything above
    and of each other, and can land in either order or in parallel with the rest of this batch.
 7. Item 16 (`ai-referral-rise`) is independent and can land anywhere after item 4 exists.
+8. Item 17 before 18. Item 17 changes the nightly pull and must keep `runDaily` inside its
+   subrequest budget (its acceptance adds the assertion); item 18 is a separate invocation and a
+   backfill, and its `query-drop` action points at the page item 17 names.
 
 Items 1 and 2 are worth shipping alone even if nothing else is built, because until they land the
 two largest numbers on the page do not mean what they say. Within this round, items 12–14 are worth

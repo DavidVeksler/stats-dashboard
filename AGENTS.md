@@ -15,7 +15,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
 | Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
-| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 implemented; 9, 10, 11 proposed) |
+| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 and 12–16 implemented; 9, 10, 11 and the P5 search batch 17–18 proposed) |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
@@ -363,7 +363,10 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
   `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
   is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
-  removes ~1 GSC call per site per night. If the estate grows enough that this stops being enough
+  removes ~1 GSC call per site per night. **Re-counted 2026-09-18 with 17 `gsc` properties: 4 RUM + ~5 zone + 1
+  token + 34 GSC + 2 forums + 1 ntfy is about 47 of 50** — so no new per-site fetch fits in `runDaily`
+  at all; anything new either changes what an existing call asks for or runs as its own invocation (spec
+  items 17 and 18 are shaped by exactly this). If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
   Workers plan's subrequest ceiling itself, not another code trim — that is a billing decision, David's
   call. **Bing's pull deliberately does NOT spend out of this headroom at all.** `runBingDaily` (see
