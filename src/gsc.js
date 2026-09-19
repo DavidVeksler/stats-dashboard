@@ -56,11 +56,14 @@ export async function getAccessToken(sa, nowSec) {
 }
 
 // Search Analytics rows for one property over [start, end] (YYYY-MM-DD).
-// pageFilter is an optional RE2 expression matched against the result page URL.
-async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLimit, pageFilter) {
+// `dimensions` is an array (["query"], ["page"], ["query", "page"]) or empty
+// for the dimensionless total; every row comes back with `keys` in that order.
+// pageFilter is an optional RE2 expression matched against the result page URL,
+// and composes with any dimension set — it is a filter, not a dimension.
+async function querySearchAnalytics(token, siteUrl, start, end, dimensions, rowLimit, pageFilter) {
   const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
   const requestBody = { startDate: start, endDate: end };
-  if (dimension) requestBody.dimensions = [dimension];
+  if (dimensions?.length) requestBody.dimensions = dimensions;
   if (rowLimit) requestBody.rowLimit = rowLimit;
   if (pageFilter) {
     requestBody.dimensionFilterGroups = [{
@@ -73,7 +76,7 @@ async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLi
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
   });
-  if (!res.ok) throw new Error(`GSC ${dimension} ${res.status} for ${siteUrl}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`GSC ${dimensions?.join("+") || "summary"} ${res.status} for ${siteUrl}: ${await res.text()}`);
   const body = await res.json();
   return body.rows ?? [];
 }
@@ -86,7 +89,7 @@ async function querySearchAnalytics(token, siteUrl, start, end, dimension, rowLi
 // of calling this — see the comment there for why that is exact, not an
 // approximation, and why it exists (the Worker's own subrequest budget).
 export async function querySearchSummary(token, siteUrl, start, end, pageFilter = null) {
-  const rows = await querySearchAnalytics(token, siteUrl, start, end, null, 1, pageFilter);
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, [], 1, pageFilter);
   const row = rows[0] ?? {};
   return {
     clicks: row.clicks ?? 0,
@@ -154,8 +157,13 @@ export function summarizeKeywordRows(rows) {
 // floor, not a cap that needs raising again.
 export const KEYWORD_ROW_LIMIT = 500;
 
+// The plain query-dimension pull. Since spec item 17 this is the FALLBACK, not
+// the nightly path: `runDaily` asks for query+page pairs (`queryQueryPages`) and
+// derives the per-query rows from them (`summarizeQueryPages`), and only calls
+// this when that pair pull came back truncated at QUERY_PAGE_ROW_LIMIT — the one
+// case where the derived rows would be incomplete.
 export async function queryKeywords(token, siteUrl, start, end, rowLimit = KEYWORD_ROW_LIMIT, pageFilter = null) {
-  const rows = await querySearchAnalytics(token, siteUrl, start, end, "query", rowLimit, pageFilter);
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, ["query"], rowLimit, pageFilter);
   return rows.map((r) => ({
     query: r.keys[0],
     clicks: r.clicks ?? 0,
@@ -165,8 +173,16 @@ export async function queryKeywords(token, siteUrl, start, end, rowLimit = KEYWO
   }));
 }
 
+// The page-dimension pull. Deliberately NOT derived from the query+page pairs
+// below, even though both carry a page: a ["page"] request includes the traffic
+// of Google's anonymized queries in each page's totals, and any request carrying
+// the `query` dimension omits those queries entirely. Summing the pairs per page
+// would therefore under-count every page by its anonymized share — a different
+// population, not an approximation of the same one. `daily_pages` keeps meaning
+// "everything Google measured for this page"; per-page sums over the pairs mean
+// "over the stored queries", and render.js labels them that way.
 export async function queryPages(token, siteUrl, start, end, rowLimit = 25, pageFilter = null) {
-  const rows = await querySearchAnalytics(token, siteUrl, start, end, "page", rowLimit, pageFilter);
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, ["page"], rowLimit, pageFilter);
   return rows.map((r) => ({
     page: r.keys[0],
     clicks: r.clicks ?? 0,
@@ -174,4 +190,67 @@ export async function queryPages(token, siteUrl, start, end, rowLimit = 25, page
     ctr: r.ctr ?? 0,
     position: r.position ?? 0,
   }));
+}
+
+// How many query+page PAIRS to ask Search Console for, per property, per
+// snapshot (spec item 17). Same one-constant-one-decision rule as
+// KEYWORD_ROW_LIMIT above: whatever comes back is what gets stored in
+// daily_query_pages, and the per-query rows in daily_keywords are derived from
+// the same response.
+//
+// Why it is larger than KEYWORD_ROW_LIMIT: pairs outnumber queries — a query that
+// ranks two of a site's pages is two rows — so at the same cap the pair pull
+// would truncate sooner than the query pull it replaces. Every site stored well
+// under 500 queries at the time of writing, so 1,000 pairs is expected to leave
+// every site untruncated; when a site does hit it, `runDaily` falls back to a
+// separate ["query"] request for that host (one extra subrequest, for that host
+// only) and says so in the run's note. Measure the live pair counts before
+// changing this, in either direction — see the item 17 note in AGENTS.md.
+export const QUERY_PAGE_ROW_LIMIT = 1000;
+
+// One row per (query, page) pair. `page` is the full URL exactly as Google
+// returns it (same as `queryPages`), so the two can be joined by string.
+export async function queryQueryPages(token, siteUrl, start, end, rowLimit = QUERY_PAGE_ROW_LIMIT, pageFilter = null) {
+  const rows = await querySearchAnalytics(token, siteUrl, start, end, ["query", "page"], rowLimit, pageFilter);
+  return rows.map((r) => ({
+    query: r.keys[0],
+    page: r.keys[1],
+    clicks: r.clicks ?? 0,
+    impressions: r.impressions ?? 0,
+    position: r.position ?? 0,
+  }));
+}
+
+// Derive the per-query rows `queryKeywords` would have returned, from the
+// query+page pairs already pulled for the same window — no extra request.
+//
+// Exact, not an approximation, on the same argument as `summarizeKeywordRows`:
+// when the pair pull is NOT truncated (pairs.length < the rowLimit it was
+// requested with), the pairs are the whole (query, page) corpus for the window,
+// so summing a query's clicks and impressions across its pages and taking the
+// impression-weighted mean of its per-page positions reproduces what Google's
+// own ["query"] aggregation computes (its `position` is impression-weighted —
+// Search API reference). And it is the SAME POPULATION: both request shapes omit
+// anonymized queries, so a row here means exactly what a `daily_keywords` row
+// always meant. Call `queryKeywords` instead when the pull came back truncated.
+//
+// Sorted by clicks then impressions, descending, matching Google's own default
+// row order so "the top of the list" keeps meaning the same thing either way.
+export function summarizeQueryPages(pairs) {
+  const byQuery = new Map();
+  for (const pair of pairs ?? []) {
+    const acc = byQuery.get(pair.query) ?? { query: pair.query, clicks: 0, impressions: 0, weighted: 0 };
+    acc.clicks += Number(pair.clicks || 0);
+    acc.impressions += Number(pair.impressions || 0);
+    acc.weighted += Number(pair.position || 0) * Number(pair.impressions || 0);
+    byQuery.set(pair.query, acc);
+  }
+  return [...byQuery.values()]
+    .map(({ query, clicks, impressions, weighted }) => ({
+      query, clicks, impressions,
+      ctr: impressions > 0 ? clicks / impressions : 0,
+      position: impressions > 0 ? weighted / impressions : 0,
+    }))
+    .sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions
+      || String(a.query).localeCompare(String(b.query)));
 }

@@ -3,8 +3,8 @@
 Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
 `e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
 (2026-08-13), with item 8's comparator corrected in `c629dfa` and its stored-keyword coverage
-fixed in `3bd0838` (both 2026-08-13). Items 9, 10, 11 and the P5 batch (17–18, added 2026-09-18) are proposed; the P4 batch
-(12–16, added 2026-09-05) is implemented.
+fixed in `3bd0838` (both 2026-08-13). Items 9, 10, 11 and 18 are proposed; the P4 batch (12–16, added 2026-09-05) and item 17
+(2026-09-18, same day it was written) are implemented.
 Written 2026-08-12 against the live page and `master` @ `6a07946`.
 
 Audience: the implementing agent. Every work item names the exact file and line to change, plus an
@@ -1066,7 +1066,25 @@ Actions for an unrelated IP-throttle reason). `write-check.mjs` currently assert
 the Bing invocation; item 17's acceptance adds the same assertion for `runDaily`, because 47 is a
 number that will otherwise be discovered the way vellum.capital's missing summary was.
 
-## 17. Join query to page
+## 17. Join query to page — IMPLEMENTED (commit sha added after commit)
+
+> Landed as specified, with three deviations worth recording. (1) `site.queryPages` is not a `Map`
+> on the shaped row: the page is attached directly to each opportunity row and to each of the twelve
+> visible `keywords` rows (`page`, `pageShare`, `pageCount`, via `pageForQuery`), which is what the
+> renderer and the signals actually need and what survives `/api/json`; the grouped structure exists
+> only inside `loadDashboard`. (2) The truncation report is **not** a `notes` entry — a note marks the
+> run `ok = 0`, which fires item 12's severity-1 `stale-pipeline` signal, and a site outgrowing a row
+> cap is not a pipeline failure. It is appended to the stored `runs.note` text as `gsc pairs
+> truncated …` and returned as `truncatedPairHosts` from `/run`, leaving `ok` alone. (3) The pair
+> fetch failing leaves **both** `daily_query_pages` and `daily_keywords` untouched for that host (the
+> query rows are derived from the failed fetch), and only then does the `["query"]` fallback run; if
+> that fails too, the host is reported and its rows survive — asserted in `write-check.mjs` 1b, which
+> fails both requests for one host. The budget assertion the spec asked for is in: `write-check.mjs`
+> now logs every fetch `runDaily` makes and asserts `<= 50`; the stubbed run measures **47** (4 RUM +
+> 5 zone + 1 token + 34 GSC + 2 forums + 1 ntfy), matching the count at the top of this batch
+> exactly. `pagePath` moved to `src/urls.js` so `render.js` and `signals.js` share one path
+> formatter. Live pair counts per site are still to be measured after the first `/run` — record
+> them here.
 
 **Symptom.** `daily_keywords` and `daily_pages` are two lists that never meet. `snippet-gap` says
 "rewrite the title and meta description for those pages" and `rank-gap` says "strengthen those
@@ -1373,9 +1391,8 @@ change is verified the same way, with a `curl` after deploy checking for a 200 w
 6. Items 12 and 13 (pipeline-health signal and `/health` body) are independent of everything above
    and of each other, and can land in either order or in parallel with the rest of this batch.
 7. Item 16 (`ai-referral-rise`) is independent and can land anywhere after item 4 exists.
-8. Item 17 before 18. Item 17 changes the nightly pull and must keep `runDaily` inside its
-   subrequest budget (its acceptance adds the assertion); item 18 is a separate invocation and a
-   backfill, and its `query-drop` action points at the page item 17 names.
+8. ~~Item 17~~ Done. Item 18 is a separate invocation and a backfill, and its `query-drop` action
+   points at the page item 17 now names.
 
 Items 1 and 2 are worth shipping alone even if nothing else is built, because until they land the
 two largest numbers on the page do not mean what they say. Within this round, items 12–14 are worth

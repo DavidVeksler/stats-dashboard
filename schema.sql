@@ -53,6 +53,25 @@ CREATE TABLE IF NOT EXISTS daily_cf_pages (
   PRIMARY KEY (date, host, page)
 );
 
+-- One row per (query, page) pair from the nightly pair pull (spec item 17):
+-- which page ranks for which query. daily_keywords is DERIVED from these rows
+-- (summed per query; exact when the pull is untruncated, and the same
+-- population, since both omit Google's anonymized queries). daily_pages is NOT
+-- derived from them and must not be: a page-dimension pull includes the
+-- anonymized-query traffic in each page's totals, so a per-page sum over these
+-- rows is a different population from a daily_pages row for the same page.
+CREATE TABLE IF NOT EXISTS daily_query_pages (
+  date        TEXT NOT NULL,         -- snapshot date (matches daily_keywords)
+  host        TEXT NOT NULL,
+  query       TEXT NOT NULL,
+  page        TEXT NOT NULL,         -- full URL as GSC returns it, same as daily_pages.page
+  clicks      INTEGER NOT NULL DEFAULT 0,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  position    REAL NOT NULL DEFAULT 0,
+  gsc_window  TEXT,
+  PRIMARY KEY (date, host, query, page)
+);
+
 CREATE TABLE IF NOT EXISTS daily_search_summary (
   date        TEXT NOT NULL,         -- snapshot date (matches daily_traffic)
   host        TEXT NOT NULL,
@@ -179,6 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_traffic_date ON daily_traffic(date);
 CREATE INDEX IF NOT EXISTS idx_ref_dh ON daily_referrers(date, host);
 CREATE INDEX IF NOT EXISTS idx_kw_dh  ON daily_keywords(date, host);
 CREATE INDEX IF NOT EXISTS idx_pages_dh ON daily_pages(date, host);
+CREATE INDEX IF NOT EXISTS idx_qp_dh ON daily_query_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_cf_pages_dh ON daily_cf_pages(date, host);
 CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host);

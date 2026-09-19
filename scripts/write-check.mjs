@@ -25,7 +25,7 @@
 // Cloudflare, Google, Bing and D1 are all stubbed. The service-account key is
 // generated here rather than fixtured, because gsc.js signs a real JWT with it.
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
-import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
+import { KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "../src/gsc.js";
 import { SITES, FORUMS } from "../src/config.js";
 import { bingUrlsOf } from "../src/bing.js";
 
@@ -64,7 +64,42 @@ const json = (body) => new Response(JSON.stringify(body), {
 
 // What Google was asked for, per dimension, so the request side of the cap can be
 // asserted as well as the stored side. Raising one without the other does nothing.
+// Since spec item 17 the nightly path asks for query+page PAIRS (`pairRowLimits`)
+// and the plain ["query"] request (`keywordRowLimits`) is the truncation
+// fallback, so in a normal run the second list stays empty.
 let keywordRowLimits = [];
+let pairRowLimits = [];
+
+// The query+page pair fixture (spec item 17): PAIR_QUERIES queries, the first of
+// which ranks two pages, so the derived per-query row for it is a sum — and so
+// the pair count (PAIR_QUERIES + 1) is below QUERY_PAGE_ROW_LIMIT, which is what
+// keeps the run on the derived path. Set `truncatePairs` to make the stub hand
+// back exactly QUERY_PAGE_ROW_LIMIT rows instead, which is the fallback case.
+const PAIR_QUERIES = 40;
+let truncatePairs = false;
+const pairRows = (siteUrl, n) => {
+  if (truncatePairs) {
+    return Array.from({ length: n }, (_, i) => ({
+      keys: [`query ${i}`, `${siteUrl}p/${i}`], clicks: 0, impressions: 10, ctr: 0, position: 8,
+    }));
+  }
+  const rows = [
+    // "query 0" on two pages: 3 clicks/40 imp at position 4 and 1 click/10 imp at
+    // position 9 -> derived row 4 clicks / 50 imp, position (4*40+9*10)/50 = 5.0.
+    { keys: ["query 0", `${siteUrl}a`], clicks: 3, impressions: 40, ctr: .075, position: 4 },
+    { keys: ["query 0", `${siteUrl}b`], clicks: 1, impressions: 10, ctr: .1, position: 9 },
+  ];
+  for (let i = 1; i < PAIR_QUERIES; i += 1) {
+    rows.push({ keys: [`query ${i}`, `${siteUrl}p/${i}`], clicks: i < 3 ? 1 : 0,
+      impressions: 100 - i, ctr: 0, position: 5 + i });
+  }
+  return rows;
+};
+
+// Every fetch the Worker makes during one `run()`, by host — the subrequest
+// budget is per invocation and Cloudflare's ceiling is 50, so the count is
+// asserted, not estimated (see the budget note at the top of spec item 17).
+let fetchLog = [];
 
 // Simulates one host's query-dimension request failing transiently (a timeout,
 // a 5xx) — set to { siteUrl, dimension } around a `run()` call, see part 1b
@@ -79,18 +114,26 @@ let failBing = null;
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input?.url ?? input);
+  fetchLog.push(new URL(url).host);
   if (url.includes("oauth2.googleapis.com/token")) return json({ access_token: "stub-token" });
+  if (url.includes("ntfy.sh")) return new Response("ok");
 
   if (url.includes("searchconsole.googleapis.com")) {
     const body = JSON.parse(init.body ?? "{}");
-    const dimension = body.dimensions?.[0] ?? null;
+    const dimension = (body.dimensions ?? []).join("+") || null;
     if (failGsc && dimension === failGsc.dimension && url.includes(encodeURIComponent(failGsc.siteUrl))) {
       return new Response("stub transient failure", { status: 503 });
     }
     if (!dimension) return json({ rows: [{ clicks: 9, impressions: 2250, ctr: .004, position: 10.1 }] });
+    const n = body.rowLimit ?? 0;
+    if (dimension === "query+page") {
+      pairRowLimits.push(n);
+      const siteUrl = decodeURIComponent(url.match(/sites\/([^/]+)\//)[1]);
+      const base = siteUrl.startsWith("sc-domain:") ? `https://${siteUrl.slice(10)}/` : siteUrl;
+      return json({ rows: pairRows(base, n) });
+    }
     // Return exactly as many rows as were asked for. A property with a deep tail
     // returns the full rowLimit, which is the case that matters here.
-    const n = body.rowLimit ?? 0;
     if (dimension === "query") keywordRowLimits.push(n);
     return json({
       rows: Array.from({ length: n }, (_, i) => ({
@@ -144,6 +187,8 @@ globalThis.fetch = async (input, init = {}) => {
 
 let seq = 0;
 let batches = [];
+// Statements executed with .run() rather than .batch() — the runs row.
+let ran = [];
 const db = {
   prepare(sql) {
     const stmt = { sql, binds: [], seq: seq += 1 };
@@ -152,7 +197,7 @@ const db = {
     // and an empty database is a valid answer for it.
     stmt.all = async () => ({ results: [] });
     stmt.first = async () => null;
-    stmt.run = async () => ({ success: true });
+    stmt.run = async () => { ran.push(stmt); return { success: true }; };
     return stmt;
   },
   async batch(list) {
@@ -164,7 +209,10 @@ const db = {
 const run = async (env) => {
   seq = 0;
   batches = [];
+  ran = [];
   keywordRowLimits = [];
+  pairRowLimits = [];
+  fetchLog = [];
   const res = await worker.fetch(
     new Request("https://stats.test/run?key=k"), { DB: db, REFRESH_KEY: "k", CF_API_TOKEN: "cf", ...env });
   const result = await res.json();
@@ -190,15 +238,46 @@ const runBing = async (env) => {
 
 // ---- 1. The full run, with a GSC key -------------------------------------
 {
-  const { result, writes, flat } = await run({ GSC_SA_KEY });
+  // NTFY_TOPIC set so the push is a real (stubbed) fetch and counts against the
+  // budget below, the way it does in production.
+  const { result, writes, flat } = await run({ GSC_SA_KEY, NTFY_TOPIC: "check" });
   check("the run completed", Array.isArray(result.notes) && result.notes.length === 0, true);
 
-  // The cap, on both sides. Neither alone does anything.
-  check("Google is asked for the raised row limit",
-    [...new Set(keywordRowLimits)].join(","), String(KEYWORD_ROW_LIMIT));
-  check("...for every property with a Search Console site", keywordRowLimits.length, GSC_SITES.length);
+  // The cap, on both sides. Neither alone does anything. Since item 17 the
+  // nightly request is for query+page pairs; the plain query request is the
+  // truncation fallback and must not fire when the pairs come back complete.
+  check("Google is asked for query+page pairs at the pair row limit",
+    [...new Set(pairRowLimits)].join(","), String(QUERY_PAGE_ROW_LIMIT));
+  check("...for every property with a Search Console site", pairRowLimits.length, GSC_SITES.length);
+  check("...and the plain query request is not made when the pairs are complete", keywordRowLimits.length, 0);
+  check("...nor is the separate summary request (derived from the untruncated pull)",
+    fetchLog.filter((h) => h === "searchconsole.googleapis.com").length, GSC_SITES.length * 2);
+  check("...and no host is reported truncated", result.truncatedPairHosts.length, 0);
+  const qpInserts = flat.filter((s) => s.sql.startsWith("INSERT INTO daily_query_pages"));
+  check("every pair Google returns is stored", qpInserts.length, (PAIR_QUERIES + 1) * GSC_SITES.length);
   const kwInserts = flat.filter((s) => s.sql.startsWith("INSERT INTO daily_keywords"));
-  check("...and every row it returns is stored", kwInserts.length, KEYWORD_ROW_LIMIT * GSC_SITES.length);
+  check("...and one derived query row per distinct query", kwInserts.length, PAIR_QUERIES * GSC_SITES.length);
+  // The derivation is exact: the two-page query sums its clicks and impressions
+  // and takes the impression-weighted position, not the mean of the two.
+  const derived = kwInserts.find((s) => s.binds[1] === GSC_SITES[0].host && s.binds[2] === "query 0");
+  check("a query ranking two pages stores the summed clicks", derived?.binds[3], 4);
+  check("...summed impressions", derived?.binds[4], 50);
+  check("...and the impression-weighted position", derived?.binds[5], 5);
+  // Every clicks/impressions total across the derived rows equals the pairs'.
+  const sumOf = (list, idx) => list.reduce((sum, s) => sum + s.binds[idx], 0);
+  check("derived clicks total the pairs' clicks", sumOf(kwInserts, 3), sumOf(qpInserts, 4));
+  check("...and impressions likewise", sumOf(kwInserts, 4), sumOf(qpInserts, 5));
+
+  // THE BUDGET. Cloudflare allows 50 subrequests per Worker invocation, and with
+  // 17 Search Console properties runDaily sits in the high 40s — see the note
+  // above spec item 17. Any new per-site fetch in runDaily lands here first.
+  check("runDaily stays inside one invocation's subrequest budget (<= 50 fetches)",
+    fetchLog.length <= 50, true);
+  if (process.argv.includes("--verbose")) {
+    const byHost = new Map();
+    for (const h of fetchLog) byHost.set(h, (byHost.get(h) ?? 0) + 1);
+    console.log(`runDaily fetches ${fetchLog.length}/50: ${[...byHost].map(([h, n]) => `${h} ${n}`).join(" · ")}`);
+  }
 
   // Chunking.
   check("the write is cut into more than one batch", writes.length > 1, true);
@@ -214,7 +293,7 @@ const runBing = async (env) => {
   // Ordering, which is the whole reason this file exists. Chunking is only safe
   // because the chunks are awaited in sequence: a DELETE that landed after its
   // INSERTs would empty a day of data, and nothing else in the repo would notice.
-  const tables = ["daily_keywords", "daily_pages", "daily_search_summary",
+  const tables = ["daily_query_pages", "daily_keywords", "daily_pages", "daily_search_summary",
     "daily_referrers", "daily_cf_pages", "daily_zone_countries", "daily_zone_status", "daily_zone_bots"];
   let straddles = 0;
   for (const table of tables) {
@@ -382,13 +461,30 @@ const runBing = async (env) => {
 // table's INSERTs and only runs once that table's fetch actually succeeded.
 {
   const failing = GSC_SITES[0];
-  failGsc = { siteUrl: failing.gsc, dimension: "query" };
+  // Fail the pair pull — the request daily_keywords is now derived from — and
+  // also the fallback query request it triggers, so nothing feeds either table.
+  failGsc = { siteUrl: failing.gsc, dimension: "query+page" };
+  const realFetchStub = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input?.url ?? input);
+    if (url.includes("searchconsole.googleapis.com") && url.includes(encodeURIComponent(failing.gsc))
+      && (JSON.parse(init.body ?? "{}").dimensions ?? []).join("+") === "query") {
+      fetchLog.push("searchconsole.googleapis.com");
+      return new Response("stub transient failure", { status: 503 });
+    }
+    return realFetchStub(input, init);
+  };
   const { result, flat } = await run({ GSC_SA_KEY });
   failGsc = null;
+  globalThis.fetch = realFetchStub;
 
   check("the run reports the GSC pull as not fully ok", result.gscOk, false);
   check("...and names the failing host", result.gscFailedHosts.includes(failing.host), true);
-  check("daily_keywords is NOT deleted for the failed host (existing rows survive)",
+  check("daily_query_pages is NOT deleted for the failed host (existing rows survive)",
+    flat.some((s) => s.sql.includes("DELETE FROM daily_query_pages ") && s.binds[1] === failing.host), false);
+  check("...or written for it",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_query_pages") && s.binds[1] === failing.host), false);
+  check("daily_keywords is NOT deleted for the failed host either (derived from the failed pull)",
     flat.some((s) => s.sql.includes("DELETE FROM daily_keywords ") && s.binds[1] === failing.host), false);
   check("...or written for it",
     flat.some((s) => s.sql.startsWith("INSERT INTO daily_keywords") && s.binds[1] === failing.host), false);
@@ -405,6 +501,34 @@ const runBing = async (env) => {
     true);
 }
 
+// ---- 1d. A truncated pair pull falls back to the plain query request --------
+// When a property returns exactly QUERY_PAGE_ROW_LIMIT pairs, the derived
+// per-query rows would be incomplete for whichever queries lost pairs to the
+// cut, so runDaily makes the old ["query"] request for that host — one extra
+// subrequest, for that host only — stores the pairs it did get, and reports the
+// host in the run's note without marking the run failed.
+{
+  truncatePairs = true;
+  const { result, flat, writes } = await run({ GSC_SA_KEY });
+  truncatePairs = false;
+
+  check("a truncated pair pull still completes the run", result.notes.length, 0);
+  check("...and names every truncated host", result.truncatedPairHosts.length, GSC_SITES.length);
+  check("...falling back to the plain query request for each", keywordRowLimits.length, GSC_SITES.length);
+  check("...at KEYWORD_ROW_LIMIT", [...new Set(keywordRowLimits)].join(","), String(KEYWORD_ROW_LIMIT));
+  check("...and to the separate summary request too (the query pull is itself at its cap)",
+    fetchLog.filter((h) => h === "searchconsole.googleapis.com").length, GSC_SITES.length * 4);
+  check("the pairs that did come back are still stored",
+    flat.filter((s) => s.sql.startsWith("INSERT INTO daily_query_pages")).length, QUERY_PAGE_ROW_LIMIT * GSC_SITES.length);
+  check("...and the query rows come from the fallback, not the pairs",
+    flat.filter((s) => s.sql.startsWith("INSERT INTO daily_keywords")).length, KEYWORD_ROW_LIMIT * GSC_SITES.length);
+  const runsRow = ran.find((s) => s.sql.includes("INTO runs"));
+  check("the runs row carries the truncation in its note", /gsc pairs truncated/.test(runsRow?.binds[3] ?? ""), true);
+  check("...as ok, not as a failure", runsRow?.binds[2], 1);
+  check("...none of the chunks larger than the limit even at this volume",
+    writes.every((list) => list.length <= D1_MAX_BATCH_STATEMENTS), true);
+}
+
 // ---- 2. No GSC key: traffic refreshes, keywords survive -------------------
 // The guard this protects has been in AGENTS.md since before the chunking, and
 // chunking is exactly the kind of edit that could have moved a DELETE outside it.
@@ -413,7 +537,7 @@ const runBing = async (env) => {
   check("a run with no GSC key still writes traffic",
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_traffic")).length, SITES.length);
   check("...and reports the keyword pull as skipped", result.gscOk, false);
-  for (const table of ["daily_keywords", "daily_pages", "daily_search_summary"]) {
+  for (const table of ["daily_query_pages", "daily_keywords", "daily_pages", "daily_search_summary"]) {
     check(`...without deleting ${table}`,
       flat.some((s) => s.sql.includes(`DELETE FROM ${table} `)), false);
     check(`...or writing to ${table}`,

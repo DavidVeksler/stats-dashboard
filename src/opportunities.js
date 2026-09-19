@@ -68,6 +68,19 @@ export const SNIPPET_CTR_RATIO = 0.5;
 // shallow one.
 export const MIN_ACTIONABLE_CLICKS = 0.5;
 
+// Cannibalization (spec item 17): one query whose impressions are split across
+// two or more of the site's own pages. "Strengthen the page" is the wrong fix
+// there — Google is already choosing between two of them — so it is its own
+// list and its own signal rather than a third opportunity class.
+//
+// A query needs this many stored impressions before a split means anything;
+// higher than OPPORTUNITY_MIN_IMPRESSIONS because a 3/2 split on five
+// impressions is not two pages competing, it is noise. And each competing page
+// must hold at least this share of the query's stored impressions: a page
+// taking 3% of a query's impressions is a stray, not a competitor.
+export const CANNIBAL_MIN_IMPRESSIONS = 20;
+export const CANNIBAL_MIN_SHARE = 0.25;
+
 // Expected organic CTR by average position.
 //
 // SOURCE (measured anchors, marked below): SISTRIX, "Why (almost) everything you
@@ -204,4 +217,107 @@ export function rankOpportunities(rows, site = null) {
   snippet.sort(byScore);
   rank.sort(byScore);
   return { snippet, rank };
+}
+
+// ---- Query-to-page join (spec item 17) -------------------------------------
+//
+// Everything below is a pure function of daily_query_pages rows loadDashboard
+// has already read for the latest snapshot. None of it changes what
+// classifyOpportunity decides about a query — the page is attached BESIDE the
+// verdict, never used to make it — so a badge and a "Pages to fix" entry cannot
+// disagree about whether a query is an opportunity.
+
+// Group one site's (query, page) rows by query. Each query's pages are sorted by
+// impressions, descending, and carry `share`: that page's fraction of the
+// query's stored impressions. `Object.create(null)` rather than a Map so the
+// result survives JSON.stringify for /api/json and a query literally named
+// "constructor" cannot collide with a prototype property.
+export function groupQueryPages(rows) {
+  const byQuery = Object.create(null);
+  for (const row of rows ?? []) {
+    const query = String(row.query ?? "");
+    if (!query || !row.page) continue;
+    (byQuery[query] ??= []).push({
+      page: row.page,
+      clicks: Number(row.clicks || 0),
+      impressions: Number(row.impressions || 0),
+      position: Number(row.position || 0),
+    });
+  }
+  for (const pages of Object.values(byQuery)) {
+    pages.sort((a, b) => b.impressions - a.impressions || b.clicks - a.clicks
+      || String(a.page).localeCompare(String(b.page)));
+    const total = pages.reduce((sum, page) => sum + page.impressions, 0);
+    for (const page of pages) page.share = total > 0 ? page.impressions / total : 0;
+  }
+  return byQuery;
+}
+
+// The page a query row should point the reader at: the one holding the largest
+// share of its stored impressions. Null when the pairs carry no row for it —
+// a query stored before daily_query_pages existed, or one whose pairs were cut
+// by QUERY_PAGE_ROW_LIMIT — in which case the row simply carries no page, the
+// same way a pre-`internal` referrer row carries no kind.
+export function pageForQuery(query, queryPages) {
+  const pages = queryPages?.[String(query ?? "")];
+  if (!pages?.length) return { page: null, pageShare: null, pageCount: 0 };
+  return { page: pages[0].page, pageShare: pages[0].share, pageCount: pages.length };
+}
+
+// Attach each opportunity row's page (see pageForQuery). Returns a new
+// { snippet, rank } with the same rows in the same order — the class metric and
+// the ranking are untouched.
+export function attachPages(opportunities, queryPages) {
+  const attach = (rows) => (rows ?? []).map((row) => ({ ...row, ...pageForQuery(row.query, queryPages) }));
+  return { snippet: attach(opportunities?.snippet), rank: attach(opportunities?.rank) };
+}
+
+// Regroup the two opportunity classes by page, each ranked by ITS OWN class's
+// metric summed over the page's queries. Two lists, two metrics, never one:
+// item 7's rule survives the change of grain from query to page unchanged, and
+// for the same reason — a page's recoverable-at-current-rank clicks and its
+// out-of-reach-until-it-ranks clicks answer different questions with different
+// fixes, and adding them would rank a snippet job against a content job on a
+// number that means neither.
+//
+// Rows with no page (see pageForQuery) are skipped here, not lumped under a
+// synthetic "(unknown)" page: an entry the reader cannot open is not a page to
+// fix.
+export function rankPageOpportunities(opportunities) {
+  const group = (rows, metric) => {
+    const byPage = new Map();
+    for (const row of rows ?? []) {
+      if (!row.page) continue;
+      const acc = byPage.get(row.page) ?? { page: row.page, queries: 0, [metric]: 0, topQuery: row.query };
+      acc.queries += 1;
+      acc[metric] += Number(row[metric] || 0);
+      byPage.set(row.page, acc);
+    }
+    return [...byPage.values()].sort((a, b) => b[metric] - a[metric]
+      || String(a.page).localeCompare(String(b.page)));
+  };
+  return {
+    snippet: group(opportunities?.snippet, "lostClicks"),
+    rank: group(opportunities?.rank, "potentialClicks"),
+  };
+}
+
+// Queries whose stored impressions are split across two or more pages, each
+// holding at least CANNIBAL_MIN_SHARE of them, with at least
+// CANNIBAL_MIN_IMPRESSIONS impressions in total. Ranked by impressions. A denied
+// query (queryDenyPatterns) is excluded here too: "not pursuing this query" is
+// an editorial call that covers consolidating pages for it as much as
+// strengthening them.
+export function findCannibalized(queryPages, site = null) {
+  const out = [];
+  for (const [query, pages] of Object.entries(queryPages ?? {})) {
+    const impressions = pages.reduce((sum, page) => sum + page.impressions, 0);
+    if (impressions < CANNIBAL_MIN_IMPRESSIONS) continue;
+    const competing = pages.filter((page) => page.share >= CANNIBAL_MIN_SHARE);
+    if (competing.length < 2) continue;
+    if (isDeniedQuery(query, site)) continue;
+    out.push({ query, impressions, pages: competing });
+  }
+  return out.sort((a, b) => b.impressions - a.impressions
+    || String(a.query).localeCompare(String(b.query)));
 }

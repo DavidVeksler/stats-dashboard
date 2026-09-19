@@ -7,6 +7,7 @@ import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE 
 import {
   SNIPPET_MAX_POSITION, RANK_MAX_POSITION, TARGET_POSITION, SNIPPET_CTR_RATIO,
   OPPORTUNITY_MIN_IMPRESSIONS, MIN_ACTIONABLE_CLICKS, POSITION_MIN_IMPRESSIONS,
+  CANNIBAL_MIN_IMPRESSIONS, CANNIBAL_MIN_SHARE,
 } from "../src/opportunities.js";
 
 const today = new Date().toISOString();
@@ -51,8 +52,8 @@ const fixture = {
     {
       severity: 2, kind: "snippet-gap", host: "example.com",
       headline: "example.com has 1 query ranking well but not clicked",
-      evidence: "About 5.2 clicks a window are going elsewhere, led by \"high impression opportunity\" at position 8.4 with 0.0% CTR against roughly 3.7% expected there.",
-      action: "Rewrite the title and meta description for those pages; the ranking is already there.",
+      evidence: "About 5.2 clicks a window are going elsewhere, led by \"high impression opportunity\" at position 8.4 on /guides/analytics with 0.0% CTR against roughly 3.7% expected there.",
+      action: "Rewrite the title and meta description on /guides/analytics; the ranking is already there.",
       href: "#site-example-com", recurrence: null,
     },
     {
@@ -127,20 +128,35 @@ const fixture = {
       // the title" and "the page ranks too deep to be seen" are not the same
       // instruction, and a bare "opportunity" badge told the reader neither.
       keywords: [
-        { query: "high impression opportunity", clicks: 0, impressions: 140, ctr: 0, position: 8.4 },
-        { query: "deep ranking query", clicks: 0, impressions: 60, ctr: 0, position: 24 },
-        { query: "strong query", clicks: 12, impressions: 70, ctr: .171, position: 2.1 },
+        // Badged rows carry the page they rank (item 17); "deep ranking query"
+        // deliberately has none, the pre-pairs / truncated case.
+        { query: "high impression opportunity", clicks: 0, impressions: 140, ctr: 0, position: 8.4,
+          page: "https://example.com/guides/analytics", pageShare: 1, pageCount: 1 },
+        { query: "deep ranking query", clicks: 0, impressions: 60, ctr: 0, position: 24, page: null, pageShare: null, pageCount: 0 },
+        { query: "strong query", clicks: 12, impressions: 70, ctr: .171, position: 2.1,
+          page: "https://example.com/", pageShare: 1, pageCount: 1 },
         // Below OPPORTUNITY_MIN_IMPRESSIONS: CTR is not a measurement here.
         { query: "one impression stray", clicks: 0, impressions: 3, ctr: 0, position: 11 },
       ],
       opportunities: {
         snippet: [{ query: "high impression opportunity", kind: "snippet", position: 8.4,
           impressions: 140, clicks: 0, ctr: 0, expectedCtr: .0371, lostClicks: 5.2,
-          potentialClicks: null, score: 5.2 }],
+          potentialClicks: null, score: 5.2, page: "https://example.com/guides/analytics", pageShare: 1, pageCount: 1 }],
         rank: [{ query: "deep ranking query", kind: "rank", position: 24, impressions: 60,
-          clicks: 0, ctr: 0, expectedCtr: .0083, lostClicks: null, potentialClicks: 4.32, score: 4.32 }],
+          clicks: 0, ctr: 0, expectedCtr: .0083, lostClicks: null, potentialClicks: 4.32, score: 4.32,
+          page: "https://example.com/deep", pageShare: 1, pageCount: 1 }],
       },
       opportunityCount: 2, queryDenyPatterns: [],
+      // Item 17: the same two classes regrouped by page, each in its own unit,
+      // and one query split across two of the site's own pages.
+      pageOpportunities: {
+        snippet: [{ page: "https://example.com/guides/analytics", queries: 1, lostClicks: 5.2, topQuery: "high impression opportunity" }],
+        rank: [{ page: "https://example.com/deep", queries: 1, potentialClicks: 4.32, topQuery: "deep ranking query" }],
+      },
+      cannibalized: [{ query: "split query", impressions: 120, pages: [
+        { page: "https://example.com/guides/analytics", clicks: 2, impressions: 70, position: 6.1, share: 70 / 120 },
+        { page: "https://example.com/guides/analytics-old", clicks: 0, impressions: 50, position: 9.3, share: 50 / 120 },
+      ] }],
       pages: [
         { page: "https://example.com/guides/analytics", clicks: 14, impressions: 180, ctr: .078, position: 5.4 },
       ],
@@ -592,6 +608,55 @@ if (!keywordPanel.includes("Strengthen the page and link to it.")) {
   throw new Error("A rank badge must carry the ranking remedy");
 }
 
+// ---- Item 17: the page beside the badge, the per-page lists, the split list --
+// A badged row names the page it ranks; an unbadged row does not (it has no
+// action to point at), and a badged row with no stored pair shows no page rather
+// than a guessed one.
+const badgedRowAt = keywordPanel.indexOf("high impression opportunity");
+const badgedRow = keywordPanel.slice(badgedRowAt, keywordPanel.indexOf("</li>", badgedRowAt));
+if (!badgedRow.includes('class="query-page"') || !badgedRow.includes(">/guides/analytics<")) {
+  throw new Error("A badged query row must name the page it ranks");
+}
+const strongRowAt = keywordPanel.indexOf("strong query");
+const strongRow = keywordPanel.slice(strongRowAt, keywordPanel.indexOf("</li>", strongRowAt));
+if (strongRow.includes('class="query-page"')) {
+  throw new Error("An unbadged query row must not carry a page link: it has no action");
+}
+const deepRowAt = keywordPanel.indexOf("deep ranking query");
+const deepRow = keywordPanel.slice(deepRowAt, keywordPanel.indexOf("</li>", deepRowAt));
+if (deepRow.includes('class="query-page"')) {
+  throw new Error("A badged row with no stored pair must show no page rather than a guessed one");
+}
+// (The action text naming the page is a signals.js concern, asserted in
+// dashboard-check.mjs 12b; this fixture's snippet-gap signal ranks fourth and
+// the actions block renders three, so it is not on this page.)
+// Pages to fix: both class headings, each in its own unit, labelled by population.
+const pagesToFixAt = html.indexOf("Pages to fix");
+if (pagesToFixAt < 0) throw new Error("The Pages to fix panel did not render");
+const pagesToFix = html.slice(pagesToFixAt, html.indexOf("</section>", pagesToFixAt));
+for (const needle of ["over stored queries", "Rewrite the snippet", "Strengthen and link",
+  "clicks a window recoverable", "clicks a window out of reach", ">/guides/analytics<", ">/deep<", "~5.2", "~4.3"]) {
+  if (!pagesToFix.includes(needle)) throw new Error(`Pages to fix is missing "${needle}"`);
+}
+if (/9\.5|clicks a window total|combined/.test(pagesToFix)) {
+  throw new Error("Pages to fix must never add lost and potential clicks together");
+}
+// The two populations never share a line: the Pages to fix panel and the Top
+// landing pages (Google Search) panel are separate sections, and the latter is
+// not labelled "over stored queries".
+const googlePagesAt = html.indexOf("Top landing pages (Google Search)");
+const googlePages = html.slice(googlePagesAt, html.indexOf("</section>", googlePagesAt));
+if (googlePages.includes("over stored queries") || googlePages.includes("clicks a window")) {
+  throw new Error("Top landing pages (Google Search) must not carry a stored-queries figure");
+}
+// Split queries.
+const splitAt = html.indexOf("Split queries");
+if (splitAt < 0) throw new Error("The Split queries panel did not render");
+const split = html.slice(splitAt, html.indexOf("</section>", splitAt));
+for (const needle of ["split query", ">/guides/analytics<", ">/guides/analytics-old<", "58%", "42%", "120 imp", "over stored queries"]) {
+  if (!split.includes(needle)) throw new Error(`Split queries is missing "${needle}"`);
+}
+
 // ---- Footer prose, interpolated from src/opportunities.js ------------------
 // Computed here from the same imports, never typed, so changing a threshold
 // fails this check until the prose follows (the same discipline the flood
@@ -600,6 +665,11 @@ const opportunityProse = `A <b>snippet</b> gap is a query at position ${SNIPPET_
   `taking under ${(SNIPPET_CTR_RATIO * 100).toFixed(0)}% of the click-through its rank would ordinarily deliver`;
 if (!html.includes(opportunityProse)) {
   throw new Error(`Footer snippet-class prose does not match src/opportunities.js: expected "${opportunityProse}"`);
+}
+const splitProse = `A <b>split query</b> is one with at least ${CANNIBAL_MIN_IMPRESSIONS} stored impressions where two or more ` +
+  `of the site's own pages each hold at least ${(CANNIBAL_MIN_SHARE * 100).toFixed(0)}% of them`;
+if (!html.includes(splitProse)) {
+  throw new Error(`Footer split-query prose does not match src/opportunities.js: expected "${splitProse}"`);
 }
 const rankProse = `A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}`;
 if (!html.includes(rankProse)) {

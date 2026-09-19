@@ -54,3 +54,17 @@ export function looksMalformed(path) {
     return true;
   }
 }
+
+// The path-and-query of a stored page URL, for display: Search Console stores
+// pages as full URLs ("https://host/guides/x?y"), and both the card and a
+// signal's action text want "/guides/x?y". A value that is not a URL (a bare
+// path, garbage) comes back unchanged rather than throwing, so a malformed row
+// still renders as what it is.
+export function pagePath(page) {
+  try {
+    const url = new URL(String(page ?? ""));
+    return `${url.pathname}${url.search}` || "/";
+  } catch (_) {
+    return String(page ?? "");
+  }
+}

@@ -14,8 +14,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_keywords`, `daily_zone_bots`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
-| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8 and 12–16 implemented; 9, 10, 11 and the P5 search batch 17–18 proposed) |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_query_pages`, `daily_keywords`, `daily_pages`, `daily_zone_bots`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
+| Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8, 12–17 implemented; 9, 10, 11 and 18 proposed) |
+| Which page ranks for a query, per-page opportunity lists, split (cannibalized) queries | `src/opportunities.js` (`groupQueryPages`, `attachPages`, `rankPageOpportunities`, `findCannibalized`) fed by `daily_query_pages`; the pull is `queryQueryPages` in `src/gsc.js` |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
@@ -78,8 +79,11 @@ The Worker has three entry points in `src/index.js`:
 
 - **`scheduled`** (cron `0 13 * * *`) and **`GET /run?key=…`** both call `runDaily(env)`, which:
   1. `pullTraffic()` (`cloudflare.js`) → Cloudflare GraphQL → 24h visitors/referrers.
-  2. `queryKeywords()` (`gsc.js`) → Google Search Console → top keywords (only if `GSC_SA_KEY` set).
-  3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_keywords`), plus a `runs` row.
+  2. `queryQueryPages()` (`gsc.js`) → Google Search Console → top (query, page) pairs, from which the
+     per-query rows are **derived** (`summarizeQueryPages`) rather than fetched — see the query-to-page
+     gotcha below; plus `queryPages()` for per-page totals (only if `GSC_SA_KEY` set).
+  3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_query_pages`,
+     `daily_keywords`, `daily_pages`, `daily_search_summary`), plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
 - **Bing's pull is a scheduled GitHub Action, not a Worker cron** (`.github/workflows/bing-pull.yml`,
   `scripts/bing-pull.mjs`) — moved out 2026-09-11 after confirming Bing throttles every call routed
@@ -352,6 +356,34 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   500), so nothing may assume a fixed count; and the median-position tile now sees the deep tail,
   which is what `POSITION_MIN_IMPRESSIONS` is for — the median got worse and more honest, it did not
   regress. Do **not** "fix" a surviving `thin sample` label by moving `THIN_SAMPLE_SHARE`.
+- **`daily_keywords` is DERIVED from `daily_query_pages`; `daily_pages` is NOT, and must not be.** Since
+  spec item 17 (2026-09-18) the nightly GSC request per site is `dimensions: ["query", "page"]`
+  (`queryQueryPages`, capped at `QUERY_PAGE_ROW_LIMIT`, 1,000 pairs), stored as-is in
+  `daily_query_pages`, and the per-query rows are summed from it by `summarizeQueryPages` — exact when
+  the pull is untruncated, on the same argument as `summarizeKeywordRows`, and **the same population**:
+  both a `["query"]` and a `["query","page"]` request omit Google's anonymized queries. A `["page"]`
+  request does *not* omit them, so summing the pairs per page would under-count every page by its
+  anonymized share; `queryPages` therefore stays a separate call, and any per-page figure computed
+  from the pairs (`site.pageOpportunities`, `site.cannibalized`) is labelled `over stored queries` and
+  is **never printed on one line with a `daily_pages` figure for the same page** — different
+  populations, same rule as the Search CTR tile's two sides. Consequences: (1) the request count per
+  site is unchanged (pairs + pages, summary derived), which matters because **`runDaily` sits at 47 of
+  50 subrequests** — `write-check.mjs` now counts every fetch and asserts `<= 50`, and prints the
+  breakdown under `--verbose`; (2) when a site's pairs come back truncated at exactly
+  `QUERY_PAGE_ROW_LIMIT`, `runDaily` falls back to the old `["query"]` request for that host (one extra
+  call, that host only), reports it in the `runs` note as `gsc pairs truncated …` **without** marking
+  the run failed (a note would trip the severity-1 `stale-pipeline` signal, and a site outgrowing a
+  cap is not a pipeline failure) and returns `truncatedPairHosts` from `/run` — check that after the
+  first live pull and tune the cap from the measured pair counts, not by guessing; (3) a query with no
+  stored pair (pre-item-17 rows, or one cut by the cap) simply carries `page: null`, and every
+  consumer (the badge's page link, the two search signals' action text, the per-page lists) falls back
+  to the page-less form rather than guessing a page. The page is attached **beside** the classifier's
+  verdict in `loadDashboard` (`attachPages`), never used to make it, so a badge and a `Pages to fix`
+  entry cannot disagree about a query. `query-cannibalization` (a query with `>=
+  CANNIBAL_MIN_IMPRESSIONS` stored impressions split across two or more pages each holding `>=
+  CANNIBAL_MIN_SHARE`) starts at **severity 3** on purpose: it has never been run against live data
+  and its advice — merge two pages — is the most destructive on the page. Promote it to 2 only after a
+  real case has been confirmed by eye.
 - **The Worker's own subrequest budget is a real ceiling, and it was already close.** One `runDaily`
   invocation makes roughly 4 (RUM, one per `CF_ACCOUNTS`) + 5 (zone, for `library.freecapitalists.org`)
   + up to 3 × `SITES.length` (GSC: keywords, pages, summary) + `FORUMS.length` + 1 (ntfy) fetches — with

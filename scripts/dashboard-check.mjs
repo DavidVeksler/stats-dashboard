@@ -11,6 +11,7 @@ import { looksMalformed } from "../src/urls.js";
 import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS,
   POSITION_MIN_IMPRESSIONS, RANK_MAX_POSITION, OPPORTUNITY_MIN_IMPRESSIONS } from "../src/opportunities.js";
 import { KEYWORD_ROW_LIMIT } from "../src/gsc.js";
+import { CANNIBAL_MIN_IMPRESSIONS, CANNIBAL_MIN_SHARE } from "../src/opportunities.js";
 import { SITES, FORUMS } from "../src/config.js";
 import { bingUrlsOf } from "../src/bing.js";
 
@@ -198,6 +199,31 @@ const KEYWORDS = [
   { host: SHEETS_HOST, query: "regex cheatsheet", clicks: 0, impressions: 80, position: 7.7 },
 ].map((row) => ({ ...row, date: KEYWORD_DATE, gsc_window: "2026-08-05–2026-08-07" }));
 
+// (query, page) pairs for the latest snapshot (spec item 17). The page a query
+// ranks is attached BESIDE the classifier's verdict, never used to make it, so
+// these rows change nothing above — they only say which page to open.
+//
+//   objectivism online   split 90/60 across two forum pages -> cannibalized
+//   objectivist ethics   split 7/3 on 10 impressions        -> below CANNIBAL_MIN_IMPRESSIONS, not
+//   ayn rand forum       190/10 across two pages            -> the 5% page is a stray, not a competitor
+//   bitcoin recovery     one page                            -> a rank row that names its page
+//   regex cheatsheet     one page                            -> a snippet row that names its page
+//   incest forum         NO pair row at all                  -> stays badge-eligible, carries no page
+const QUERY_PAGES = [
+  { host: FORUM_HOST, query: "objectivism online", page: `https://${FORUM_HOST}/`, clicks: 2, impressions: 90, position: 3.8 },
+  { host: FORUM_HOST, query: "objectivism online", page: `https://${FORUM_HOST}/forums/`, clicks: 0, impressions: 60, position: 5.5 },
+  { host: FORUM_HOST, query: "objectivist ethics", page: `https://${FORUM_HOST}/topic/ethics`, clicks: 0, impressions: 7, position: 9 },
+  { host: FORUM_HOST, query: "objectivist ethics", page: `https://${FORUM_HOST}/topic/ethics-2`, clicks: 0, impressions: 3, position: 14 },
+  { host: FORUM_HOST, query: "ayn rand forum", page: `https://${FORUM_HOST}/`, clicks: 1, impressions: 190, position: 8 },
+  { host: FORUM_HOST, query: "ayn rand forum", page: `https://${FORUM_HOST}/topic/rand`, clicks: 0, impressions: 10, position: 10 },
+  { host: FORUM_HOST, query: "objectivism forum", page: `https://${FORUM_HOST}/`, clicks: 0, impressions: 120, position: 6.4 },
+  { host: FORUM_HOST, query: "is altruism evil", page: `https://${FORUM_HOST}/topic/altruism`, clicks: 0, impressions: 45, position: 11 },
+  { host: WALLET_HOST, query: "bitcoin recovery", page: `https://${WALLET_HOST}/recover`, clicks: 0, impressions: 13, position: 31.2 },
+  { host: WALLET_HOST, query: "recover lost bitcoin wallet", page: `https://${WALLET_HOST}/recover`, clicks: 0, impressions: 40, position: 22.4 },
+  { host: WALLET_HOST, query: "crypto wallet recovery service", page: `https://${WALLET_HOST}/`, clicks: 1, impressions: 55, position: 18.7 },
+  { host: SHEETS_HOST, query: "regex cheatsheet", page: `https://${SHEETS_HOST}/regex`, clicks: 0, impressions: 80, position: 7.7 },
+].map((row) => ({ ...row, date: KEYWORD_DATE }));
+
 // daily_search_summary stores one row per snapshot per host and always has. The
 // rows are a ROLLING window keyed by snapshot date — each covers date-4..date-2,
 // so consecutive rows overlap by two days out of three — which is why only
@@ -300,6 +326,7 @@ const db = {
       // The stub applies whichever filter the SQL actually asks for, so a read
       // that widens again shows up as a changed row count rather than passing.
       if (sql.includes("daily_keywords")) return { results: onDate([...KEYWORDS, ...keywordTail], binds) };
+      if (sql.includes("daily_query_pages")) return { results: onDate(QUERY_PAGES, binds) };
       if (sql.includes("daily_search_summary")) return { results: between(SEARCH_SUMMARIES, binds) };
       if (sql.includes("daily_cf_pages")) return { results: between(ZONE_PAGES, binds) };
       // Read over the whole history window now, not just the latest day: the
@@ -907,7 +934,10 @@ for (const period of [7, 30]) {
   check("the generic search-opportunity rule is gone",
     (data.signals ?? []).some((s) => s.kind === "search-opportunity"), false);
   check("a site with both classes gets both signals", kinds(WALLET_HOST), "rank-gap,snippet-gap");
-  check("a site with only snippet gaps gets only that one", kinds(FORUM_HOST), "snippet-gap");
+  // (query-cannibalization, item 17, also fires on this host from the pair
+  // fixture — it is a different rule about a different problem, checked in 12b.)
+  check("a site with only snippet gaps gets that and no rank-gap",
+    kinds(FORUM_HOST).replace("query-cannibalization,", ""), "snippet-gap");
   const snippet = of(FORUM_HOST)[0];
   check("...at severity 2", snippet.severity, 2);
   check("...with the remedy that fits the class",
@@ -915,9 +945,86 @@ for (const period of [7, 30]) {
   check("...naming the query that leads it", snippet.evidence.includes("objectivism online"), true);
   const rank = of(WALLET_HOST).find((s) => s.kind === "rank-gap");
   check("the ranking signal prescribes ranking work, not a rewrite",
-    rank.action.includes("Strengthen those pages"), true);
+    rank.action.startsWith("Strengthen "), true);
   check("...and never tells the reader to rewrite a snippet nobody sees",
     /rewrite/i.test(rank.action), false);
+}
+
+// 12b. The query-to-page join (spec item 17). The page is attached beside the
+//      classifier's verdict, never used to make it; the two classes regroup by
+//      page in their own units; and a query split across two of the site's own
+//      pages is its own list and its own (severity 3, observe) signal.
+{
+  const { data } = await load("period=1");
+  const wallet = data.sites.find((s) => s.host === WALLET_HOST);
+  const forum = data.sites.find((s) => s.host === FORUM_HOST);
+  const sheets = data.sites.find((s) => s.host === SHEETS_HOST);
+  const of = (host) => (data.signals ?? []).filter((s) => s.host === host);
+
+  const bitcoin = wallet.opportunities.rank.find((row) => row.query === "bitcoin recovery");
+  check("a rank row carries the page it ranks", bitcoin?.page, `https://${WALLET_HOST}/recover`);
+  check("...with its share of the query's stored impressions", bitcoin?.pageShare, 1);
+  check("...and how many pages rank for it", bitcoin?.pageCount, 1);
+  check("a snippet row carries its page too",
+    sheets.opportunities.snippet.find((row) => row.query === "regex cheatsheet")?.page, `https://${SHEETS_HOST}/regex`);
+  const incest = forum.keywords.find((row) => row.query === "incest forum");
+  check("a query with no stored pair carries no page rather than a guessed one", incest?.page, null);
+  check("...and the visible query rows carry the page as well",
+    forum.keywords.find((row) => row.query === "objectivism online")?.page, `https://${FORUM_HOST}/`);
+  check("the verdict itself is unchanged by the join (same snippet count as before)",
+    forum.opportunities.snippet.length, 5);
+
+  // Page-level regrouping: two lists, two metrics, never summed.
+  check("rank opportunities regroup by page", wallet.pageOpportunities.rank.length > 0, true);
+  const recover = wallet.pageOpportunities.rank.find((row) => row.page === `https://${WALLET_HOST}/recover`);
+  check("...a page ranking two rank-class queries counts both", recover?.queries, 2);
+  check("...summing their potential clicks",
+    Math.abs(recover.potentialClicks - wallet.opportunities.rank
+      .filter((row) => row.page === recover.page).reduce((sum, row) => sum + row.potentialClicks, 0)) < 1e-9, true);
+  check("...and carries no lost-clicks figure", "lostClicks" in recover, false);
+  check("the page lists are sorted by their own class metric, descending",
+    wallet.pageOpportunities.rank.every((row, i) => i === 0 || wallet.pageOpportunities.rank[i - 1].potentialClicks >= row.potentialClicks)
+      && forum.pageOpportunities.snippet.every((row, i) => i === 0 || forum.pageOpportunities.snippet[i - 1].lostClicks >= row.lostClicks), true);
+  check("a snippet page entry carries no potential-clicks figure",
+    forum.pageOpportunities.snippet.every((row) => !("potentialClicks" in row)), true);
+  check("a rank-class query with no page does not produce a synthetic page entry",
+    forum.pageOpportunities.snippet.some((row) => !row.page), false);
+  // The action names the page. The signal reads pageOpportunities for "and N
+  // other pages", so this also proves the two are wired to the same list.
+  const snippetSignal = of(FORUM_HOST).find((s) => s.kind === "snippet-gap");
+  check("the snippet signal names the leading query's page", snippetSignal?.action.includes(" on /"), true);
+  check("...and the leading page in its evidence", snippetSignal?.evidence.includes(" on / "), true);
+  const rankSignal = of(WALLET_HOST).find((s) => s.kind === "rank-gap");
+  // The class leader by potential clicks is "crypto wallet recovery service",
+  // which ranks the apex page; /recover holds the other two paged rank rows.
+  check("the rank signal names the page to strengthen", rankSignal?.action.startsWith("Strengthen / "), true);
+  check("...and how many other pages the class touches",
+    rankSignal?.action.includes("(and 1 other page)"), true);
+
+  // Cannibalization.
+  check("a query split 60/40 across two pages is cannibalized", forum.cannibalized.length, 1);
+  check("...that query", forum.cannibalized[0]?.query, "objectivism online");
+  check("...with both competing pages, largest share first",
+    forum.cannibalized[0]?.pages.map((page) => page.page).join(","), `https://${FORUM_HOST}/,https://${FORUM_HOST}/forums/`);
+  check("...and shares of the query's stored impressions", forum.cannibalized[0]?.pages[1].share, 0.4);
+  check("a 7/3 split on fewer than CANNIBAL_MIN_IMPRESSIONS impressions is not",
+    forum.cannibalized.some((row) => row.query === "objectivist ethics"), true === false);
+  check("...(the fixture is really below the floor)", 10 < CANNIBAL_MIN_IMPRESSIONS, true);
+  check("a 95/5 split is not either: the 5% page is a stray, not a competitor",
+    forum.cannibalized.some((row) => row.query === "ayn rand forum"), false);
+  check("...(the fixture is really below the share floor)", 10 / 200 < CANNIBAL_MIN_SHARE, true);
+  const cannibal = of(FORUM_HOST).find((s) => s.kind === "query-cannibalization");
+  check("the cannibalized site gets one query-cannibalization signal", Boolean(cannibal), true);
+  check("...at severity 3 (observe) until a live case is confirmed", cannibal?.severity, 3);
+  check("...naming both pages", cannibal?.evidence.includes("/forums/") && cannibal?.evidence.includes("60%"), true);
+  check("...prescribing consolidation, not a rewrite", /consolidate/.test(cannibal?.action ?? "") && !/rewrite/i.test(cannibal?.action ?? ""), true);
+  check("a site with no split query gets none",
+    of(WALLET_HOST).some((s) => s.kind === "query-cannibalization"), false);
+  check("the zone-sourced host gets none", (data.signals ?? []).some((s) => s.host === ZONE_HOST && s.kind === "query-cannibalization"), false);
+
+  // Nothing here sums the two classes into one number.
+  check("no site-level field adds lost and potential clicks together",
+    Object.keys(wallet).some((key) => /total.*clicks|combined/i.test(key)), false);
 }
 
 // 13. Read width. The three GSC tables are read at two different widths on
@@ -936,6 +1043,9 @@ for (const period of [7, 30]) {
   check("...that date being the latest snapshot",
     readWidths.find((r) => r.table === "daily_keywords").binds[0], data.date);
   check("daily_pages is read the same way", width("daily_pages").join(","), "1");
+  check("daily_query_pages is read the same way (item 17)", width("daily_query_pages").join(","), "1");
+  check("...that date being the latest snapshot",
+    readWidths.find((r) => r.table === "daily_query_pages").binds[0], data.date);
   check("daily_search_summary keeps the history window it needs for the trend",
     width("daily_search_summary").join(","), "2");
   // The narrowing must not have cost the trend anything.

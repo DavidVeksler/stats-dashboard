@@ -38,7 +38,7 @@
 //                than an absent one, so nothing here guesses.
 
 import { FLAT_PAGES_PER_SESSION } from "./bots.js";
-import { looksMalformed } from "./urls.js";
+import { looksMalformed, pagePath } from "./urls.js";
 
 // Session-delta floors. Shared with the renderer's delta badge so the page shows
 // a percentage exactly when a percentage could mean something.
@@ -168,6 +168,7 @@ function weigh(kind, site, extra) {
     // on the same axis even though they are found by different metrics.
     case "snippet-gap":
     case "rank-gap": return extra.clicks;
+    case "query-cannibalization": return extra.impressions;
     case "no-comparison": return Number(site.visits || 0);
     case "ai-referral-rise": return Math.abs(extra.absolute);
     // Pipeline-health signals (item 12) are estate-wide, not site-shaped, so
@@ -348,30 +349,69 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
     // deep-ranking business query cannot be crowded out by a shallow trivial one.
     const snippetRows = site.opportunities?.snippet ?? [];
     const rankRows = site.opportunities?.rank ?? [];
+    // Since spec item 17 each row may carry the page it ranks (from the
+    // query+page pairs), and the page-level lists say how many pages the class
+    // touches — so the action can name the page to open instead of "those
+    // pages". A row with no page (stored before the pairs existed, or cut by
+    // QUERY_PAGE_ROW_LIMIT) falls back to the page-less wording; nothing here
+    // guesses a page.
+    const pageWords = (list) => {
+      const others = (list?.length ?? 0) - 1;
+      return others > 0 ? ` (and ${others} other ${others === 1 ? "page" : "pages"})` : "";
+    };
     if (snippetRows.length) {
       const lost = snippetRows.reduce((sum, row) => sum + row.lostClicks, 0);
       const top = snippetRows[0];
+      const path = top.page ? pagePath(top.page) : null;
       add({
         severity: 2, kind: "snippet-gap", host,
         headline: `${host} has ${snippetRows.length} ${snippetRows.length === 1 ? "query" : "queries"} ranking well but not clicked`,
         evidence: `About ${lost.toFixed(1)} clicks a window are going elsewhere, led by "${top.query}" ` +
-          `at position ${top.position.toFixed(1)} with ${pctText(top.ctr, 1)} CTR against roughly ` +
+          `at position ${top.position.toFixed(1)}${path ? ` on ${path}` : ""} with ${pctText(top.ctr, 1)} CTR against roughly ` +
           `${pctText(top.expectedCtr, 1)} expected there.`,
-        action: "Rewrite the title and meta description for those pages; the ranking is already there.",
+        action: path
+          ? `Rewrite the title and meta description on ${path}${pageWords(site.pageOpportunities?.snippet)}; the ranking is already there.`
+          : "Rewrite the title and meta description for those pages; the ranking is already there.",
         href, recurrence: null,
       }, weigh("snippet-gap", site, { clicks: lost }));
     }
     if (rankRows.length) {
       const potential = rankRows.reduce((sum, row) => sum + row.potentialClicks, 0);
       const top = rankRows[0];
+      const path = top.page ? pagePath(top.page) : null;
       add({
         severity: 2, kind: "rank-gap", host,
         headline: `${host} has ${rankRows.length} ${rankRows.length === 1 ? "query" : "queries"} ranking too deep to be seen`,
         evidence: `Roughly ${potential.toFixed(1)} clicks a window are out of reach at these ranks, led by ` +
-          `"${top.query}" at position ${top.position.toFixed(1)} on ${num(top.impressions)} impressions.`,
-        action: "Strengthen those pages and link to them from the strongest related page on the site.",
+          `"${top.query}" at position ${top.position.toFixed(1)}${path ? ` on ${path}` : ""} on ${num(top.impressions)} impressions.`,
+        action: path
+          ? `Strengthen ${path}${pageWords(site.pageOpportunities?.rank)} and link to it from the strongest related page on the site.`
+          : "Strengthen those pages and link to them from the strongest related page on the site.",
         href, recurrence: null,
       }, weigh("rank-gap", site, { clicks: potential }));
+    }
+
+    // query-cannibalization (item 17). One query, two or more of the site's own
+    // pages each holding a real share of its impressions: Google is choosing
+    // between them, and neither a rewrite nor "strengthen the page" is the fix —
+    // picking one is. Severity 3 (observe) until a live case has been confirmed
+    // by eye: a false positive here tells the reader to merge two pages, which
+    // is the most destructive advice on this page. Not exclusive with the two
+    // rules above — the same query can be badged and split, and both are true.
+    const cannibalized = site.cannibalized ?? [];
+    if (cannibalized.length) {
+      const top = cannibalized[0];
+      const [a, b] = top.pages;
+      const impressions = cannibalized.reduce((sum, row) => sum + row.impressions, 0);
+      add({
+        severity: 3, kind: "query-cannibalization", host,
+        headline: `${host} has ${cannibalized.length} ${cannibalized.length === 1 ? "query" : "queries"} split across its own pages`,
+        evidence: `"${top.query}" (${num(top.impressions)} impressions) is split between ${pagePath(a.page)} ` +
+          `(${pctText(a.share, 0)}, position ${a.position.toFixed(1)}) and ${pagePath(b.page)} ` +
+          `(${pctText(b.share, 0)}, position ${b.position.toFixed(1)})${top.pages.length > 2 ? ` and ${top.pages.length - 2} more` : ""}.`,
+        action: "Pick one page to rank for it, and consolidate the other into it or point its canonical at it.",
+        href, recurrence: null,
+      }, weigh("query-cannibalization", site, { impressions }));
     }
 
     // traffic-drop / traffic-rise. Both floored on absolute change, so a

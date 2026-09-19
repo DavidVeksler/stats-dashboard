@@ -2,13 +2,14 @@ import { SITES, FORUMS, registrableDomain } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
-  KEYWORD_ROW_LIMIT } from "./gsc.js";
+  queryQueryPages, summarizeQueryPages, KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "./gsc.js";
 import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords,
   getUserSites as getBingSites, diffBingSites, bingUrlsOf,
   mergeBingSummaries, mergeBingKeywords } from "./bing.js";
 import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
   crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
-import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS } from "./opportunities.js";
+import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS,
+  groupQueryPages, pageForQuery, attachPages, rankPageOpportunities, findCannibalized } from "./opportunities.js";
 import { computeSignals, STALE_PIPELINE_DAYS } from "./signals.js";
 import { renderDashboard } from "./render.js";
 
@@ -158,6 +159,16 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, kind)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signals_dh ON daily_signals(date, host)`),
+    // One row per (query, page) pair from the nightly pair pull (spec item 17).
+    // daily_keywords is derived from these; daily_pages is NOT — see the note on
+    // queryPages in gsc.js for the population difference.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_query_pages (
+      date TEXT NOT NULL, host TEXT NOT NULL, query TEXT NOT NULL, page TEXT NOT NULL,
+      clicks INTEGER NOT NULL DEFAULT 0, impressions INTEGER NOT NULL DEFAULT 0,
+      position REAL NOT NULL DEFAULT 0, gsc_window TEXT,
+      PRIMARY KEY (date, host, query, page)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_qp_dh ON daily_query_pages(date, host)`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -294,6 +305,13 @@ async function runDaily(env, now = new Date()) {
   // one truncated note in the runs table, which is how five sites sat with no
   // keyword data from 2026-08-11 until it was noticed by eye.
   const gscFailedHosts = new Set();
+  // Hosts whose query+page pair pull came back truncated at QUERY_PAGE_ROW_LIMIT
+  // and so cost a second, ["query"]-only request (spec item 17). Recorded in the
+  // runs row's note so the subrequest cost is visible, but deliberately NOT a
+  // `notes` entry: a note marks the run failed (`ok`), which trips item 12's
+  // severity-1 stale-pipeline signal, and a site outgrowing a row cap is not a
+  // pipeline failure.
+  const truncatedPairHosts = [];
   if (env.GSC_SA_KEY) {
     try {
       const sa = JSON.parse(env.GSC_SA_KEY);
@@ -316,14 +334,31 @@ async function runDaily(env, now = new Date()) {
         // to recover, because the DELETE had already run regardless. This block
         // also stays inside the `if (env.GSC_SA_KEY)` guard, so a run with no
         // GSC key refreshes traffic without wiping keyword history at all.
-        let rows = [], pages = [], summary = null;
-        let keywordsOk = false, pagesOk = false;
+        let pairs = [], rows = [], pages = [], summary = null;
+        let pairsOk = false, keywordsOk = false, pagesOk = false;
+        // One request for (query, page) pairs replaces the old ["query"] request
+        // (spec item 17): the per-query rows are derived from the pairs, exactly,
+        // when the pull is untruncated — see summarizeQueryPages in gsc.js. Only
+        // a truncated pull costs the second request, and that is reported.
         try {
-          rows = await queryKeywords(token, gsc, gStart, gEnd, KEYWORD_ROW_LIMIT, gscPageFilter);
-          keywordsOk = true;
+          pairs = await queryQueryPages(token, gsc, gStart, gEnd, QUERY_PAGE_ROW_LIMIT, gscPageFilter);
+          pairsOk = true;
         } catch (e) {
-          notes.push(`gsc queries ${host}: ${e.message}`.slice(0, 140));
+          notes.push(`gsc query pages ${host}: ${e.message}`.slice(0, 140));
           gscFailedHosts.add(host);
+        }
+        if (pairsOk && pairs.length < QUERY_PAGE_ROW_LIMIT) {
+          rows = summarizeQueryPages(pairs);
+          keywordsOk = true;
+        } else {
+          if (pairsOk) truncatedPairHosts.push(host);
+          try {
+            rows = await queryKeywords(token, gsc, gStart, gEnd, KEYWORD_ROW_LIMIT, gscPageFilter);
+            keywordsOk = true;
+          } catch (e) {
+            notes.push(`gsc queries ${host}: ${e.message}`.slice(0, 140));
+            gscFailedHosts.add(host);
+          }
         }
         try {
           pages = await queryPages(token, gsc, gStart, gEnd, 15, gscPageFilter);
@@ -346,6 +381,16 @@ async function runDaily(env, now = new Date()) {
           } catch (e) {
             notes.push(`gsc summary ${host}: ${e.message}`.slice(0, 140));
             gscFailedHosts.add(host);
+          }
+        }
+        if (pairsOk) {
+          stmts.push(env.DB.prepare(`DELETE FROM daily_query_pages WHERE date=? AND host=?`).bind(date, host));
+          for (const p of pairs) {
+            stmts.push(
+              env.DB.prepare(
+                `INSERT INTO daily_query_pages (date,host,query,page,clicks,impressions,position,gsc_window) VALUES (?,?,?,?,?,?,?,?)`
+              ).bind(date, host, p.query, p.page, p.clicks, p.impressions, p.position, gscWindow),
+            );
           }
         }
         if (keywordsOk) {
@@ -392,8 +437,13 @@ async function runDaily(env, now = new Date()) {
   // 3. Record the run
   const totalVisits = [...traffic.values()].reduce((a, r) => a + r.visits, 0);
   const ok = notes.length === 0;
+  // Informational, appended to the stored note but not to `notes`: see
+  // truncatedPairHosts above for why it must not flip `ok`.
+  const info = truncatedPairHosts.length
+    ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`]
+    : [];
   await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
-    .bind(now.toISOString(), date, ok ? 1 : 0, notes.join(" | ") || "ok").run();
+    .bind(now.toISOString(), date, ok ? 1 : 0, [...notes, ...info].join(" | ") || "ok").run();
 
   // 4. ntfy push — classified against the trailing history that was just written,
   //    so the daily phone alert reports the human audience rather than whatever a
@@ -433,7 +483,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    notes };
+    truncatedPairHosts, notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------
@@ -773,6 +823,7 @@ async function loadDashboard(env, options = {}) {
         zoneBots: measurementOf(s) === "zone" ? summarizeVerifiedBots([]) : null,
         zoneNonContent: measurementOf(s) === "zone" ? summarizeNonContent([], []) : null,
         opportunities: { snippet: [], rank: [] }, opportunityCount: 0,
+        pageOpportunities: { snippet: [], rank: [] }, cannibalized: [],
         queryDenyPatterns: s.queryDenyPatterns ?? [],
         sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 },
         spark: [] })) };
@@ -814,6 +865,13 @@ async function loadDashboard(env, options = {}) {
   // date a human reads comes from `gsc_window`, never from `date`.
   const pagesQuery = env.DB.prepare(
     `SELECT date,host,page,clicks,impressions,ctr,position,gsc_window FROM daily_pages WHERE date=? ORDER BY clicks DESC, impressions DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  // (query, page) pairs, latest day only — same width and same reason as the two
+  // reads above (spec item 17). Same schema-tolerance .catch: the table arrives
+  // with ensureSchema on the next run, and until then every query simply
+  // carries no page rather than the page 500ing.
+  const queryPagesQuery = env.DB.prepare(
+    `SELECT date,host,query,page,clicks,impressions,position FROM daily_query_pages WHERE date=? ORDER BY impressions DESC, clicks DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
   const searchSummaryQuery = env.DB.prepare(
     `SELECT date,host,clicks,impressions,ctr,position,gsc_window FROM daily_search_summary WHERE date BETWEEN ? AND ?`
@@ -871,7 +929,7 @@ async function loadDashboard(env, options = {}) {
   const dailySignalsQuery = env.DB.prepare(
     `SELECT date,host,kind FROM daily_signals WHERE date BETWEEN ? AND ?`
   ).bind(historyStart, addDays(date, -1)).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run] = await Promise.all([
+  const [tr, previousTr, refs, kws, pages, queryPagesRows, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -883,6 +941,7 @@ async function loadDashboard(env, options = {}) {
     // consumer of this read filters back down to `date` anyway.
     env.DB.prepare(`SELECT date,host,query,clicks,impressions,position,gsc_window FROM daily_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`).bind(date).all(),
     pagesQuery,
+    queryPagesQuery,
     searchSummaryQuery,
     bingSummaryQuery,
     bingKeywordsQuery,
@@ -993,7 +1052,13 @@ async function loadDashboard(env, options = {}) {
     // keyword row rather than the twelve the card shows. The renderer re-derives
     // each visible row's class from the same classifier, so a badge and this
     // count can differ in coverage but never in verdict.
-    const opportunities = rankOpportunities(kwRows, s);
+    // The query-to-page join (spec item 17). The classifier's verdict is made
+    // from the query row alone; the page is attached beside it afterwards, so
+    // the badge and the "Pages to fix" list cannot disagree about a query.
+    const queryPages = groupQueryPages(byHost(queryPagesRows, s.host).filter((r) => r.date === date));
+    const opportunities = attachPages(rankOpportunities(kwRows, s), queryPages);
+    const pageOpportunities = rankPageOpportunities(opportunities);
+    const cannibalized = findCannibalized(queryPages, s);
     // Landing-page rows carry no referer dimension, so a flooded day's are the
     // crawler's and stay excluded whole.
     const cfPageRows = mergeBy(byHost(cfPages, s.host).filter((r) => !floods.has(r.date)),
@@ -1076,7 +1141,8 @@ async function loadDashboard(env, options = {}) {
       referrers: refRows.slice(0, 8).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
       sources: summarizeSources(refRows, t.visits, t.estimatedDirect),
       keywords: kwRows.slice(0, 12).map((k) => ({ query: k.query, clicks: k.clicks,
-        impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position })),
+        impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position,
+        ...pageForQuery(k.query, queryPages) })),
       pages: pageRows.slice(0, 8).map((p) => ({ page: p.page, clicks: p.clicks,
         impressions: p.impressions, ctr: p.ctr ?? (p.impressions ? p.clicks / p.impressions : 0), position: p.position })),
       cfPages: cfPageRows.slice(0, 8).map((p) => ({ page: p.page, visits: Number(p.visits || 0), views: Number(p.views || 0) })),
@@ -1101,6 +1167,12 @@ async function loadDashboard(env, options = {}) {
         ? summarizeNonContent(latestCfPageRows, latestZoneStatusRows) : null,
       opportunities,
       opportunityCount: opportunities.snippet.length + opportunities.rank.length,
+      // Per-page view of the same two classes, and queries split across pages.
+      // Both are sums over stored (query, page) pairs, which omit anonymized
+      // queries — a different population from `pages` above, and render.js
+      // labels them so. Never print one against the other.
+      pageOpportunities,
+      cannibalized,
       // Carried onto the shaped row so render.js can re-run the same classifier
       // over the visible keywords with the same deny list. Strings, not RegExp
       // objects, so /api/json does not serialize them to `{}`.
