@@ -179,10 +179,14 @@ and combining the two there would repeat the RUM/zone population-mismatch mistak
 site's `bingSummary` clicks/impressions, because at the estate level "how much search traffic in
 total" is a real question a reader asks, and it's summed there instead of forcing them to add two
 tiles by hand. Both tiles' subtitles name the Google/Bing split whenever any site has Bing data
-(`hasBingSite`), so the combination is never silent. CTR and median-position stay Google-only, both
-there and on every card — Bing's summary has no position field at all, and per-query rows carry a
-`-1` "not reported" sentinel, so neither can be folded into a median or into `expectedCtr()`'s
-position curve (itself sourced from a Google-CTR study). Auth is a single flat
+(`hasBingSite`), so the combination is never silent. The **Search CTR · position** tile (one tile since
+2026-09-24, `searchQualityTile` in `render.js`) extends the same sum to its headline CTR only: Google +
+Bing whole-corpus clicks over impressions, the same populations as the two tiles beside it. Position is
+**never pooled**: the headline is Google's median, and Bing's median (`totals.bingMedianPosition`, over
+Bing's own stored query rows' `AvgImpressionPosition`, same `POSITION_MIN_IMPRESSIONS` floor, the `-1`
+sentinel skipped) sits on its own line. The expected-CTR comparator and the 14-snapshot mean stay
+Google-only and sit on the Google line, because `expectedCtr()` is a Google-CTR curve and no Bing
+history is read. Per-site cards stay unmerged. Auth is a single flat
 `BING_API_KEY` (Settings → API Access in Bing Webmaster Tools), not OAuth, and one key covers every
 site verified under that Bing account — see `getUserSites` in `bing.js` for discovering the exact
 `Url` string a site is registered under (Bing 400s on anything else, the same intolerance GSC has
@@ -279,18 +283,19 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   from the panel entirely** rather than drawn as `Internal 0 · 0.0%`. A rendered zero there would
   assert a measurement nobody took. This matters most in `?period=7` and `?period=30`, which still
   reach back over pre-change rows — test both, not only the 24h view.
-- **`kind: "ai"` is a per-row badge, not a mix-bar channel, because it is known to undercount.**
-  `classifyReferrer` recognizes a short list of AI chat/answer-engine referrer hosts
-  (`AI_ANSWER_ENGINES` in `src/config.js`) and tags matching rows `ai` — same write-time-frozen,
-  forward-only rule as `internal` above. It is deliberately **not** added to `totals.sourceMix`:
-  `summarizeSources` in `src/index.js` folds `ai` into `referral` for every aggregate, so the KPI
-  tiles and the traffic-source bar are unaffected. Reason: most AI chat surfaces don't reliably send
-  a `Referer` at all (`noreferrer` links, JS-driven navigation), and Google's AI Overviews and Bing
-  Copilot pass their parent engine's own referrer (`google.`/`bing.`), indistinguishable from
-  ordinary search — so this list only ever catches a fraction of real AI-driven traffic. Promoting
-  it to a headline channel would imply a completeness the data can't back up. If that changes (a
-  reliable way to separate AI Overview / Copilot clicks turns up), reconsider promoting it — until
-  then it stays a badge on `referrerList`'s per-row tags only.
+- **AI referrals: a per-row badge AND an estate tile, never a mix-bar channel, because they undercount.**
+  `classifyReferrer` tags referers matching `AI_ANSWER_ENGINES` (`src/config.js`, host substring plus
+  engine name) as kind `ai`, write-time frozen like `internal`. `summarizeSources` folds `ai` into
+  `referral` for every aggregate, so the source-mix bar is unaffected. Reason: most AI chat surfaces
+  send no `Referer` (they land in Direct), and Google AI Overviews / Copilot in Bing pass
+  `google.`/`bing.` referers, indistinguishable from search, so this only ever catches a fraction of
+  AI-driven traffic. The **AI referrals** tile (`totals.ai`, `aiTile` in `render.js`) reports it as
+  labelled floor, by engine, with previous-period delta and 14-day mean (`trend.aiPerDay`). Unlike
+  `internal`, the referer host IS stored, so the tile's read (`aiRefsQuery` in `loadDashboard`)
+  **matches on the referer host via `aiEngineOf`, not on `kind`**: an engine added to the list counts
+  retroactively on the tile, while the per-row badge stays frozen. The `ai-referral-rise` signal still
+  reads `kind` (its baseline comes from the kind-grouped `histRefs`), so the two can differ for rows
+  written before an engine was listed.
 - **`Unattributed` is a residual, not a channel, and must never be rendered as one.** It is
   `visits - (direct + search + social + referral + internal)`, so it measures the disagreement
   between two tables rather than any behavior. It used to be called `Other / unlisted` and rendered

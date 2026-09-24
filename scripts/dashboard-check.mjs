@@ -149,6 +149,8 @@ let runsRow = { run_at: "2026-08-09T13:00:57Z", ok: 1, note: "ok" };
 let bingSummaryRows = SITES.filter((s) => bingUrlsOf(s).length).map((s) => ({
   date: "2026-08-09", host: s.host, clicks: 1, impressions: 10, ctr: .1, bing_window: "2026-08-08–2026-08-09",
 }));
+// Empty by default; the Bing-median block below fills it for its own assertions.
+let bingKeywordRows = [];
 let forumActivityRows = FORUMS.map((f) => ({
   date: "2026-08-09", host: f.host, users_count: 100, active_today: 1, active_7d: 3, active_30d: 5,
   new_today: 0, new_7d: 1, new_30d: 2, posts_today: 0, posts_count: 10, topics_count: 2,
@@ -281,6 +283,10 @@ const referrers = [
   // (sourceMix, totals) but carries its own "ai" kind on the row itself, which
   // is all this per-row badge is — see the AI_ANSWER_ENGINES note in config.js.
   { date: "2026-08-09", host: SMALL_HOST, referrer: "chatgpt.com", kind: "ai", visits: 2 },
+  // An AI engine stored as plain "ref" because it joined AI_ANSWER_ENGINES after
+  // the row was written. The row's kind stays frozen, but the AI referrals tile
+  // matches on the stored referer host, so it still counts there.
+  { date: "2026-08-08", host: SMALL_HOST, referrer: "notebook.google.com", kind: "ref", visits: 1 },
 ];
 const nonDirect = (date) =>
   referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
@@ -333,6 +339,7 @@ const db = {
       // error-spike baseline lives in these rows.
       if (sql.includes("daily_zone_status")) return { results: between(ZONE_STATUSES, binds) };
       if (sql.includes("daily_bing_summary")) return { results: onDate(bingSummaryRows, binds) };
+      if (sql.includes("daily_bing_keywords")) return { results: onDate(bingKeywordRows, binds) };
       if (sql.includes("daily_forum_activity")) return { results: between(forumActivityRows, binds) };
       if (sql.includes("daily_signals")) return { results: between(dailySignalRows, binds) };
       if (sql.includes("daily_zone_bots")) {
@@ -726,6 +733,38 @@ if (process.argv.includes("--signals")) {
   // into "referral" here rather than counted separately or left unattributed.
   check("an ai-kind referrer is folded into referral, not given its own mix key",
     mix.referral, 2);
+}
+
+// 9a. The AI referrals tile: matched on referer host, RUM hosts only, grouped by
+//     engine, with the previous period and the 14-day mean from the same rows.
+{
+  const { data } = await load("period=1");
+  check("AI referrals count the latest day's AI-engine sessions", data.totals.ai.visits, 2);
+  check("...named by engine", data.totals.ai.engines.map((e) => `${e.engine} ${e.visits}`).join(", "), "ChatGPT 2");
+  check("...with the previous day as the comparison", data.totals.ai.previousVisits, 1);
+  check("...and the site they landed on", data.totals.ai.hosts[0]?.host, SMALL_HOST);
+  check("the 14-day AI mean counts days with no AI row as zero",
+    data.totals.trend.aiPerDay, 3 / data.totals.trend.days);
+  const month = (await load("period=30")).data.totals.ai;
+  check("a row stored as \"ref\" before its engine was listed still counts", month.visits, 3);
+  check("...under its engine's name", month.engines.map((e) => e.engine).sort().join(", "), "ChatGPT, Gemini Notebook");
+}
+
+// 9a'. Bing's median position: its own stored query rows, the same impression
+//      floor as Google's median, and the -1 "not reported" sentinel skipped
+//      rather than averaged in as a rank. Never pooled with Google's median.
+{
+  const bingHost = SITES.find((s) => bingUrlsOf(s).length).host;
+  const row = (query, impressions, position) => ({ date: "2026-08-09", host: bingHost, query,
+    clicks: 0, impressions, avg_click_position: -1, avg_impression_position: position, bing_window: "x" });
+  bingKeywordRows = [row("a", POSITION_MIN_IMPRESSIONS, 2), row("b", 50, 4), row("c", 50, 12),
+    row("sentinel", 50, -1), row("thin", Math.max(0, POSITION_MIN_IMPRESSIONS - 1), 1)];
+  const { data } = await load("period=1");
+  bingKeywordRows = [];
+  check("Bing median position is taken over rows clearing the impression floor", data.totals.bingMedianPosition, 4);
+  check("...skipping the -1 sentinel", data.totals.bingPositionQueries, 3);
+  check("...with its own top-10 count", data.totals.bingTop10Queries, 2);
+  check("...and never replaces Google's median", data.totals.gscMedianPosition !== 4 || data.totals.gscPositionQueries !== 3, true);
 }
 
 // 9b. The historical case, and the reason item 6 needs one. `kind` is frozen into

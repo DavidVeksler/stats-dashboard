@@ -1,4 +1,4 @@
-import { SITES, FORUMS, registrableDomain } from "./config.js";
+import { SITES, FORUMS, registrableDomain, AI_ANSWER_ENGINES, aiEngineOf } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages, RUM_ROW_LIMIT } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
@@ -811,7 +811,9 @@ async function loadDashboard(env, options = {}) {
         gscMedianPosition: 0, gscPositionQueries: 0, gscTop10Queries: 0, gscExpectedCtr: 0,
         gscSampleCtr: 0, gscSampleClicks: 0, gscSampleImpressions: 0, gscSampleQueries: 0,
         gscSampleShare: 0,
-        trend: { window: COMPARATOR_DAYS, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0,
+        bingClicks: 0, bingImpressions: 0, bingMedianPosition: 0, bingPositionQueries: 0, bingTop10Queries: 0,
+        ai: { visits: 0, previousVisits: 0, delta: null, engines: [], hosts: [] },
+        trend: { window: COMPARATOR_DAYS, days: 0, visitsPerDay: 0, viewsPerDay: 0, searchPerDay: 0, aiPerDay: 0,
           gscSnapshots: 0, gscClicksPerSnapshot: 0, gscImpressionsPerSnapshot: 0, gscCtr: 0,
           gscWindowFirst: null, gscWindowLast: null, gscSeries: [] },
         opportunities: 0, snippetOpportunities: 0, rankOpportunities: 0 },
@@ -933,7 +935,19 @@ async function loadDashboard(env, options = {}) {
   const dailySignalsQuery = env.DB.prepare(
     `SELECT date,host,kind FROM daily_signals WHERE date BETWEEN ? AND ?`
   ).bind(historyStart, addDays(date, -1)).all().catch(() => ({ results: [] }));
-  const [tr, previousTr, refs, kws, pages, queryPagesRows, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run] = await Promise.all([
+  // AI answer-engine referrals for the estate "AI referrals" tile, over the
+  // history window so one read gives the current period, the previous period and
+  // the 14-day comparator. Selected by REFERER HOST (the same substrings
+  // aiEngineOf matches), not by the stored `kind`: kind is frozen at write time,
+  // so filtering on it would drop every row written before a host joined
+  // AI_ANSWER_ENGINES, while the host is right there in the row. The LIKEs only
+  // narrow the read; aiEngineOf re-checks every row in JS.
+  const aiRefsQuery = env.DB.prepare(
+    `SELECT date,host,referrer,SUM(visits) AS visits FROM daily_referrers
+     WHERE date BETWEEN ? AND ? AND (${AI_ANSWER_ENGINES.map(() => "LOWER(referrer) LIKE ?").join(" OR ")})
+     GROUP BY date,host,referrer`
+  ).bind(historyStart, date, ...AI_ANSWER_ENGINES.map(([match]) => `%${match}%`)).all().catch(() => ({ results: [] }));
+  const [tr, previousTr, refs, kws, pages, queryPagesRows, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run, aiRefs] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
     env.DB.prepare(
@@ -961,6 +975,7 @@ async function loadDashboard(env, options = {}) {
        WHERE date BETWEEN ? AND ? GROUP BY date,host,kind`
     ).bind(baselineStart, date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
+    aiRefsQuery,
   ]);
   const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
   // Memoized per host: directRatioStats scans a host's whole clean-day history,
@@ -1252,6 +1267,50 @@ async function loadDashboard(env, options = {}) {
   const meanOf = (rows, pick) => (rows.length
     ? rows.reduce((sum, row) => sum + pick(row), 0) / rows.length : 0);
 
+  // AI answer-engine referrals (the "AI referrals" tile). RUM hosts only, like
+  // every other session figure. These are referred sessions, which splitDay
+  // keeps on a flooded day too, so no flood adjustment applies. A FLOOR, not a
+  // channel measurement: most AI surfaces send no Referer and AI Overviews /
+  // Copilot-in-Bing arrive as google./bing. search (see AI_ANSWER_ENGINES), which
+  // is why this stays a tile beside the mix bar and is never added to sourceMix.
+  const aiByDate = new Map();
+  const aiEngines = new Map();
+  const aiHosts = new Map();
+  let aiVisits = 0;
+  let aiPreviousVisits = 0;
+  for (const row of aiRefs?.results ?? []) {
+    const engine = aiEngineOf(row.referrer);
+    if (!engine || !rumHosts.has(row.host)) continue;
+    const visits = Number(row.visits || 0);
+    aiByDate.set(row.date, (aiByDate.get(row.date) ?? 0) + visits);
+    if (row.date >= start && row.date <= date) {
+      aiVisits += visits;
+      aiEngines.set(engine, (aiEngines.get(engine) ?? 0) + visits);
+      aiHosts.set(row.host, (aiHosts.get(row.host) ?? 0) + visits);
+    } else if (row.date >= previousStart && row.date <= previousEnd) {
+      aiPreviousVisits += visits;
+    }
+  }
+  const byVisits = (map, key) => [...map].map(([name, visits]) => ({ [key]: name, visits }))
+    .sort((a, b) => b.visits - a.visits || String(a[key]).localeCompare(String(b[key])));
+
+  // Bing's side of the combined search tile: median AvgImpressionPosition over
+  // the latest stored Bing query rows, same impression floor as Google's median.
+  // Its own population (Bing's top queries per property, updated weekly), so it
+  // is reported beside Google's median, never merged into one. Positions <= 0
+  // are Bing's "not reported" sentinel and are skipped, never averaged in.
+  const bingPositions = (bingKeywords.results ?? [])
+    .filter((row) => selectedHosts.has(row.host)
+      && Number(row.impressions || 0) >= POSITION_MIN_IMPRESSIONS
+      && Number(row.avg_impression_position || 0) > 0)
+    .map((row) => Number(row.avg_impression_position)).sort((a, b) => a - b);
+  const medianOf = (sorted) => (sorted.length
+    ? (sorted.length % 2
+      ? sorted[(sorted.length - 1) / 2]
+      : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2)
+    : 0);
+  const bingSelected = (bingSummaries.results ?? []).filter((row) => selectedHosts.has(row.host));
+
   // GSC rows are a ROLLING WINDOW keyed by snapshot date (see the read above), so
   // only trailing averages are taken from them and never a day-over-day delta.
   const gscByDate = new Map();
@@ -1367,12 +1426,30 @@ async function loadDashboard(env, options = {}) {
     gscSampleClicks: mixClicks,
     gscSampleImpressions: mixImpressions,
     gscSampleQueries: latestKeywordRows.length,
+    // Bing Webmaster Tools, estate level. Clicks/impressions are Bing's whole
+    // site-level summary (the same corpus shape as daily_search_summary), so
+    // they add to Google's for the combined CTR headline; position is a separate
+    // median over Bing's own stored query rows.
+    bingClicks: bingSelected.reduce((sum, row) => sum + Number(row.clicks || 0), 0),
+    bingImpressions: bingSelected.reduce((sum, row) => sum + Number(row.impressions || 0), 0),
+    bingMedianPosition: medianOf(bingPositions),
+    bingPositionQueries: bingPositions.length,
+    bingTop10Queries: bingPositions.filter((position) => position <= 10).length,
+    ai: {
+      visits: aiVisits,
+      previousVisits: aiPreviousVisits,
+      delta: aiPreviousVisits ? (aiVisits - aiPreviousVisits) / aiPreviousVisits : null,
+      engines: byVisits(aiEngines, "engine"),
+      hosts: byVisits(aiHosts, "host"),
+    },
     trend: {
       window: COMPARATOR_DAYS,
       days: trafficTrend.length,
       visitsPerDay: meanOf(trafficTrend, (row) => row.visits),
       viewsPerDay: meanOf(trafficTrend, (row) => row.views),
       searchPerDay: meanOf(trafficTrend, (row) => row.search),
+      // Same days as visitsPerDay; a day with no AI row is a real zero.
+      aiPerDay: meanOf(trafficTrend, (row) => aiByDate.get(row.date) ?? 0),
       // Snapshots, not days: consecutive GSC rows overlap by two days out of
       // three, so this is "the average of the last N overlapping windows" and the
       // renderer is required to label it as one.

@@ -87,10 +87,16 @@ const fixture = {
     gscExpectedCtr: .059, gscSampleCtr: 41 / 900, gscSampleClicks: 41, gscSampleImpressions: 900,
     gscSampleQueries: 18, gscSampleShare: 900 / 2200,
     opportunities: 2, snippetOpportunities: 1, rankOpportunities: 1,
+    // Bing's own median over its own stored query rows, printed beside Google's.
+    bingMedianPosition: 4.0, bingPositionQueries: 5, bingTop10Queries: 4,
+    // AI answer-engine referrals, grouped by engine (config.js AI_ANSWER_ENGINES).
+    ai: { visits: 6, previousVisits: 3, delta: 1,
+      engines: [{ engine: "ChatGPT", visits: 3 }, { engine: "Gemini", visits: 2 }, { engine: "Gemini Notebook", visits: 1 }],
+      hosts: [{ host: "example.com", visits: 5 }, { host: "wiki.example", visits: 1 }] },
     // 14-day comparators. GSC ones are counted in SNAPSHOTS, not days: each
     // snapshot covers a rolling three-day window lagging two days, so consecutive
     // ones overlap and the ends of the range are named from gsc_window.
-    trend: { window: 14, days: 14, visitsPerDay: 96.4, viewsPerDay: 131.2, searchPerDay: 19.6,
+    trend: { window: 14, days: 14, visitsPerDay: 96.4, viewsPerDay: 131.2, searchPerDay: 19.6, aiPerDay: 0.5,
       gscSnapshots: 14, gscClicksPerSnapshot: 41.5, gscImpressionsPerSnapshot: 2050, gscCtr: .0202,
       gscWindowFirst: "2026-06-29–2026-07-01", gscWindowLast: "2026-07-12–2026-07-14", gscSeries: [] } },
   sites: [
@@ -348,7 +354,13 @@ const required = [
   // and say so — CTR/position stay Google-only right below since Bing has no
   // per-query position curve to fold into either.
   ">72<", ">3,039<", "(46 Google clicks + 26 Bing)", "(2,200 Google + 839 Bing)",
-  "Search CTR (Google only)", "Median search position (Google only)",
+  // CTR and position share one tile. Headline CTR is Google + Bing whole-corpus
+  // (72 / 3,039 = 2.4%); headline position is Google's median; each engine gets
+  // its own line so neither median is pooled with the other.
+  "Search CTR · position (Google + Bing)", "2.4%<span class=\"v-sep\">·</span>9.4",
+  "<b>Google</b> 2.1% CTR · median pos 9.4", "<b>Bing</b> 3.1% CTR · median pos 4.0 · 4 of 5 stored queries in the top 10",
+  // AI referrals tile: engine breakdown, top host, the floor caveat, a comparator.
+  "AI referrals", "ChatGPT 3 · Gemini 2 · Gemini Notebook 1", "top: example.com 5", ">a floor<",
   // Item 6: the panel is RUM-only, the residual is named and moved out of the bar.
   "Traffic sources (RUM sites only)",
   "<b>Unattributed: 80 sessions (6.2%)</b>",
@@ -361,16 +373,15 @@ const required = [
   "clicks a window lost to the snippet, not to the ranking",
   "too deep to be seen",
   // Item 8: comparators on every tile.
-  "Median search position", "9.4", "11 of 18 stored top queries in the top 10",
+  "11 of 18 stored top queries in the top 10",
   "1 snippet · 1 rank",
   // Item 8, correction: both sides of the CTR comparator are the stored top-query
   // rows and the tile says so. The headline (2.1% here) is the whole corpus, a
   // visibly different number from the sample's 4.6%, because a top-query
   // expectation is not a verdict on the corpus.
-  "headline covers every query",
-  "stored top 18 queries: 4.6% vs expected ~5.9% · 40.9% of impressions",
+  "Google stored top 18 queries: 4.6% vs expected ~5.9% · 40.9% of impressions",
   "14-day mean 96/day", "186/day here",
-  "14-snapshot mean 42", "14-snapshot mean 2.0%",
+  "14-snapshot mean 42", "Google 14-snapshot mean 2.0%",
   "rolling windows 2026-06-29–2026-07-01 through 2026-07-12–2026-07-14",
   "consecutive snapshots overlap",
   // Item 6, correction 4: the two tiles used to read "12 / 12 with traffic" beside

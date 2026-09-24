@@ -219,7 +219,30 @@ const SOCIAL = ["reddit.", "reddit.frontpage", "linkedin.", "facebook.", "x.com"
 // (google./bing.), which is indistinguishable from ordinary search — those stay
 // classified as "search" and can't be split out from this list. Checked before
 // SEARCH_ENGINES because gemini.google.com would otherwise match "google.".
-const AI_ANSWER_ENGINES = ["chatgpt.com", "chat.openai.com", "claude.ai", "perplexity.ai", "gemini.google.com", "copilot.microsoft.com", "you.com", "poe.com"];
+//
+// Each entry is a substring of the referer host plus the engine it names, so the
+// "AI referrals" tile can group rows by engine. notebook.google.com is Gemini
+// Notebook (formerly NotebookLM; notebooklm.google.com has 301'd to it since
+// 2026-08-24). com.openai.chatgpt is the Android app's package-name referer,
+// the same shape as com.google.android.googlequicksearchbox.
+export const AI_ANSWER_ENGINES = [
+  ["chatgpt.com", "ChatGPT"], ["chat.openai.com", "ChatGPT"], ["com.openai.chatgpt", "ChatGPT"],
+  ["claude.ai", "Claude"], ["perplexity.ai", "Perplexity"],
+  ["gemini.google.com", "Gemini"], ["notebook.google.com", "Gemini Notebook"], ["notebooklm.google.com", "Gemini Notebook"],
+  ["copilot.microsoft.com", "Copilot"], ["chat.deepseek.com", "DeepSeek"], ["grok.com", "Grok"],
+  ["chat.mistral.ai", "Mistral"], ["meta.ai", "Meta AI"], ["you.com", "You.com"], ["poe.com", "Poe"],
+];
+
+// The engine name for an AI referer host, or null. Read-time as well as
+// write-time: the referer host itself is stored in daily_referrers, so unlike
+// "internal" this classification CAN be re-applied to old rows, and the
+// estate-wide AI tile does exactly that (a host added to the list above counts
+// retroactively there, while the frozen per-row `kind` badge does not).
+export function aiEngineOf(refHost) {
+  const h = String(refHost ?? "").toLowerCase();
+  if (!h) return null;
+  return AI_ANSWER_ENGINES.find(([match]) => h.includes(match))?.[1] ?? null;
+}
 
 // Classify a refererHost into a source type for the dashboard tags.
 //
@@ -244,7 +267,7 @@ export function classifyReferrer(refHost, selfHost = null) {
   if (!refHost) return "direct";
   const h = refHost.toLowerCase();
   if (selfHost && HOST_ALIASES.get(refHost) === selfHost) return "internal";
-  if (AI_ANSWER_ENGINES.some((s) => h.includes(s))) return "ai";
+  if (aiEngineOf(h)) return "ai";
   if (SEARCH_ENGINES.some((s) => h.includes(s))) return "search";
   if (SOCIAL.some((s) => h.includes(s))) return "social";
   return "ref";
