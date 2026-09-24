@@ -255,6 +255,15 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `rumPageloadEventsAdaptiveGroups` under `viewer.accounts`, NOT under `zones` (querying it on a
   zone errors with "unknown field"). `pullTraffic` queries all `CF_ACCOUNTS` and merges rows by
   `requestHost`, because a host can live on any account.
+- **The RUM pull is three aliased groupings in one request, never one three-dimension grouping.**
+  `pullTraffic` asks for per-host `totals`, per-(host, referrer) `refs` and per-(host, path) `pages`
+  separately. The old single `refererHost x requestHost x requestPath` query shared one 5,000-row cap
+  across every host in the account; a crawler flood filled it and cheatsheets.davidveksler.com stored
+  zero referrers on 2026-09-24 against Cloudflare's own 44 Google + 17 Bing, which made the day read as
+  100% direct. Aliases keep it at one subrequest per account. `excludePaths` is applied in the query
+  filter (`rumFilter`) because two groupings have no path to drop rows on. A grouping that fills its cap
+  (usually `pages` during a flood) is reported as `rumTruncated` from `/run` and in the `runs` note,
+  without failing the run.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and
   contributes nothing either way. A hop between a site's *own different* hostnames does start a

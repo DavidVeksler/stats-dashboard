@@ -1,5 +1,5 @@
 import { SITES, FORUMS, registrableDomain } from "./config.js";
-import { pullTraffic, pullZoneTraffic, topReferrers, topPages } from "./cloudflare.js";
+import { pullTraffic, pullZoneTraffic, topReferrers, topPages, RUM_ROW_LIMIT } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
   queryQueryPages, summarizeQueryPages, KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "./gsc.js";
@@ -188,7 +188,9 @@ async function runDaily(env, now = new Date()) {
   const notes = [];
 
   // 1. Traffic + referrers (Cloudflare Web Analytics)
-  const traffic = await pullTraffic(env, since, until);
+  // `rumTruncated` names any grouping that filled its row cap. Informational
+  // (see `info` below), not a failure: the per-host totals are exact either way.
+  const { hosts: traffic, truncated: rumTruncated } = await pullTraffic(env, since, until);
 
   // 1b. Zone-log traffic for hosts with no RUM beacon (trafficSource: "zone").
   // Merged into the same `traffic` map so the rest of this function doesn't
@@ -439,9 +441,11 @@ async function runDaily(env, now = new Date()) {
   const ok = notes.length === 0;
   // Informational, appended to the stored note but not to `notes`: see
   // truncatedPairHosts above for why it must not flip `ok`.
-  const info = truncatedPairHosts.length
-    ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`]
-    : [];
+  const info = [
+    ...(truncatedPairHosts.length
+      ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`] : []),
+    ...(rumTruncated.length ? [`rum rows truncated at ${RUM_ROW_LIMIT}: ${rumTruncated.join(", ")}`] : []),
+  ];
   await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
     .bind(now.toISOString(), date, ok ? 1 : 0, [...notes, ...info].join(" | ") || "ok").run();
 
@@ -483,7 +487,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, notes };
+    truncatedPairHosts, rumTruncated, notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------

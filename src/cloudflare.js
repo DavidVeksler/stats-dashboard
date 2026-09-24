@@ -3,26 +3,75 @@ import { UNVERIFIED_CATEGORY } from "./bots.js";
 
 const GQL = "https://api.cloudflare.com/client/v4/graphql";
 
-const QUERY = `query Rum($account: String!, $start: String!, $end: String!) {
+// Per-grouping row cap on the RUM dataset.
+export const RUM_ROW_LIMIT = 5000;
+
+// Three groupings of the same dataset in ONE request (GraphQL aliases), so the
+// split costs no extra subrequests — runDaily sits near the 50-per-invocation
+// ceiling.
+//
+// This used to be a single `refererHost x requestHost x requestPath` grouping,
+// capped at 5,000 rows and ordered by pageviews across EVERY host in the
+// account. A crawler flood (direct hits spread over many paths) filled that
+// budget and pushed out the small referred rows: on 2026-09-24
+// cheatsheets.davidveksler.com stored no referrers at all against Cloudflare's
+// own 44 Google + 17 Bing sessions, and because visits were summed from the same
+// truncated rows, the day read as 100% direct and the card had no human figure.
+// Each grouping below carries only the dimensions its consumer needs:
+//   totals: per host — exact visits/views
+//   refs:   per (host, referrer) — no path dimension to explode it
+//   pages:  per (host, path), ranked by landing sessions — the one a flood can
+//           still fill; pullTraffic reports which groupings hit the cap.
+// Per-host EXCLUDE_PATHS go into the shared filter as
+// `OR: [{ requestHost_neq }, { requestPath_notin }]`, since two of the three
+// groupings have no path to drop rows on after the fact.
+const QUERY = `query Rum($account: String!, $filter: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!) {
   viewer {
     accounts(filter: { accountTag: $account }) {
-      rumPageloadEventsAdaptiveGroups(
-        filter: { datetime_geq: $start, datetime_leq: $end }
-        limit: 5000
-        orderBy: [count_DESC]
-      ) {
+      totals: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [count_DESC]) {
         count
         sum { visits }
-        dimensions { refererHost requestHost requestPath }
+        dimensions { requestHost }
+      }
+      refs: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
+        sum { visits }
+        dimensions { requestHost refererHost }
+      }
+      pages: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
+        count
+        sum { visits }
+        dimensions { requestHost requestPath }
       }
     }
   }
 }`;
 
+// The RUM filter: the time window, plus one exclusion clause per raw hostname
+// (aliases included) whose primary host lists excludePaths.
+export function rumFilter(startISO, endISO) {
+  const filter = { datetime_geq: startISO, datetime_leq: endISO };
+  const exclusions = [];
+  for (const [raw, host] of HOST_ALIASES) {
+    const paths = EXCLUDE_PATHS.get(host);
+    if (paths?.size) exclusions.push({ OR: [{ requestHost_neq: raw }, { requestPath_notin: [...paths] }] });
+  }
+  if (exclusions.length) filter.AND = exclusions;
+  return filter;
+}
+
 // Pull the last-24h RUM rows from every account and merge by requestHost.
-// Returns Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>.
+// Returns { hosts, truncated } where hosts is
+// Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>
+// and truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT.
 export async function pullTraffic(env, startISO, endISO) {
   const hosts = new Map();
+  const truncated = [];
+  const filter = rumFilter(startISO, endISO);
+  const recFor = (host) => {
+    let rec = hosts.get(host);
+    if (!rec) hosts.set(host, rec = { views: 0, visits: 0, referrers: new Map(), pages: new Map() });
+    return rec;
+  };
 
   for (const account of CF_ACCOUNTS) {
     const res = await fetch(GQL, {
@@ -31,49 +80,53 @@ export async function pullTraffic(env, startISO, endISO) {
         Authorization: `Bearer ${env.CF_API_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ query: QUERY, variables: { account, start: startISO, end: endISO } }),
+      body: JSON.stringify({ query: QUERY, variables: { account, filter } }),
     });
     if (!res.ok) throw new Error(`CF GraphQL ${res.status} for ${account}: ${await res.text()}`);
     const body = await res.json();
     if (body.errors) throw new Error(`CF GraphQL errors: ${JSON.stringify(body.errors)}`);
 
-    const accts = body.data?.viewer?.accounts ?? [];
-    const rows = accts[0]?.rumPageloadEventsAdaptiveGroups ?? [];
-    for (const g of rows) {
-      // Aliases (e.g. an apex landing page) roll up into the site's primary host.
+    const acct = body.data?.viewer?.accounts?.[0] ?? {};
+    for (const name of ["totals", "refs", "pages"]) {
+      if ((acct[name]?.length ?? 0) >= RUM_ROW_LIMIT) truncated.push(`${account.slice(0, 8)}/${name}`);
+    }
+
+    // Aliases (e.g. an apex landing page) roll up into the site's primary host.
+    for (const g of acct.totals ?? []) {
       const host = HOST_ALIASES.get(g.dimensions.requestHost);
       if (!host) continue;
-      // Drop bot-heavy paths (e.g. /history.php) so totals reflect real readers.
-      if (EXCLUDE_PATHS.get(host)?.has(g.dimensions.requestPath)) continue;
-      const rec = hosts.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
+      const rec = recFor(host);
       rec.views += g.count;
       rec.visits += g.sum.visits;
-      // A session ("visit") is only counted on its first pageview, so navigation
-      // within one hostname carries visits: 0 and contributes nothing here either
-      // way. A hop between a site's own hostnames (landing page -> forum) does
-      // start a session, and used to be dropped entirely: the visits were already
-      // counted in rec.visits but no referrer row was written, so the sessions
-      // reappeared in the traffic-source panel as an unattributable residual.
-      // They are kept now and classified as kind "internal" (topReferrers passes
-      // `host` through to classifyReferrer), which is a real category rather than
-      // a hole.
+    }
+    // A session ("visit") is only counted on its first pageview, so navigation
+    // within one hostname carries visits: 0 and contributes nothing here either
+    // way. A hop between a site's own hostnames (landing page -> forum) does
+    // start a session; it is kept and classified as kind "internal"
+    // (topReferrers passes `host` through to classifyReferrer).
+    for (const g of acct.refs ?? []) {
+      const host = HOST_ALIASES.get(g.dimensions.requestHost);
+      if (!host || !(g.sum.visits > 0)) continue;
+      const rec = recFor(host);
       const ref = g.dimensions.refererHost || "(direct)";
-      if (g.sum.visits > 0) {
-        rec.referrers.set(ref, (rec.referrers.get(ref) ?? 0) + g.sum.visits);
-      }
-      // Landing pages: summing visits (session-starts) by requestPath tells us
-      // which page each session actually entered on, since visits only counts
-      // on a session's first pageview.
+      rec.referrers.set(ref, (rec.referrers.get(ref) ?? 0) + g.sum.visits);
+    }
+    // Landing pages: summing visits (session-starts) by requestPath tells us
+    // which page each session actually entered on, since visits only counts
+    // on a session's first pageview.
+    for (const g of acct.pages ?? []) {
+      const host = HOST_ALIASES.get(g.dimensions.requestHost);
+      if (!host) continue;
+      const rec = recFor(host);
       const path = g.dimensions.requestPath || "/";
       const pageRec = rec.pages.get(path) ?? { views: 0, visits: 0 };
       pageRec.views += g.count;
       pageRec.visits += g.sum.visits;
       rec.pages.set(path, pageRec);
-      hosts.set(host, rec);
     }
   }
 
-  return hosts;
+  return { hosts, truncated };
 }
 
 // httpRequestsAdaptiveGroups filter+one optional dimension. Kept to a single

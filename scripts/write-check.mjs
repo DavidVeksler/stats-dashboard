@@ -168,11 +168,13 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.includes("api.cloudflare.com")) {
     const body = JSON.parse(init.body ?? "{}");
     if (body.query.includes("rumPageloadEventsAdaptiveGroups")) {
-      return json({ data: { viewer: { accounts: [{ rumPageloadEventsAdaptiveGroups:
-        SITES.filter((s) => s.trafficSource !== "zone").map((s) => ({
-          count: 40, sum: { visits: 20 },
-          dimensions: { refererHost: "www.google.com", requestHost: s.host, requestPath: "/" },
-        })) }] } } });
+      // The three aliased groupings pullTraffic asks for (totals / refs / pages).
+      const rum = SITES.filter((s) => s.trafficSource !== "zone");
+      return json({ data: { viewer: { accounts: [{
+        totals: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host } })),
+        refs: rum.map((s) => ({ sum: { visits: 20 }, dimensions: { requestHost: s.host, refererHost: "www.google.com" } })),
+        pages: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host, requestPath: "/" } })),
+      }] } } });
     }
     // Zone queries: one row is enough — this check is about the write, not the pull.
     return json({ data: { viewer: { zones: [{ httpRequestsAdaptiveGroups: [{
