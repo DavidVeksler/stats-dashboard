@@ -357,10 +357,10 @@ const required = [
   // CTR and position share one tile. Headline CTR is Google + Bing whole-corpus
   // (72 / 3,039 = 2.4%); headline position is Google's median; each engine gets
   // its own line so neither median is pooled with the other.
-  "Search CTR · position (Google + Bing)", "2.4%<span class=\"v-sep\">·</span>9.4",
-  "<b>Google</b> 2.1% CTR · median pos 9.4", "<b>Bing</b> 3.1% CTR · median pos 4.0 · 4 of 5 stored queries in the top 10",
+  "Search CTR · position", "2.4%<span class=\"v-sep\">·</span>9.4",
+  "<b>Google</b> 2.1% · pos 9.4 · 11/18 top-10", "<b>Bing</b> 3.1% · pos 4.0 · 4/5 top-10",
   // AI referrals tile: engine breakdown, top host, the floor caveat, a comparator.
-  "AI referrals", "ChatGPT 3 · Gemini 2 · Gemini Notebook 1", "top: example.com 5", ">a floor<",
+  "AI referrals", "ChatGPT 3 · Gemini 2 · Gemini Notebook 1 · ", "top: example.com 5", ">a floor<",
   // Item 6: the panel is RUM-only, the residual is named and moved out of the bar.
   "Traffic sources (RUM sites only)",
   "<b>Unattributed: 80 sessions (6.2%)</b>",
@@ -373,15 +373,15 @@ const required = [
   "clicks a window lost to the snippet, not to the ranking",
   "too deep to be seen",
   // Item 8: comparators on every tile.
-  "11 of 18 stored top queries in the top 10",
+  "18 stored top queries, 11 of them in the top 10",
   "1 snippet · 1 rank",
   // Item 8, correction: both sides of the CTR comparator are the stored top-query
   // rows and the tile says so. The headline (2.1% here) is the whole corpus, a
   // visibly different number from the sample's 4.6%, because a top-query
   // expectation is not a verdict on the corpus.
-  "Google stored top 18 queries: 4.6% vs expected ~5.9% · 40.9% of impressions",
+  "top 18 queries: 4.6% vs ~5.9% expected · 41% of impr.",
   "14-day mean 96/day", "186/day here",
-  "14-snapshot mean 42", "Google 14-snapshot mean 2.0%",
+  "14-snapshot mean 42", "Google mean 2.0%",
   "rolling windows 2026-06-29–2026-07-01 through 2026-07-12–2026-07-14",
   "consecutive snapshots overlap",
   // Item 6, correction 4: the two tiles used to read "12 / 12 with traffic" beside
@@ -556,7 +556,7 @@ const thinHtml = renderDashboard({
   totals: { ...fixture.totals,
     gscSampleImpressions: 200, gscSampleShare: 200 / 2200 },
 });
-if (!thinHtml.includes("9.1% of impressions · thin sample")) {
+if (!thinHtml.includes("9% of impr. · thin sample")) {
   throw new Error("A CTR comparator drawn from 9% of impressions did not declare itself thin");
 }
 if (html.includes("thin sample")) {
@@ -575,10 +575,10 @@ const wideHtml = renderDashboard({
     gscSampleImpressions: 47_300, gscSampleShare: 47_300 / 58_832, gscImpressions: 58_832,
     gscPositionQueries: 968, gscTop10Queries: 121 },
 });
-if (!wideHtml.includes("stored top 1,842 queries:")) {
+if (!wideHtml.includes("top 1,842 queries:")) {
   throw new Error("The CTR tile's sample count did not render at estate scale");
 }
-if (!wideHtml.includes("121 of 968 stored top queries in the top 10")) {
+if (!wideHtml.includes("121/968 top-10")) {
   throw new Error("The position tile's subtitle did not render at estate scale");
 }
 if (wideHtml.includes("thin sample")) {

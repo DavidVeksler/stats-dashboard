@@ -797,15 +797,17 @@ function formatTimestamp(timestamp) {
 // google./bing. search. That undercount is why it is a tile and not a segment of
 // the source-mix bar, where it stays folded into "referral".
 function aiTile(ai, trend, totals, periodDays) {
-  const engines = (ai.engines ?? []).slice(0, 4)
-    .map((row) => `${esc(row.engine)} ${fmt(row.visits)}`).join(" · ");
+  const all = (ai.engines ?? []).map((row) => `${row.engine} ${fmt(row.visits)}`);
+  const more = all.length > 3
+    ? ` · <span class="floor" title="${esc(all.slice(3).join(" · "))}">+${all.length - 3} more</span>` : "";
+  const engines = all.slice(0, 3).map(esc).join(" · ") + more;
   const topHost = ai.hosts?.[0];
   const floor = `<span class="floor" title="${esc("Counts only sessions whose referer is a known AI chat or answer engine. Most AI apps send no referer at all (they land in Direct), and Google AI Overviews and Copilot in Bing pass google./bing. referers, so they count as search. Real AI-driven traffic is higher than this.")}">a floor</span>`;
-  return ["AI referrals", fmt(ai.visits ?? 0),
-    `${deltaBadge(ai.delta, false, (ai.visits ?? 0) - (ai.previousVisits ?? 0))}`
-      + `<span class="ln">${engines || "no AI-engine referers in this period"}</span>`
-      + (topHost ? `<a class="cmp" href="#${cardAnchor(topHost.host)}">top: ${esc(topHost.host)} ${fmt(topHost.visits)}</a>` : "")
-      + floor
+  // The delta rides beside the value rather than on its own row: the tile sits
+  // in a four-across grid, and every extra row makes the whole row taller.
+  return ["AI referrals", `${fmt(ai.visits ?? 0)}${deltaBadge(ai.delta, false, (ai.visits ?? 0) - (ai.previousVisits ?? 0))}`,
+    `<span class="ln">${engines || "no AI-engine referers in this period"} · ${floor}</span>`
+      + (topHost ? `<a class="cmp" href="#${cardAnchor(topHost.host)}" title="Site with the most AI referrals">top: ${esc(topHost.host)} ${fmt(topHost.visits)}</a>` : "")
       + meanNote(ai.visits ?? 0, trend.aiPerDay, totals.daysAvailable, periodDays),
     "social"];
 }
@@ -830,17 +832,17 @@ function searchQualityTile({ totals, trend, hasBingSite, bingClicksTotal, bingIm
   const ctr = impressions ? clicks / impressions : 0;
   const position = totals.gscMedianPosition ? totals.gscMedianPosition.toFixed(1) : "—";
   const bingPos = totals.bingMedianPosition ? totals.bingMedianPosition.toFixed(1) : null;
-  const googleLine = `<span class="ln"><b>Google</b> ${pct(totals.gscCtr, 1)} CTR · median pos ${position}`
-    + ` · ${fmt(totals.gscTop10Queries ?? 0)} of ${fmt(totals.gscPositionQueries ?? 0)} stored top queries in the top 10</span>`;
+  const googleLine = `<span class="ln" title="Google: CTR over every query; median position over ${fmt(totals.gscPositionQueries ?? 0)} stored top queries, ${fmt(totals.gscTop10Queries ?? 0)} of them in the top 10."><b>Google</b> ${pct(totals.gscCtr, 1)} · pos ${position}`
+    + ` · ${fmt(totals.gscTop10Queries ?? 0)}/${fmt(totals.gscPositionQueries ?? 0)} top-10</span>`;
   const bingLine = hasBingSite
-    ? `<span class="ln"><b>Bing</b> ${pct(bingImpressionsTotal ? bingClicksTotal / bingImpressionsTotal : 0, 1)} CTR`
-      + (bingPos ? ` · median pos ${bingPos} · ${fmt(totals.bingTop10Queries ?? 0)} of ${fmt(totals.bingPositionQueries ?? 0)} stored queries in the top 10`
+    ? `<span class="ln" title="Bing: CTR over every query; median position over ${fmt(totals.bingPositionQueries ?? 0)} stored queries (Bing's own set, never pooled with Google's)."><b>Bing</b> ${pct(bingImpressionsTotal ? bingClicksTotal / bingImpressionsTotal : 0, 1)}`
+      + (bingPos ? ` · pos ${bingPos} · ${fmt(totals.bingTop10Queries ?? 0)}/${fmt(totals.bingPositionQueries ?? 0)} top-10`
         : " · no position reported")
       + `</span>`
     : "";
-  const mean = trend.gscSnapshots > 1 ? cmp(`Google 14-snapshot mean ${pct(trend.gscCtr, 1)}`, rolling) : "";
+  const mean = trend.gscSnapshots > 1 ? cmp(`Google mean ${pct(trend.gscCtr, 1)}`, `Google CTR, 14-snapshot mean. ${rolling}`) : "";
   const value = `${pct(ctr, 1)}<span class="v-sep">·</span>${position}`;
-  return [hasBingSite ? "Search CTR · position (Google + Bing)" : "Search CTR · median position", value,
+  return ["Search CTR · position", value,
     `${googleLine}${bingLine}${expected}${mean}${opportunityNote}`, "search"];
 }
 
@@ -946,8 +948,8 @@ export function renderDashboard(data) {
     const thinSample = sampleShare > 0 && sampleShare < THIN_SAMPLE_SHARE ? " · thin sample" : "";
     const expected = totals.gscSampleImpressions
       ? `<span class="ln" title="Both sides of this comparison are the ${fmt(totals.gscSampleQueries ?? 0)} per-query rows Google returns (its top queries per site), covering ${fmt(totals.gscSampleImpressions)} of ${fmt(totals.gscImpressions)} impressions. The headline CTR above covers every query on both engines, tail included, so the expectation is not a verdict on it.">`
-        + `Google stored top ${fmt(totals.gscSampleQueries ?? 0)} queries: ${pct(totals.gscSampleCtr, 1)} vs expected ~${pct(totals.gscExpectedCtr, 1)}`
-        + ` · ${pct(sampleShare, 1)} of impressions${thinSample}</span>`
+        + `top ${fmt(totals.gscSampleQueries ?? 0)} queries: ${pct(totals.gscSampleCtr, 1)} vs ~${pct(totals.gscExpectedCtr, 1)} expected`
+        + ` · ${pct(sampleShare, 0)} of impr.${thinSample}</span>`
       : "";
     const opportunityHost = data.sites
       .filter((site) => (site.opportunityCount ?? 0) > 0)
@@ -1002,7 +1004,7 @@ ${APPLE_SPLASH_LINKS}
 a{color:inherit}a,button,select,summary{touch-action:manipulation}a:focus-visible,button:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid color-mix(in srgb,var(--traffic) 58%,transparent);outline-offset:2px}.skip{position:fixed;left:12px;top:-60px;background:var(--ink);color:var(--paper);padding:8px 12px;border-radius:6px;z-index:10}.skip:focus{top:12px}.wrap{max-width:1180px;margin:0 auto;padding:calc(34px + env(safe-area-inset-top)) max(24px,env(safe-area-inset-right)) calc(64px + env(safe-area-inset-bottom)) max(24px,env(safe-area-inset-left))}
 header.top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px 32px;padding-bottom:22px;border-bottom:1px solid var(--line)}.eyebrow{text-transform:uppercase;letter-spacing:.15em;font-size:11px;font-weight:700;color:var(--faint)}h1{font-size:28px;margin:4px 0 0;letter-spacing:-.025em;text-wrap:balance}.win{font-size:12.5px;color:var(--muted);text-align:right;line-height:1.65}.win b{color:var(--ink);font-weight:650}.ext-links{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:8px;font-size:11.5px}.ext-links a{color:var(--muted)}.ext-links a:hover{color:var(--ink)}.fresh{display:inline-flex;align-items:center;gap:5px}.fresh::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--good)}.fresh.stale{color:var(--danger)}.fresh.stale::before{background:var(--danger)}
 .toolbar{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:18px 0}.periods{display:flex;gap:4px;background:color-mix(in srgb,var(--line) 62%,transparent);padding:4px;border-radius:10px}.periods a{text-decoration:none;font-size:12px;font-weight:650;color:var(--muted);padding:6px 10px;border-radius:7px}.periods a[aria-current=page]{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.08)}.filters{display:flex;align-items:end;gap:8px}.field{display:flex;flex-direction:column;gap:3px}.field label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:700}.field select,.theme{height:34px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);font:inherit;font-size:12px;padding:0 28px 0 9px}.theme{padding:0 10px;cursor:pointer}
-.totals{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:0 0 18px}.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px;box-shadow:var(--shadow)}.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.stat .v{font-size:30px;font-weight:700;letter-spacing:-.035em;margin:3px 0}.stat .s{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:7px;flex-wrap:wrap}.stat .s .ln{flex:1 0 100%}.stat .s .ln b{color:var(--ink);font-weight:650}.stat .s .floor{color:var(--faint);border-bottom:1px dotted var(--faint);cursor:help}.stat .v .v-sep{color:var(--faint);font-weight:400;margin:0 .22em}.delta{display:inline-flex;align-items:center;font-size:10px;font-weight:700;border-radius:999px;padding:2px 6px;background:var(--line);color:var(--muted);white-space:nowrap}.delta.up{background:var(--good-soft);color:var(--good)}.delta.down{background:var(--danger-soft);color:var(--danger)}
+.totals{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:0 0 18px}.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:15px 17px;box-shadow:var(--shadow)}.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:700}.stat .v{font-size:30px;font-weight:700;letter-spacing:-.035em;margin:3px 0}.stat .s{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:7px;flex-wrap:wrap}.stat .s .ln{flex:1 0 100%}.stat .s .ln b{color:var(--ink);font-weight:650}.stat .s .floor{color:var(--faint);border-bottom:1px dotted var(--faint);cursor:help}.stat .v .delta{vertical-align:middle;margin-left:8px;letter-spacing:normal}.stat .v .v-sep{color:var(--faint);font-weight:400;margin:0 .22em}.delta{display:inline-flex;align-items:center;font-size:10px;font-weight:700;border-radius:999px;padding:2px 6px;background:var(--line);color:var(--muted);white-space:nowrap}.delta.up{background:var(--good-soft);color:var(--good)}.delta.down{background:var(--danger-soft);color:var(--danger)}
 .anomaly{margin:0 0 14px;padding:9px 12px;border-radius:9px;background:var(--danger-soft);color:var(--danger);font-size:12px;line-height:1.45;border:1px solid color-mix(in srgb,var(--danger) 28%,transparent)}.anomaly strong{font-weight:700}
 .crawler{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--social);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.crawler strong{color:var(--ink);font-weight:700}
 .crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
