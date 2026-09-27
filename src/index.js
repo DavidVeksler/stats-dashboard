@@ -1,6 +1,7 @@
-import { SITES, FORUMS, registrableDomain, AI_ANSWER_ENGINES, aiEngineOf } from "./config.js";
+import { SITES, FORUMS, CF_ACCOUNTS, registrableDomain, AI_ANSWER_ENGINES, aiEngineOf } from "./config.js";
 import { pullTraffic, pullZoneTraffic, topReferrers, topPages, RUM_ROW_LIMIT } from "./cloudflare.js";
 import { pullForumStats } from "./discourse.js";
+import { pullR2, summarizeR2, summarizeCache, estimateR2Cost, opClass, R2_PRICING } from "./r2.js";
 import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summarizeKeywordRows,
   queryQueryPages, summarizeQueryPages, KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "./gsc.js";
 import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords,
@@ -121,6 +122,52 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, category)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host)`),
+    // Small closed zone-log dimensions (cacheStatus, HTTP method) as (dim, value)
+    // rows, so another one needs no new table.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_zone_dims (
+      date TEXT NOT NULL, host TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, dim, value)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_zone_dims_dh ON daily_zone_dims(date, host)`),
+    // R2 bucket analytics for hosts with an `r2Bucket` (see src/r2.js). One
+    // summary row per night — storage snapshot, the day's operations by billing
+    // class, and month-to-date class A/B for the free-tier meter — plus the
+    // per-operation, per-object and (status, region) breakdowns behind it.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_r2_summary (
+      date TEXT NOT NULL, host TEXT NOT NULL, bucket TEXT NOT NULL,
+      object_count INTEGER NOT NULL DEFAULT 0, payload_bytes INTEGER NOT NULL DEFAULT 0,
+      metadata_bytes INTEGER NOT NULL DEFAULT 0, upload_count INTEGER NOT NULL DEFAULT 0,
+      ia_object_count INTEGER NOT NULL DEFAULT 0, ia_payload_bytes INTEGER NOT NULL DEFAULT 0,
+      storage_at TEXT,
+      requests INTEGER NOT NULL DEFAULT 0, response_bytes INTEGER NOT NULL DEFAULT 0,
+      class_a INTEGER NOT NULL DEFAULT 0, class_b INTEGER NOT NULL DEFAULT 0,
+      class_free INTEGER NOT NULL DEFAULT 0, class_unlisted INTEGER NOT NULL DEFAULT 0,
+      errors INTEGER NOT NULL DEFAULT 0,
+      mtd_class_a INTEGER NOT NULL DEFAULT 0, mtd_class_b INTEGER NOT NULL DEFAULT 0, mtd_start TEXT,
+      PRIMARY KEY (date, host)
+    )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_r2_ops (
+      date TEXT NOT NULL, host TEXT NOT NULL, action_type TEXT NOT NULL, action_status TEXT NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, response_bytes INTEGER NOT NULL DEFAULT 0,
+      object_bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, action_type, action_status)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_r2_ops_dh ON daily_r2_ops(date, host)`),
+    // kind 'read' = successful GetObject, 'missing' = GetObject for a key
+    // that is not in the bucket.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_r2_objects (
+      date TEXT NOT NULL, host TEXT NOT NULL, kind TEXT NOT NULL, object TEXT NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, response_bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, kind, object)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_r2_objects_dh ON daily_r2_objects(date, host)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_r2_dims (
+      date TEXT NOT NULL, host TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL,
+      requests INTEGER NOT NULL DEFAULT 0, response_bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host, dim, value)
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_r2_dims_dh ON daily_r2_dims(date, host)`),
     // Forum user login/activity stats (see discourse.js). Independent of the
     // CF/GSC tables above — sourced from each Discourse forum's /about.json.
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_forum_activity (
@@ -179,6 +226,43 @@ async function ensureSchema(env) {
   }
 }
 
+// The R2 panel's data for one host (see src/r2.js). `measured` is false until
+// a night's pull has written a summary row for the latest date, and the panel
+// says so rather than rendering a bucket of zeros.
+function shapeR2(site, date, summaryRows, opRows, objectRows, dimRows) {
+  const num = (v) => Number(v || 0);
+  const toSummary = (row) => ({ date: row.date, bucket: row.bucket,
+    objectCount: num(row.object_count), payloadBytes: num(row.payload_bytes), metadataBytes: num(row.metadata_bytes),
+    uploadCount: num(row.upload_count), iaObjectCount: num(row.ia_object_count), iaPayloadBytes: num(row.ia_payload_bytes),
+    storageAt: row.storage_at ?? null, requests: num(row.requests), responseBytes: num(row.response_bytes),
+    classA: num(row.class_a), classB: num(row.class_b), classFree: num(row.class_free),
+    classUnlisted: num(row.class_unlisted), errors: num(row.errors),
+    mtdClassA: num(row.mtd_class_a), mtdClassB: num(row.mtd_class_b), mtdStart: row.mtd_start ?? null });
+  const history = summaryRows.map(toSummary);
+  const latest = history.find((row) => row.date === date) ?? null;
+  const previous = latest ? history.filter((row) => row.date < date).at(-1) ?? null : null;
+  const dim = (name) => dimRows.filter((d) => d.dim === name)
+    .map((d) => ({ value: d.value, requests: num(d.requests), responseBytes: num(d.response_bytes) }));
+  return {
+    bucket: site.r2Bucket,
+    measured: Boolean(latest),
+    summary: latest,
+    previous,
+    history,
+    ops: opRows.map((op) => ({ actionType: op.action_type, actionStatus: op.action_status,
+      opClass: opClass(op.action_type), requests: num(op.requests),
+      responseBytes: num(op.response_bytes), objectBytes: num(op.object_bytes) })),
+    objects: objectRows.filter((o) => (o.kind ?? "read") === "read")
+      .map((o) => ({ object: o.object, requests: num(o.requests), responseBytes: num(o.response_bytes) })),
+    missing: objectRows.filter((o) => o.kind === "missing")
+      .map((o) => ({ object: o.object, requests: num(o.requests) })),
+    statuses: dim("status"),
+    regions: dim("region"),
+    cost: latest ? estimateR2Cost(latest) : null,
+    pricing: R2_PRICING,
+  };
+}
+
 // ---- Nightly pull: Cloudflare + GSC -> D1 -> ntfy -------------------------
 async function runDaily(env, now = new Date()) {
   await ensureSchema(env);
@@ -202,7 +286,7 @@ async function runDaily(env, now = new Date()) {
       const z = await pullZoneTraffic(env, site.zoneTag, site.host, since, until);
       traffic.set(site.host, { views: z.requests, visits: z.visits, referrers: new Map(), pages: new Map() });
       zoneExtra.set(site.host, { bytes: z.bytes, paths: z.paths, countries: z.countries,
-        statuses: z.statuses, bots: z.bots });
+        statuses: z.statuses, bots: z.bots, dims: z.dims });
     } catch (e) {
       notes.push(`zone traffic ${site.host}: ${e.message}`.slice(0, 140));
     }
@@ -222,6 +306,7 @@ async function runDaily(env, now = new Date()) {
       env.DB.prepare(`DELETE FROM daily_zone_countries WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_zone_status WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_zone_bots WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_zone_dims WHERE date=? AND host=?`).bind(date, host),
     );
     // Keep enough rows for accurate source-mix totals; the dashboard still
     // renders only the top eight referrers per domain.
@@ -263,6 +348,12 @@ async function runDaily(env, now = new Date()) {
             .bind(date, host, b.category, b.requests, b.visits),
         );
       }
+      for (const d of zx.dims ?? []) {
+        stmts.push(
+          env.DB.prepare(`INSERT INTO daily_zone_dims (date,host,dim,value,requests,bytes) VALUES (?,?,?,?,?,?)`)
+            .bind(date, host, d.dim, d.value, d.requests, d.bytes),
+        );
+      }
       continue;
     }
     for (const p of topPages(rec.pages, 50)) {
@@ -271,6 +362,57 @@ async function runDaily(env, now = new Date()) {
           `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
         ).bind(date, host, p.page, p.visits, p.views),
       );
+    }
+  }
+
+  // 1b'. R2 bucket analytics for hosts served from an R2 bucket (`r2Bucket` in
+  // config). One subrequest per bucket. The DELETEs sit behind a successful
+  // pull, same rule as the GSC tables below: a transient GraphQL failure keeps
+  // the last good snapshot instead of blanking the card's R2 panel.
+  const r2Buckets = [];
+  for (const site of SITES.filter((s) => s.r2Bucket)) {
+    const { host, r2Bucket: bucket } = site;
+    let pull;
+    try {
+      pull = await pullR2(env, site.r2Account ?? CF_ACCOUNTS[0], bucket, since, until);
+    } catch (e) {
+      notes.push(`r2 ${bucket}: ${e.message}`.slice(0, 140));
+      continue;
+    }
+    const r2 = summarizeR2(pull);
+    r2Buckets.push({ host, bucket, objects: r2.objectCount, payloadBytes: r2.payloadBytes,
+      requests: r2.requests, classA: r2.classA, classB: r2.classB });
+    stmts.push(
+      env.DB.prepare(`DELETE FROM daily_r2_ops WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_r2_objects WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_r2_dims WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(
+        `INSERT OR REPLACE INTO daily_r2_summary (date,host,bucket,object_count,payload_bytes,metadata_bytes,
+           upload_count,ia_object_count,ia_payload_bytes,storage_at,requests,response_bytes,class_a,class_b,
+           class_free,class_unlisted,errors,mtd_class_a,mtd_class_b,mtd_start)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(date, host, bucket, r2.objectCount, r2.payloadBytes, r2.metadataBytes, r2.uploadCount,
+        r2.iaObjectCount, r2.iaPayloadBytes, r2.storageAt, r2.requests, r2.responseBytes, r2.classA, r2.classB,
+        r2.classFree, r2.classUnlisted, r2.errors, r2.mtdClassA, r2.mtdClassB, r2.mtdStart),
+    );
+    for (const op of pull.ops) {
+      stmts.push(env.DB.prepare(
+        `INSERT INTO daily_r2_ops (date,host,action_type,action_status,requests,response_bytes,object_bytes) VALUES (?,?,?,?,?,?,?)`
+      ).bind(date, host, op.actionType, op.actionStatus || "unknown", op.requests, op.responseBytes, op.objectBytes));
+    }
+    for (const [kind, rows] of [["read", pull.objects], ["missing", pull.missing]]) {
+      for (const o of rows) {
+        stmts.push(env.DB.prepare(
+          `INSERT INTO daily_r2_objects (date,host,kind,object,requests,response_bytes) VALUES (?,?,?,?,?,?)`
+        ).bind(date, host, kind, o.object, o.requests, o.responseBytes ?? 0));
+      }
+    }
+    for (const [dim, rows] of [["status", pull.statuses], ["region", pull.regions]]) {
+      for (const r of rows) {
+        stmts.push(env.DB.prepare(
+          `INSERT INTO daily_r2_dims (date,host,dim,value,requests,response_bytes) VALUES (?,?,?,?,?,?)`
+        ).bind(date, host, dim, r.value, r.requests, r.responseBytes));
+      }
     }
   }
 
@@ -487,7 +629,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, rumTruncated, notes };
+    truncatedPairHosts, rumTruncated, r2Buckets, notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------
@@ -828,6 +970,7 @@ async function loadDashboard(env, options = {}) {
         measurement: measurementOf(s),
         zoneBots: measurementOf(s) === "zone" ? summarizeVerifiedBots([]) : null,
         zoneNonContent: measurementOf(s) === "zone" ? summarizeNonContent([], []) : null,
+        zoneCache: null, zoneMethods: [], r2: null,
         opportunities: { snippet: [], rank: [] }, opportunityCount: 0,
         pageOpportunities: { snippet: [], rank: [] }, cannibalized: [],
         queryDenyPatterns: s.queryDenyPatterns ?? [],
@@ -947,6 +1090,26 @@ async function loadDashboard(env, options = {}) {
      WHERE date BETWEEN ? AND ? AND (${AI_ANSWER_ENGINES.map(() => "LOWER(referrer) LIKE ?").join(" OR ")})
      GROUP BY date,host,referrer`
   ).bind(historyStart, date, ...AI_ANSWER_ENGINES.map(([match]) => `%${match}%`)).all().catch(() => ({ results: [] }));
+  // Zone cache/method breakdown and R2 bucket analytics (src/r2.js). All
+  // latest-day except the R2 summary, which spans the history window so the
+  // panel can show storage growth and a daily-operations trend without a second
+  // read. Same schema-tolerance .catch as every table above: they arrive with
+  // ensureSchema on the next run.
+  const zoneDimsPromise = env.DB.prepare(
+    `SELECT host,dim,value,requests,bytes FROM daily_zone_dims WHERE date=? ORDER BY requests DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const r2SummaryPromise = env.DB.prepare(
+    `SELECT * FROM daily_r2_summary WHERE date BETWEEN ? AND ? ORDER BY date ASC`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
+  const r2OpsPromise = env.DB.prepare(
+    `SELECT host,action_type,action_status,requests,response_bytes,object_bytes FROM daily_r2_ops WHERE date=? ORDER BY requests DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const r2ObjectsPromise = env.DB.prepare(
+    `SELECT host,kind,object,requests,response_bytes FROM daily_r2_objects WHERE date=? ORDER BY requests DESC, response_bytes DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const r2DimsPromise = env.DB.prepare(
+    `SELECT host,dim,value,requests,response_bytes FROM daily_r2_dims WHERE date=? ORDER BY requests DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
   const [tr, previousTr, refs, kws, pages, queryPagesRows, searchSummaries, bingSummaries, bingKeywords, cfPages, zoneCountries, zoneStatuses, zoneBots, forumActivity, dailySignals, hist, histRefs, run, aiRefs] = await Promise.all([
     env.DB.prepare(`SELECT date,host,visits,views,bytes FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(start, date).all(),
     env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(previousStart, previousEnd).all(),
@@ -977,6 +1140,8 @@ async function loadDashboard(env, options = {}) {
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
     aiRefsQuery,
   ]);
+  const [zoneDims, r2Summaries, r2Ops, r2Objects, r2Dims] = await Promise.all(
+    [zoneDimsPromise, r2SummaryPromise, r2OpsPromise, r2ObjectsPromise, r2DimsPromise]);
   const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
   // Memoized per host: directRatioStats scans a host's whole clean-day history,
   // and this function calls it once per site plus once per history row in the
@@ -1184,6 +1349,13 @@ async function loadDashboard(env, options = {}) {
       zoneBots: zoneRoute ? summarizeVerifiedBots(zoneBotRows) : null,
       zoneNonContent: zoneRoute
         ? summarizeNonContent(latestCfPageRows, latestZoneStatusRows) : null,
+      // Edge cache outcome and HTTP method, zone hosts only, latest day.
+      zoneCache: zoneRoute ? summarizeCache(byHost(zoneDims, s.host).filter((d) => d.dim === "cache")
+        .map((d) => ({ value: d.value, requests: Number(d.requests || 0), bytes: Number(d.bytes || 0) }))) : null,
+      zoneMethods: zoneRoute ? byHost(zoneDims, s.host).filter((d) => d.dim === "method")
+        .map((d) => ({ value: d.value, requests: Number(d.requests || 0), bytes: Number(d.bytes || 0) })) : [],
+      r2: s.r2Bucket ? shapeR2(s, date, byHost(r2Summaries, s.host), byHost(r2Ops, s.host),
+        byHost(r2Objects, s.host), byHost(r2Dims, s.host)) : null,
       opportunities,
       opportunityCount: opportunities.snippet.length + opportunities.rank.length,
       // Per-page view of the same two classes, and queries split across pages.

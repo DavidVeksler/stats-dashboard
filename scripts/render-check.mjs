@@ -270,6 +270,34 @@ const fixture = {
         errorStatuses: [{ status: 404, requests: 1745 }],
         errorRequests: 1745,
       },
+      // Served from an R2 bucket (the real 2026-09-27 migration day's figures).
+      zoneCache: { rows: [{ value: "dynamic", requests: 8357, bytes: 489894999 }, { value: "miss", requests: 877, bytes: 2805320624 },
+        { value: "hit", requests: 91, bytes: 211002495 }], requests: 9325, bytes: 3506218118,
+        hitRequests: 91, hitBytes: 211002495, hitShare: 91 / 9325, hitByteShare: 211002495 / 3506218118 },
+      zoneMethods: [{ value: "HEAD", requests: 8274, bytes: 6868390 }, { value: "GET", requests: 1186, bytes: 3499594374 }],
+      r2: {
+        bucket: "example-library", measured: true,
+        summary: { date: "2026-07-16", objectCount: 26139, payloadBytes: 162880512114, metadataBytes: 1839241,
+          uploadCount: 0, iaObjectCount: 0, iaPayloadBytes: 0, storageAt: "2026-07-16T06:50:00Z",
+          requests: 35189, responseBytes: 3758375321, classA: 26197, classB: 8990, classFree: 0, classUnlisted: 2,
+          errors: 283, mtdClassA: 26191, mtdClassB: 9006, mtdStart: "2026-07-01" },
+        previous: { date: "2026-07-15", objectCount: 26100 },
+        history: [
+          { date: "2026-07-15", objectCount: 26100, payloadBytes: 162000000000, requests: 500, classA: 1, classB: 499, responseBytes: 1e9, errors: 0 },
+          { date: "2026-07-16", objectCount: 26139, payloadBytes: 162880512114, requests: 35189, classA: 26197, classB: 8990, responseBytes: 3758375321, errors: 283 },
+        ],
+        ops: [{ actionType: "PutObject", actionStatus: "success", opClass: "A", requests: 26135, responseBytes: 0, objectBytes: 163231697558 },
+          { actionType: "GetObject", actionStatus: "userError", opClass: "B", requests: 280, responseBytes: 0, objectBytes: 0 },
+          { actionType: "GetBucketSippyConfiguration", actionStatus: "success", opClass: "unlisted", requests: 1, responseBytes: 0, objectBytes: 0 }],
+        objects: [{ object: "books/Ludwig von Mises/Human Action.pdf", requests: 5, responseBytes: 167161155 }],
+        missing: [{ object: ".env", requests: 5 }, { object: "", requests: 21 }],
+        statuses: [{ value: "200", requests: 34906, responseBytes: 3758375321 }, { value: "404", requests: 283, responseBytes: 0 }],
+        regions: [{ value: "ENAM", requests: 679, responseBytes: 3758375321 }],
+        cost: { gb: 162.88, billableGb: 152.88, storageUsd: 2.2932, classAUsd: 0, classBUsd: 0,
+          classAFreeShare: .026191, classBFreeShare: .0009006, monthUsd: 2.2932 },
+        pricing: { source: "https://developers.cloudflare.com/r2/pricing/", checked: "2026-09-27",
+          storagePerGbMonth: 0.015, freeStorageGb: 10, freeClassA: 1000000, freeClassB: 10000000 },
+      },
       sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
       spark: [{ date: "2026-07-15", visits: 940, flood: false }, { date: "2026-07-16", visits: 1059, flood: false }],
     },
@@ -291,6 +319,8 @@ const fixture = {
         unverifiedRequests: 0, unverifiedVisits: 0, totalRequests: 0, totalVisits: 0,
         verifiedShare: 0, measured: false },
       zoneNonContent: { paths: [], pathRequests: 0, errorStatuses: [], errorRequests: 0 },
+      // An R2 bucket configured but not pulled yet.
+      r2: { bucket: "files-bucket", measured: false },
       sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
       spark: [{ date: "2026-07-15", visits: 80, flood: false }, { date: "2026-07-16", visits: 88, flood: false }],
     },
@@ -860,6 +890,24 @@ if (!preMigrationCard.includes("Verified-crawler figures appear after the next d
 }
 if (/&ge;&nbsp;0 requests/.test(preMigrationCard)) {
   throw new Error("A zone card with no verified-bot data must not render a zero floor");
+}
+
+// The R2 panel: storage, billing classes, the cost estimate with its source, the
+// population warning, and links to objects that survive spaces in their keys.
+for (const marker of ["Cloudflare R2 bucket · example-library", "26,139", "objects stored", "+39", "162.9 GB", "$0.015/GB-month",
+  "~$2.29/month", "developers.cloudflare.com/r2/pricing", "not a bill", "do not add up",
+  "R2 operations by type", "class A", "unlisted", "Edge cache (zone log)", "1.0%",
+  "https://library.example/books/Ludwig%20von%20Mises/Human%20Action.pdf",
+  "Eastern North America (ENAM)", "R2 bucket by night", "HTTP methods",
+  "Keys requested but not in the bucket", "(bucket root)"]) {
+  if (!measuredCard.includes(marker)) throw new Error(`R2 panel is missing: ${marker}`);
+}
+// A bucket that has not been pulled yet says so rather than printing zeros.
+if (!preMigrationCard.includes("Bucket analytics appear after the next nightly pull.")) {
+  throw new Error("An unpulled R2 bucket must say so, not render a bucket of zeros");
+}
+if (preMigrationCard.includes("R2 operations by type")) {
+  throw new Error("An unpulled R2 bucket must not render an empty operations table");
 }
 
 // Footer prose is interpolated from the classifier's own constants. Computed

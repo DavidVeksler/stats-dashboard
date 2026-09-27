@@ -166,7 +166,15 @@ export const SITES = [
   // instead — see pullZoneTraffic in cloudflare.js. gsc is independent of
   // trafficSource and still queries Search Console; the property is live but has
   // returned no rows yet, so expect an empty search panel until it does.
+  //
+  // Since 2026-09-27 the files live in the R2 bucket below, served through an
+  // R2 custom domain on the same freecapitalists.org zone. The zone log above
+  // keeps counting every edge request (the custom domain is proxied), and R2's
+  // own account-scoped analytics add the bucket's side: storage, operations by
+  // billing class, and which objects were fetched from the bucket itself (cache
+  // misses). `r2Account` is the account that owns the bucket. See src/r2.js.
   { host: "library.freecapitalists.org", trafficSource: "zone", zoneTag: "066e5342a1531be2638029c2f1dde5f6",
+    r2Bucket: "freecapitalists-library", r2Account: "556c237bf8cb62edb8f7b401499bb7a9",
     gsc: "sc-domain:library.freecapitalists.org",
     // Bing's pull is independent of trafficSource (it needs only a URL, not a
     // Cloudflare RUM beacon), so a zone-sourced host is just as pullable as any

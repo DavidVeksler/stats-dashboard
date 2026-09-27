@@ -26,7 +26,7 @@
 // generated here rather than fixtured, because gsc.js signs a real JWT with it.
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
 import { KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "../src/gsc.js";
-import { SITES, FORUMS } from "../src/config.js";
+import { SITES, FORUMS, CF_ACCOUNTS } from "../src/config.js";
 import { bingUrlsOf } from "../src/bing.js";
 
 const BING_SITES = SITES.filter((s) => bingUrlsOf(s).length);
@@ -111,6 +111,9 @@ let failGsc = null;
 // around a `runBing()` call, see part 3b below.
 let failBing = null;
 
+// Set true around a `run()` to fail every R2 GraphQL request — see part 1d.
+let failR2 = false;
+
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input?.url ?? input);
@@ -176,12 +179,33 @@ globalThis.fetch = async (input, init = {}) => {
         pages: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host, requestPath: "/" } })),
       }] } } });
     }
-    // Zone queries: one row is enough — this check is about the write, not the pull.
-    return json({ data: { viewer: { zones: [{ httpRequestsAdaptiveGroups: [{
-      count: 19506, sum: { visits: 1059, edgeResponseBytes: 76_658_000_000 },
-      dimensions: { clientRequestPath: "/robots.txt", clientCountryName: "United States",
-        edgeResponseStatus: 404, verifiedBotCategory: "AI Crawler" },
-    }] }] } } });
+    if (body.query.includes("r2OperationsAdaptiveGroups")) {
+      if (failR2) return new Response("stub transient failure", { status: 503 });
+      const opRow = (actionType, requests) => ({ sum: { requests, responseBytes: 10, responseObjectSize: 10 },
+        dimensions: { actionType, actionStatus: "success" } });
+      return json({ data: { viewer: { accounts: [{
+        ops: [opRow("GetObject", 400), opRow("PutObject", 20)],
+        statuses: [{ sum: { requests: 420, responseBytes: 10 }, dimensions: { responseStatusCode: 200 } }],
+        regions: [{ sum: { requests: 420, responseBytes: 10 }, dimensions: { eyeballRegion: "ENAM" } }],
+        objects: [{ sum: { requests: 5, responseBytes: 10 }, dimensions: { objectName: "books/a.pdf" } }],
+        missing: [{ sum: { requests: 3 }, dimensions: { objectName: ".env" } }],
+        mtd: [{ sum: { requests: 900 }, dimensions: { actionType: "GetObject" } }],
+        storage: [{ max: { objectCount: 26139, payloadSize: 162880512114, metadataSize: 1839241, uploadCount: 0 },
+          dimensions: { datetime: "2026-09-27T06:50:00Z", storageClass: "Standard" } }],
+      }] } } });
+    }
+    // Zone queries: one aliased request per host, one row per grouping is
+    // enough — this check is about the write, not the pull.
+    const row = { count: 19506, sum: { visits: 1059, edgeResponseBytes: 76_658_000_000 } };
+    return json({ data: { viewer: { zones: [{
+      total: [row],
+      path: [{ ...row, dimensions: { clientRequestPath: "/robots.txt" } }],
+      country: [{ ...row, dimensions: { clientCountryName: "United States" } }],
+      status: [{ ...row, dimensions: { edgeResponseStatus: 404 } }],
+      bots: [{ ...row, dimensions: { verifiedBotCategory: "AI Crawler" } }],
+      cache: [{ ...row, dimensions: { cacheStatus: "miss" } }],
+      method: [{ ...row, dimensions: { clientRequestHTTPMethodName: "GET" } }],
+    }] } } });
   }
 
   throw new Error(`unstubbed fetch: ${url}`);
@@ -281,6 +305,31 @@ const runBing = async (env) => {
     console.log(`runDaily fetches ${fetchLog.length}/50: ${[...byHost].map(([h, n]) => `${h} ${n}`).join(" · ")}`);
   }
 
+  // Cloudflare's share of it: one RUM request per account, ONE aliased zone
+  // request per zone host (it was five before the R2 pull needed the room), and
+  // one R2 request per bucket.
+  const zoneSites = SITES.filter((s) => s.trafficSource === "zone");
+  const r2Sites = SITES.filter((s) => s.r2Bucket);
+  check("Cloudflare costs one request per account, zone host and bucket",
+    fetchLog.filter((h) => h === "api.cloudflare.com").length, CF_ACCOUNTS.length + zoneSites.length + r2Sites.length);
+
+  // The R2 bucket's night: one summary row, and its breakdown tables.
+  for (const site of r2Sites) {
+    const summary = flat.filter((s) => s.sql.includes("INTO daily_r2_summary") && s.binds[1] === site.host);
+    check(`${site.host}: one R2 summary row`, summary.length, 1);
+    check("...naming the bucket", summary[0]?.binds[2], site.r2Bucket);
+    check("...with the stored object count", summary[0]?.binds[3], 26139);
+    for (const table of ["daily_r2_ops", "daily_r2_objects", "daily_r2_dims"]) {
+      check(`...and ${table} rows`, flat.some((s) => s.sql.startsWith(`INSERT INTO ${table} `) && s.binds[1] === site.host), true);
+    }
+  }
+  check("/run reports the buckets it pulled", result.r2Buckets.length, r2Sites.length);
+  for (const site of zoneSites) {
+    check(`${site.host}: cache and method rows are stored`,
+      flat.filter((s) => s.sql.startsWith("INSERT INTO daily_zone_dims ") && s.binds[1] === site.host)
+        .map((s) => s.binds[2]).sort().join(","), "cache,method");
+  }
+
   // Chunking.
   check("the write is cut into more than one batch", writes.length > 1, true);
   check("...none of them larger than the limit",
@@ -296,7 +345,8 @@ const runBing = async (env) => {
   // because the chunks are awaited in sequence: a DELETE that landed after its
   // INSERTs would empty a day of data, and nothing else in the repo would notice.
   const tables = ["daily_query_pages", "daily_keywords", "daily_pages", "daily_search_summary",
-    "daily_referrers", "daily_cf_pages", "daily_zone_countries", "daily_zone_status", "daily_zone_bots"];
+    "daily_referrers", "daily_cf_pages", "daily_zone_countries", "daily_zone_status", "daily_zone_bots",
+    "daily_zone_dims", "daily_r2_ops", "daily_r2_objects", "daily_r2_dims"];
   let straddles = 0;
   for (const table of tables) {
     const hosts = new Set(flat.filter((s) => s.sql.includes(`DELETE FROM ${table} `))
@@ -452,6 +502,21 @@ const runBing = async (env) => {
     inserts2.length, inserts.length);
   check("...the same set of kinds", inserts2.map((s) => s.binds[2]).sort().join(","),
     inserts.map((s) => s.binds[2]).sort().join(","));
+}
+
+// ---- 1a. A failed R2 pull keeps the last good snapshot ---------------------
+// Same rule as the GSC tables below: the R2 DELETEs sit behind a successful
+// pull, so a GraphQL 5xx leaves yesterday's-still-good rows in place, and the
+// failure shows up as a note rather than a blank panel.
+{
+  failR2 = true;
+  const { result, flat } = await run({ GSC_SA_KEY });
+  failR2 = false;
+  check("a failed R2 pull is reported in notes", result.notes.some((n) => n.startsWith("r2 ")), true);
+  check("...and deletes no R2 rows",
+    flat.some((s) => /DELETE FROM daily_r2_|INTO daily_r2_summary/.test(s.sql)), false);
+  check("...while the zone tables are still written",
+    flat.some((s) => s.sql.startsWith("INSERT INTO daily_zone_dims ")), true);
 }
 
 // ---- 1b. A transient per-host GSC failure must not erase existing data ----

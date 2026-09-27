@@ -129,53 +129,52 @@ export async function pullTraffic(env, startISO, endISO) {
   return { hosts, truncated };
 }
 
-// httpRequestsAdaptiveGroups filter+one optional dimension. Kept to a single
-// dimension per call deliberately: combining clientRequestPath with country
+// httpRequestsAdaptiveGroups, one dimension per grouping. Kept to a single
+// dimension per grouping deliberately: combining clientRequestPath with country
 // and status on this host exploded past the 5000-row cap (thousands of files
 // x ~120 countries x ~10 statuses) and silently undercounted every sum — the
 // same failure mode gsc.js's querySearchSummary comment warns about for
-// Search Console's ranked rows. A day's total, split three single-dimension
-// ways, never approached the cap in testing (max ~3700 rows, for path).
+// Search Console's ranked rows. A day's total, split single-dimension ways,
+// never approached the cap in testing (max ~3700 rows, for path; the one
+// exception was the R2 migration morning, 2026-09-27, when a sync tool HEADed
+// every file and `path` filled its cap — the top-files list is a top-N anyway).
 //
-// It is a row-cap convention, not an API ceiling: a two-dimension call is legal
-// and works. `{ clientRequestPath, edgeResponseStatus }` filtered to
+// It is a row-cap convention, not an API ceiling: a two-dimension grouping is
+// legal and works. `{ clientRequestPath, edgeResponseStatus }` filtered to
 // edgeResponseStatus_geq: 400 returned 1,376 rows on this zone without
 // approaching the cap (spike 2026-08-12). Pair dimensions only where a filter
 // keeps the product small like that.
-function zoneQuery(dimension) {
-  return `query ZoneTraffic($zoneTag: String!, $start: String!, $end: String!, $host: String!) {
-  viewer {
-    zones(filter: { zoneTag: $zoneTag }) {
-      httpRequestsAdaptiveGroups(
-        filter: { datetime_geq: $start, datetime_leq: $end, clientRequestHTTPHost: $host }
-        limit: 5000
-        orderBy: [count_DESC]
-      ) {
+//
+// The groupings are GraphQL aliases in ONE request (since 2026-09-27; it was
+// five fetches before), so a zone host costs one subrequest out of runDaily's
+// budget instead of five — which is what paid for the R2 pull.
+export const ZONE_GROUPINGS = {
+  total: null,
+  path: "clientRequestPath",
+  country: "clientCountryName",
+  status: "edgeResponseStatus",
+  bots: "verifiedBotCategory",
+  // Edge cache outcome per request — how much of an R2-backed host the cache
+  // answered without a bucket read (see summarizeCache in r2.js).
+  cache: "cacheStatus",
+  method: "clientRequestHTTPMethodName",
+};
+
+export function zoneQuery() {
+  const filter = "{ datetime_geq: $start, datetime_leq: $end, clientRequestHTTPHost: $host }";
+  const groupings = Object.entries(ZONE_GROUPINGS).map(([alias, dimension]) =>
+    `      ${alias}: httpRequestsAdaptiveGroups(filter: ${filter}, limit: 5000, orderBy: [count_DESC]) {
         count
         sum { visits edgeResponseBytes }
         ${dimension ? `dimensions { ${dimension} }` : ""}
-      }
+      }`).join("\n");
+  return `query ZoneTraffic($zoneTag: String!, $start: String!, $end: String!, $host: String!) {
+  viewer {
+    zones(filter: { zoneTag: $zoneTag }) {
+${groupings}
     }
   }
 }`;
-}
-
-async function runZoneQuery(env, dimension, zoneTag, host, startISO, endISO) {
-  const res = await fetch(GQL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.CF_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: zoneQuery(dimension),
-      variables: { zoneTag, start: startISO, end: endISO, host },
-    }),
-  });
-  if (!res.ok) throw new Error(`CF zone GraphQL ${res.status} for ${host}: ${await res.text()}`);
-  const body = await res.json();
-  if (body.errors) throw new Error(`CF zone GraphQL errors for ${host}: ${JSON.stringify(body.errors)}`);
-  return body.data?.viewer?.zones?.[0]?.httpRequestsAdaptiveGroups ?? [];
 }
 
 // Pull one host's traffic straight from the zone's HTTP request log, for hosts
@@ -183,15 +182,28 @@ async function runZoneQuery(env, dimension, zoneTag, host, startISO, endISO) {
 // no HTML wrapper for the RUM script to load from). Free-plan limit: this
 // dataset accepts at most a 1-day window per request, so callers must pass a
 // startISO/endISO span no wider than 24h.
-// Returns { visits, requests, bytes, paths, countries, statuses, bots }.
+// Returns { visits, requests, bytes, paths, countries, statuses, bots, dims }.
 export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
-  const [totalRows, pathRows, countryRows, statusRows, botRows] = await Promise.all([
-    runZoneQuery(env, null, zoneTag, host, startISO, endISO),
-    runZoneQuery(env, "clientRequestPath", zoneTag, host, startISO, endISO),
-    runZoneQuery(env, "clientCountryName", zoneTag, host, startISO, endISO),
-    runZoneQuery(env, "edgeResponseStatus", zoneTag, host, startISO, endISO),
-    runZoneQuery(env, "verifiedBotCategory", zoneTag, host, startISO, endISO),
-  ]);
+  const res = await fetch(GQL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: zoneQuery(),
+      variables: { zoneTag, start: startISO, end: endISO, host },
+    }),
+  });
+  if (!res.ok) throw new Error(`CF zone GraphQL ${res.status} for ${host}: ${await res.text()}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(`CF zone GraphQL errors for ${host}: ${JSON.stringify(body.errors)}`);
+  const zone = body.data?.viewer?.zones?.[0] ?? {};
+  const totalRows = zone.total ?? [];
+  const pathRows = zone.path ?? [];
+  const countryRows = zone.country ?? [];
+  const statusRows = zone.status ?? [];
+  const botRows = zone.bots ?? [];
 
   const totals = totalRows[0] ?? { count: 0, sum: { visits: 0, edgeResponseBytes: 0 } };
 
@@ -245,6 +257,10 @@ export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
     // floor into a smaller floor for no benefit.
     bots: [...bots.entries()].sort((a, b) => b[1].requests - a[1].requests)
       .map(([category, b]) => ({ category, requests: b.requests, visits: b.visits })),
+    // Small, closed dimensions stored whole in daily_zone_dims as (dim, value).
+    dims: ["cache", "method"].flatMap((dim) => (zone[dim] ?? []).map((g) => ({
+      dim, value: String(g.dimensions[ZONE_GROUPINGS[dim]] || "(none)"),
+      requests: g.count, bytes: g.sum.edgeResponseBytes }))),
   };
 }
 

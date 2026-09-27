@@ -666,13 +666,157 @@ function numsBlocks(site, periodLabel) {
   return `${allBlock}${searchBlock}${referredBlock}`;
 }
 
+// ---- R2 bucket panel (hosts with `r2Bucket`, see src/r2.js) -----------------
+// Written for a reader new to R2, so it spells out what each number counts.
+// The one rule it keeps: the bucket's operations and the zone log's edge
+// requests are different populations and are never added, subtracted or put in
+// one ratio. The cache figure comes from the zone log's own cacheStatus.
+const R2_REGIONS = { WNAM: "Western North America", ENAM: "Eastern North America",
+  WEUR: "Western Europe", EEUR: "Eastern Europe", APAC: "Asia-Pacific", OC: "Oceania",
+  SAM: "South America", AFR: "Africa", ME: "Middle East" };
+const usd = (n) => `$${Number(n || 0).toFixed(2)}`;
+const gbDecimal = (bytes) => `${(Number(bytes || 0) / 1e9).toFixed(1)} GB`;
+const signed = (n, f = fmt) => `${n > 0 ? "+" : n < 0 ? "−" : "±"}${f(Math.abs(n))}`;
+const objectHref = (host, object) => `https://${host}/${String(object).split("/").map(encodeURIComponent).join("/")}`;
+
+function r2Panel(site) {
+  const r2 = site.r2;
+  if (!r2) return "";
+  if (!r2.measured) {
+    return `<div class="r2-panel" role="note"><h3>Cloudflare R2 bucket · ${esc(r2.bucket)}</h3>
+      <p class="none">Bucket analytics appear after the next nightly pull.</p></div>`;
+  }
+  const s = r2.summary;
+  const prev = r2.previous;
+  const cost = r2.cost;
+  const pr = r2.pricing;
+  const change = prev
+    ? `<strong>${signed(s.objectCount - prev.objectCount)}</strong><span>objects since ${esc(prev.date)}</span>`
+    : `<strong>—</strong><span>no earlier snapshot</span>`;
+  const extras = [
+    s.errors ? `<b>${fmt(s.errors)}</b> operations did not succeed (see the operations table below; a GetObject userError is usually a 404 for a missing key).` : "",
+    s.classUnlisted ? `<b>${fmt(s.classUnlisted)}</b> operations are types Cloudflare's pricing page does not list in any class; counted here, not priced.` : "",
+    s.uploadCount ? `<b>${fmt(s.uploadCount)}</b> multipart uploads are in progress (the bucket's lifecycle rule aborts incomplete ones after 7 days).` : "",
+    s.iaObjectCount ? `Infrequent Access: <b>${fmt(s.iaObjectCount)}</b> objects, <b>${bytesLabel(s.iaPayloadBytes)}</b>.` : "",
+  ].filter(Boolean).map((line) => `<p>${line}</p>`).join("");
+  return `<div class="r2-panel" role="note">
+    <h3>Cloudflare R2 bucket · ${esc(r2.bucket)}</h3>
+    <div class="search-summary r2-grid" aria-label="R2 storage">
+      <div><strong>${fmt(s.objectCount)}</strong><span>objects stored</span></div>
+      <div><strong>${gbDecimal(s.payloadBytes)}</strong><span>stored (decimal GB)</span></div>
+      <div>${change}</div>
+      <div><strong>${bytesLabel(s.metadataBytes)}</strong><span>object metadata</span></div>
+    </div>
+    <div class="search-summary r2-grid" aria-label="R2 operations, last 24h">
+      <div><strong>${fmt(s.requests)}</strong><span>bucket ops 24h</span></div>
+      <div><strong>${fmt(s.classA)}</strong><span>class A (writes)</span></div>
+      <div><strong>${fmt(s.classB)}</strong><span>class B (reads)</span></div>
+      <div><strong>${bytesLabel(s.responseBytes)}</strong><span>read out</span></div>
+    </div>
+    <p><b>This month</b> (since ${esc(s.mtdStart)}): class A <b>${fmt(s.mtdClassA)}</b> of ${fmt(pr.freeClassA)} free
+      (${pct(cost.classAFreeShare, 1)}) · class B <b>${fmt(s.mtdClassB)}</b> of ${fmt(pr.freeClassB)} free
+      (${pct(cost.classBFreeShare, 1)}). Storage at today's size runs <b>~${usd(cost.storageUsd)}/month</b>
+      (${gbDecimal(s.payloadBytes + s.metadataBytes)}, first ${pr.freeStorageGb} GB free, $${pr.storagePerGbMonth}/GB-month).
+      Operations beyond the free tier so far: <b>${usd(cost.classAUsd + cost.classBUsd)}</b>. Egress is free.
+      <span class="r2-src">Estimate from <a href="${esc(pr.source)}" target="_blank" rel="noopener">Cloudflare's published R2 prices</a>
+      (checked ${esc(pr.checked)}), counting every operation including errors; not a bill.</span></p>
+    ${extras}
+    <p class="r2-src">Class A = writes and listings (PutObject, ListObjects...), class B = reads (GetObject, HeadObject...).
+      These count operations that reached the bucket: downloads the edge cache did not answer, plus uploads, listings
+      and HEADs from sync tools, which never show up in the zone log. The request counts above count every hit at
+      Cloudflare's edge, cached or not. Different populations; they do not add up. Storage sampled ${esc(s.storageAt ?? "—")}.</p>
+  </div>`;
+}
+
+function r2OpsList(ops) {
+  if (!ops.length) return `<p class="none">No bucket operations in this period.</p>`;
+  const total = ops.reduce((sum, op) => sum + op.requests, 0);
+  return `<ol class="metric-list">${ops.map((op) => {
+    const bad = op.actionStatus !== "success";
+    const detail = op.responseBytes ? `${bytesLabel(op.responseBytes)} out`
+      : op.objectBytes ? `${bytesLabel(op.objectBytes)} in` : `${pct(total ? op.requests / total : 0, 1)} of ops`;
+    const tag = op.opClass === "A" || op.opClass === "B" ? `class ${op.opClass}` : op.opClass;
+    return `<li class="metric-row ${bad ? "flagged" : ""}">
+      <div class="metric-name"><span class="truncate">${esc(op.actionType)}</span><span class="r2-class ${op.opClass === "A" ? "a" : ""}" title="R2 billing class">${esc(tag)}</span>${bad ? `<small>${esc(op.actionStatus)}</small>` : ""}</div>
+      <div class="metric-values"><strong>${fmt(op.requests)}</strong><span>${detail}</span></div>
+    </li>`;
+  }).join("")}</ol>`;
+}
+
+function dimList(rows, { label = (v) => v, bytesKey = "bytes", flag = () => false, empty = "" } = {}) {
+  if (!rows?.length) return `<p class="none">${empty}</p>`;
+  const total = rows.reduce((sum, r) => sum + r.requests, 0);
+  return `<ol class="metric-list">${rows.map((r) => `<li class="metric-row ${flag(r) ? "flagged" : ""}">
+      <div class="metric-name"><span class="truncate">${esc(label(r.value))}</span></div>
+      <div class="metric-values"><strong>${fmt(r.requests)}</strong><span>${pct(total ? r.requests / total : 0, 1)} · ${bytesLabel(r[bytesKey])}</span></div>
+    </li>`).join("")}</ol>`;
+}
+
+function cachePanel(site) {
+  const cache = site.zoneCache;
+  if (!cache?.rows.length) return `<p class="none">Cache status appears after the next nightly pull.</p>`;
+  return `<p class="panel-lead"><b>${pct(cache.hitShare, 1)}</b> of edge requests and <b>${pct(cache.hitByteShare, 1)}</b>
+      of bytes were answered from Cloudflare's cache (hit, stale, revalidated) without touching the origin.
+      <i>miss</i>/<i>expired</i> went to the origin; <i>dynamic</i>/<i>bypass</i>/<i>none</i> were not cacheable.</p>
+    ${dimList(cache.rows, { flag: (r) => r.value === "miss" || r.value === "expired" })}
+    ${site.zoneMethods?.length ? `<h4 class="mini-h3">HTTP methods</h4>${dimList(site.zoneMethods)}` : ""}`;
+}
+
+function r2ObjectList(objects, host) {
+  if (!objects.length) return `<p class="none">No objects were read from the bucket in this period.</p>`;
+  return `<ol class="metric-list pages-list">${objects.map((o) => `<li class="metric-row">
+      <div class="metric-name"><a class="truncate" href="${esc(objectHref(host, o.object))}" target="_blank" rel="noopener" title="${esc(o.object)}">${esc(o.object)}</a></div>
+      <div class="metric-values"><strong>${fmt(o.requests)} reads</strong><span>${bytesLabel(o.responseBytes)}</span></div>
+    </li>`).join("")}</ol>`;
+}
+
+// GetObject for keys that are not in the bucket. After a migration this is the
+// broken-link list; the rest is scanners probing for .env and config files.
+// Not linked: most of these are not paths anyone should click.
+function r2MissingList(missing) {
+  if (!missing?.length) return "";
+  return `<section class="panel pages-panel"><h3><span class="dot search"></span>Keys requested but not in the bucket <span class="panel-note">404s: broken links or scanner probes</span></h3>
+    <ol class="metric-list pages-list">${missing.map((o) => `<li class="metric-row">
+      <div class="metric-name"><span class="truncate" title="${esc(o.object)}">${esc(o.object || "(bucket root)")}</span></div>
+      <div class="metric-values"><strong>${fmt(o.requests)}</strong><span>requests</span></div>
+    </li>`).join("")}</ol></section>`;
+}
+
+function r2History(history) {
+  if (history.length < 2) return "";
+  const rows = [...history].reverse().map((h) => `<tr><td>${esc(h.date)}</td><td>${fmt(h.objectCount)}</td>
+    <td>${gbDecimal(h.payloadBytes)}</td><td>${fmt(h.requests)}</td><td>${fmt(h.classA)}</td><td>${fmt(h.classB)}</td>
+    <td>${bytesLabel(h.responseBytes)}</td><td>${fmt(h.errors)}</td></tr>`).join("");
+  return `<section class="panel pages-panel"><h3><span class="dot traffic"></span>R2 bucket by night</h3>
+    <div class="r2-table-wrap"><table class="r2-table"><thead><tr><th>date</th><th>objects</th><th>stored</th><th>ops</th>
+    <th>class A</th><th>class B</th><th>read out</th><th>errors</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+}
+
+function r2Details(site) {
+  const r2 = site.r2;
+  const cacheCol = site.zoneCache
+    ? `<section class="panel"><h3><span class="dot good"></span>Edge cache (zone log)</h3>${cachePanel(site)}</section>` : "";
+  if (!r2?.measured) return cacheCol ? `<div class="cols r2-cols">${cacheCol}</div>` : "";
+  return `<div class="cols r2-cols">
+      <section class="panel"><h3><span class="dot traffic"></span>R2 operations by type</h3>${r2OpsList(r2.ops)}</section>
+      ${cacheCol}
+    </div>
+    <div class="cols">
+      <section class="panel"><h3><span class="dot search"></span>R2 response status</h3>${dimList(r2.statuses, { bytesKey: "responseBytes", flag: (r) => Number(r.value) >= 400, empty: "No status data." })}</section>
+      <section class="panel"><h3><span class="dot traffic"></span>R2 requests by region</h3>${dimList(r2.regions, { bytesKey: "responseBytes", label: (v) => (R2_REGIONS[v] ? `${R2_REGIONS[v]} (${v})` : v), empty: "No region data." })}</section>
+    </div>
+    <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top objects read from the bucket <span class="panel-note">cache misses only, not every download</span></h3>${r2ObjectList(r2.objects, site.host)}</section>
+    ${r2MissingList(r2.missing)}
+    ${r2History(r2.history)}`;
+}
+
 function siteCard(site, index, periodDays) {
   // Same function the signal hrefs are built from, so a "Today's actions" link
   // cannot point at an anchor this card does not carry.
   const id = cardAnchor(site.host);
   const periodLabel = periodDays === 1 ? "24h" : `${periodDays}d`;
   const hasDetails = site.zoneSourced
-    ? site.cfPages.length || site.zoneCountries.length || site.zoneStatuses.length
+    ? site.cfPages.length || site.zoneCountries.length || site.zoneStatuses.length || site.r2?.measured
     : site.searchSummary || site.referrers.length || site.keywords.length || site.pages.length
       || site.cfPages.length || site.bingKeywords.length;
   return `<section class="card ${site.zoneSourced ? "card--zone" : ""} ${!site.visits && !hasDetails ? "empty" : ""}" aria-labelledby="${id}">
@@ -686,16 +830,18 @@ function siteCard(site, index, periodDays) {
     ${site.zoneSourced ? `<p class="zone-row" role="note">Counted from zone HTTP request logs (no RUM tag on this site).
       Requests include crawlers, assets, and robots.txt, so this is not comparable to the session counts above.</p>` : ""}
     ${site.zoneSourced ? zoneCrawlerPanel(site) : ""}
+    ${r2Panel(site)}
     ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${crawlerRowDetail(site)}</p>` : ""}
     ${searchSummary(site.searchSummary)}
     ${bingSummary(site)}
     ${hasDetails ? (site.zoneSourced ? `<details class="detail" open data-card-index="${index}">
-      <summary><span>Countries, status codes &amp; top files</span><span class="summary-action">Hide details</span></summary>
+      <summary><span>Countries, status codes, cache${site.r2 ? ", R2" : ""} &amp; top files</span><span class="summary-action">Hide details</span></summary>
       <div class="cols">
         <section class="panel"><h3><span class="dot traffic"></span>Top countries</h3>${countryList(site.zoneCountries)}</section>
         <section class="panel"><h3><span class="dot search"></span>Status codes</h3>${statusList(site.zoneStatuses)}</section>
       </div>
-      <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top files</h3>${fileList(site.cfPages, site.host)}</section>
+      <section class="panel pages-panel"><h3><span class="dot traffic"></span>Top files <span class="panel-note">every edge request, cached or not</span></h3>${fileList(site.cfPages, site.host)}</section>
+      ${r2Details(site)}
     </details>` : `<details class="detail" open data-card-index="${index}">
       <summary><span>Referrers, search queries &amp; landing pages</span><span class="summary-action">Hide details</span></summary>
       <div class="cols">
@@ -1012,6 +1158,8 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
 .zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line);cursor:pointer;list-style:none}.domain-heading::-webkit-details-marker{display:none}.domain-heading::before{content:"▾";font-size:9px;color:var(--faint)}.domain-group:not([open])>.domain-heading::before{content:"▸"}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
+.r2-panel{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--traffic) 7%,transparent);border:1px solid color-mix(in srgb,var(--traffic) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted);display:flex;flex-direction:column;gap:7px}.r2-panel h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0;color:var(--traffic)}.r2-panel p{margin:0}.r2-panel b{color:var(--ink);font-weight:650}.r2-panel .r2-grid{background:color-mix(in srgb,var(--traffic-soft) 55%,transparent)}.r2-panel .r2-grid strong{color:var(--traffic)}.r2-src{font-size:10.5px;color:var(--faint)}.panel-lead{font-size:11px;color:var(--muted);margin:0 0 6px;line-height:1.45}.panel-lead b{color:var(--ink)}.metric-name small{font-size:9px;color:var(--danger)}.r2-class{font-size:7.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--search);font-weight:800;border:1px solid color-mix(in srgb,var(--search) 35%,transparent);border-radius:4px;padding:1px 3px;flex:none;cursor:help}.r2-class.a{color:var(--traffic);border-color:color-mix(in srgb,var(--traffic) 35%,transparent)}.r2-cols{margin-top:15px;padding-top:13px;border-top:1px solid var(--line)}.r2-table-wrap{overflow-x:auto}.r2-table{border-collapse:collapse;width:100%;font-size:11px;font-variant-numeric:tabular-nums}.r2-table th,.r2-table td{padding:3px 8px 3px 0;text-align:right;white-space:nowrap;border-bottom:1px dashed var(--line)}.r2-table th:first-child,.r2-table td:first-child{text-align:left}.r2-table th{font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);font-weight:700}
+@media (max-width:560px){.r2-panel .r2-grid{grid-template-columns:repeat(2,1fr);gap:10px 8px}}
 .source-overview{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 17px;box-shadow:var(--shadow);margin:-2px 0 18px}.source-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:9px}.source-heading h2{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0}.source-heading span{font-size:10px;color:var(--faint)}.source-bar{height:8px;display:flex;overflow:hidden;border-radius:999px;background:var(--line);margin-bottom:10px}.source-segment{height:100%}.source-segment.direct,.source-legend i.direct{background:var(--direct)}.source-segment.search,.source-legend i.search{background:var(--search)}.source-segment.social,.source-legend i.social{background:var(--social)}.source-segment.referral,.source-legend i.referral{background:var(--good)}.source-segment.internal,.source-legend i.internal{background:var(--faint)}.source-legend{display:grid;grid-template-columns:repeat(5,1fr);gap:8px 14px}.source-legend>div{display:grid;grid-template-columns:auto 1fr auto;align-items:center;column-gap:6px;font-size:11px;min-width:0}.source-legend i{width:7px;height:7px;border-radius:50%}.source-legend span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-legend strong{font-size:11px}.source-legend small{grid-column:2/-1;color:var(--faint);font-size:9px}.source-note{margin:10px 0 0;padding-top:9px;border-top:1px dashed var(--line);font-size:10.5px;line-height:1.5;color:var(--faint)}.source-note b{color:var(--muted);font-weight:650}
 html[data-traffic-view=search] .source-segment:not(.search),html[data-traffic-view=search] .source-legend>div:not(:has(i.search)){opacity:.32}html[data-traffic-view=referred] .source-segment.direct,html[data-traffic-view=referred] .source-legend>div:has(i.direct){opacity:.32}
 .cmp{display:inline-flex;align-items:center;font-size:10px;font-weight:650;border-radius:999px;padding:2px 6px;background:color-mix(in srgb,var(--line) 70%,transparent);color:var(--faint);white-space:nowrap;text-decoration:none}a.cmp:hover{color:var(--ink)}

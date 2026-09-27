@@ -119,6 +119,83 @@ CREATE TABLE IF NOT EXISTS daily_zone_bots (
   PRIMARY KEY (date, host, category)
 );
 
+-- Small closed zone-log dimensions as (dim, value) rows: 'cache' (cacheStatus:
+-- hit, miss, expired, dynamic, ...) and 'method' (GET, HEAD, ...).
+CREATE TABLE IF NOT EXISTS daily_zone_dims (
+  date     TEXT NOT NULL,
+  host     TEXT NOT NULL,
+  dim      TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  bytes    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, dim, value)
+);
+
+-- R2 bucket analytics for SITES rows with an `r2Bucket` (src/r2.js). The bucket
+-- side of an R2-backed host: operations that reached the bucket (edge cache
+-- misses plus S3-API calls), not edge requests — a different population from
+-- daily_traffic/daily_zone_* for the same host, never added to or subtracted
+-- from them.
+CREATE TABLE IF NOT EXISTS daily_r2_summary (
+  date            TEXT NOT NULL,
+  host            TEXT NOT NULL,
+  bucket          TEXT NOT NULL,
+  object_count    INTEGER NOT NULL DEFAULT 0,   -- Standard class, latest storage sample
+  payload_bytes   INTEGER NOT NULL DEFAULT 0,
+  metadata_bytes  INTEGER NOT NULL DEFAULT 0,
+  upload_count    INTEGER NOT NULL DEFAULT 0,   -- in-progress multipart uploads
+  ia_object_count INTEGER NOT NULL DEFAULT 0,   -- Infrequent Access class
+  ia_payload_bytes INTEGER NOT NULL DEFAULT 0,
+  storage_at      TEXT,                         -- when that storage sample was taken
+  requests        INTEGER NOT NULL DEFAULT 0,   -- the day's operations, all classes
+  response_bytes  INTEGER NOT NULL DEFAULT 0,
+  class_a         INTEGER NOT NULL DEFAULT 0,
+  class_b         INTEGER NOT NULL DEFAULT 0,
+  class_free      INTEGER NOT NULL DEFAULT 0,
+  class_unlisted  INTEGER NOT NULL DEFAULT 0,   -- ops the pricing page does not classify
+  errors          INTEGER NOT NULL DEFAULT 0,   -- actionStatus other than 'success'
+  mtd_class_a     INTEGER NOT NULL DEFAULT 0,   -- month-to-date, for the free-tier meter
+  mtd_class_b     INTEGER NOT NULL DEFAULT 0,
+  mtd_start       TEXT,
+  PRIMARY KEY (date, host)
+);
+
+CREATE TABLE IF NOT EXISTS daily_r2_ops (
+  date           TEXT NOT NULL,
+  host           TEXT NOT NULL,
+  action_type    TEXT NOT NULL,                 -- GetObject, PutObject, HeadObject, ...
+  action_status  TEXT NOT NULL,                 -- success, userError, internalError
+  requests       INTEGER NOT NULL DEFAULT 0,
+  response_bytes INTEGER NOT NULL DEFAULT 0,
+  object_bytes   INTEGER NOT NULL DEFAULT 0,    -- for PutObject: bytes uploaded
+  PRIMARY KEY (date, host, action_type, action_status)
+);
+
+-- Top objects READ FROM THE BUCKET: cache misses, not every download (the
+-- zone log's daily_cf_pages is the every-download list). kind 'read' is a
+-- successful GetObject; 'missing' is a GetObject for a key that is not there
+-- (broken links, scanner probes).
+CREATE TABLE IF NOT EXISTS daily_r2_objects (
+  date           TEXT NOT NULL,
+  host           TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  object         TEXT NOT NULL,
+  requests       INTEGER NOT NULL DEFAULT 0,
+  response_bytes INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, kind, object)
+);
+
+-- (dim, value) rows: 'status' (HTTP status R2 returned), 'region' (eyeball region).
+CREATE TABLE IF NOT EXISTS daily_r2_dims (
+  date           TEXT NOT NULL,
+  host           TEXT NOT NULL,
+  dim            TEXT NOT NULL,
+  value          TEXT NOT NULL,
+  requests       INTEGER NOT NULL DEFAULT 0,
+  response_bytes INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host, dim, value)
+);
+
 -- Forum user login/activity stats (see src/discourse.js). One row per
 -- (date, host) snapshot, same shape as daily_traffic, sourced from each
 -- Discourse forum's own /about.json rather than Cloudflare or GSC.
@@ -204,6 +281,10 @@ CREATE INDEX IF NOT EXISTS idx_search_summary_dh ON daily_search_summary(date, h
 CREATE INDEX IF NOT EXISTS idx_zone_countries_dh ON daily_zone_countries(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_status_dh ON daily_zone_status(date, host);
 CREATE INDEX IF NOT EXISTS idx_zone_bots_dh ON daily_zone_bots(date, host);
+CREATE INDEX IF NOT EXISTS idx_zone_dims_dh ON daily_zone_dims(date, host);
+CREATE INDEX IF NOT EXISTS idx_r2_ops_dh ON daily_r2_ops(date, host);
+CREATE INDEX IF NOT EXISTS idx_r2_objects_dh ON daily_r2_objects(date, host);
+CREATE INDEX IF NOT EXISTS idx_r2_dims_dh ON daily_r2_dims(date, host);
 CREATE INDEX IF NOT EXISTS idx_forum_activity_dh ON daily_forum_activity(date, host);
 CREATE INDEX IF NOT EXISTS idx_bing_summary_dh ON daily_bing_summary(date, host);
 CREATE INDEX IF NOT EXISTS idx_bing_keywords_dh ON daily_bing_keywords(date, host);

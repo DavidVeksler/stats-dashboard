@@ -14,7 +14,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_query_pages`, `daily_keywords`, `daily_pages`, `daily_zone_bots`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_query_pages`, `daily_keywords`, `daily_pages`, `daily_zone_bots`, `daily_zone_dims`, `daily_r2_summary`, `daily_r2_ops`, `daily_r2_objects`, `daily_r2_dims`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
 | Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8, 12–17 implemented; 9, 10, 11 and 18 proposed) |
 | Which page ranks for a query, per-page opportunity lists, split (cannibalized) queries | `src/opportunities.js` (`groupQueryPages`, `attachPages`, `rankPageOpportunities`, `findCannibalized`) fed by `daily_query_pages`; the pull is `queryQueryPages` in `src/gsc.js` |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
@@ -22,6 +22,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
+| R2 bucket stats (storage, ops by billing class, cost estimate, objects read from the bucket), edge cache status | `src/r2.js` + `r2Bucket`/`r2Account` on a `SITES` row; checked by `scripts/r2-check.mjs` |
 | Forum user login/activity stats | `src/discourse.js` + `FORUMS` in `src/config.js` — no API key, see the note below |
 | Bing Search stats | `src/bing.js` + `bing` field in `src/config.js` — a flat API key (`BING_API_KEY`), not OAuth, see the note below |
 | Why the Bing pull runs in GitHub Actions instead of the Worker's own cron | the note on `runBingDaily` in `src/index.js`, and `scripts/bing-pull.mjs` / `.github/workflows/bing-pull.yml` |
@@ -148,6 +149,22 @@ visible badges with no way to tell that from a bug.
 `totals.trend` holds the 14-day means, and no new query was added for any of them. A number that
 answers none of *is this normal? / what changed? / what do I do?* is decoration, so a bare figure on
 a tile is a bug, not a style choice.
+
+**R2-backed hosts get the bucket's own analytics beside the zone log.** library.freecapitalists.org
+moved to the R2 bucket `freecapitalists-library` on 2026-09-27, served through an R2 custom domain on
+the same zone, so the zone pull keeps working unchanged. A `SITES` row with `r2Bucket` (+ `r2Account`)
+also gets `pullR2` (`src/r2.js`): one aliased GraphQL request against the account-scoped
+`r2OperationsAdaptiveGroups`/`r2StorageAdaptiveGroups` datasets for the day's operations by
+(actionType, actionStatus), R2 status codes, eyeball regions, the top GetObject keys, month-to-date ops
+and the latest storage sample. Stored in `daily_r2_summary`/`_ops`/`_objects`/`_dims`, rendered as an
+R2 panel plus details on the zone card, and returned from `/run` as `r2Buckets`. Rules to keep: (1) R2
+operations and zone edge requests are **different populations** (R2 sees cache misses plus S3-API
+calls that never touch the zone; the zone sees every edge hit) and are never added, subtracted or
+divided into each other; the cache figure comes from the zone log's own `cacheStatus`
+(`daily_zone_dims`, `summarizeCache`). (2) Op classes and prices in `R2_PRICING` are verbatim from
+Cloudflare's pricing page with the date read; an op type the page does not list is `unlisted`, never
+guessed into a class. The cost line is an upper-bound estimate (errors counted, decimal GB), labelled
+as not a bill. (3) R2 DELETEs are gated on a successful pull, like the GSC tables.
 
 **Forum activity (Discourse) is a third, independent pull**, alongside Cloudflare/RUM and GSC —
 `FORUMS` in `src/config.js`, pulled by `src/discourse.js`, stored in `daily_forum_activity`,
@@ -399,7 +416,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   and its advice — merge two pages — is the most destructive on the page. Promote it to 2 only after a
   real case has been confirmed by eye.
 - **The Worker's own subrequest budget is a real ceiling, and it was already close.** One `runDaily`
-  invocation makes roughly 4 (RUM, one per `CF_ACCOUNTS`) + 5 (zone, for `library.freecapitalists.org`)
+  invocation makes roughly 4 (RUM, one per `CF_ACCOUNTS`) + 1 per zone host (one aliased request since
+  2026-09-27; it was 5) + 1 per `r2Bucket`
   + up to 3 × `SITES.length` (GSC: keywords, pages, summary) + `FORUMS.length` + 1 (ntfy) fetches — with
   12 GSC sites that is up to 36 GSC calls alone. On 2026-08-26 vellum.capital, last in `SITES`, lost its
   summary call to Cloudflare's own `Too many subrequests by single Worker invocation` error, even though
@@ -409,8 +427,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
   `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
   is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
-  removes ~1 GSC call per site per night. **Re-counted 2026-09-18 with 17 `gsc` properties: 4 RUM + ~5 zone + 1
-  token + 34 GSC + 2 forums + 1 ntfy is about 47 of 50** — so no new per-site fetch fits in `runDaily`
+  removes ~1 GSC call per site per night. **Re-counted 2026-09-27 with 17 `gsc` properties: 4 RUM + 1 zone + 1 R2
+  + 1 token + 34 GSC + 2 forums + 1 ntfy is 44 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
   at all; anything new either changes what an existing call asks for or runs as its own invocation (spec
   items 17 and 18 are shaped by exactly this). If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
@@ -675,8 +693,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   do not subtract the floor and call the remainder human, do not interpolate, do not add the two
   lenses. `summarizeVerifiedBots` intentionally exposes no `human*` field and `bots-check.mjs`
   asserts that; the card says outright that the remainder cannot be characterized.
-- **Two dimensions in one zone query are legal.** The one-dimension-per-call convention at
-  `src/cloudflare.js:73-79` is a 5,000-row-cap workaround for high-cardinality combinations, not an
+- **Two dimensions in one zone query are legal.** The one-dimension-per-grouping convention in
+  `zoneQuery` (`src/cloudflare.js`) is a 5,000-row-cap workaround for high-cardinality combinations, not an
   API ceiling. The same spike confirmed `{ clientRequestPath, edgeResponseStatus }` filtered
   `edgeResponseStatus_geq: 400` returns 1,376 rows on this zone without approaching the cap. Pair
   dimensions only where a filter keeps the product that small.

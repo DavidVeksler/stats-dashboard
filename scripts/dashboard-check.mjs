@@ -342,6 +342,11 @@ const db = {
       if (sql.includes("daily_bing_keywords")) return { results: onDate(bingKeywordRows, binds) };
       if (sql.includes("daily_forum_activity")) return { results: between(forumActivityRows, binds) };
       if (sql.includes("daily_signals")) return { results: between(dailySignalRows, binds) };
+      // R2 bucket rows for the zone host (the 2026-09-27 migration shape): a
+      // summary per night over the history window, the rest latest-day only.
+      if (sql.includes("daily_r2_summary")) return { results: between(R2_SUMMARIES(), binds) };
+      if (sql.includes("daily_r2_ops")) return { results: onDate(R2_OPS(), binds) };
+      if (sql.includes("daily_zone_dims")) return { results: onDate(ZONE_DIMS(), binds) };
       if (sql.includes("daily_zone_bots")) {
         // A missing table is what D1 raises before the migration lands; the read
         // path has to survive it, not 500 the whole dashboard.
@@ -362,6 +367,24 @@ const db = {
     return stmt;
   },
 };
+
+// R2 fixtures, dated relative to the fixture's latest day.
+const R2_SUMMARIES = () => [
+  { date: DAYS.at(-2).date, host: ZONE_HOST, bucket: "freecapitalists-library", object_count: 17605,
+    payload_bytes: 132906356605, metadata_bytes: 1228872, requests: 8554, class_a: 8554, class_b: 0 },
+  { date: DAYS.at(-1).date, host: ZONE_HOST, bucket: "freecapitalists-library", object_count: 26139,
+    payload_bytes: 162880512114, metadata_bytes: 1839241, requests: 35189, class_a: 26197, class_b: 8990,
+    class_unlisted: 2, errors: 283, mtd_class_a: 26191, mtd_class_b: 9006, mtd_start: "2026-09-01" },
+];
+const R2_OPS = () => [
+  { date: DAYS.at(-1).date, host: ZONE_HOST, action_type: "PutObject", action_status: "success", requests: 26135 },
+  { date: DAYS.at(-1).date, host: ZONE_HOST, action_type: "GetBucketSippyConfiguration", action_status: "success", requests: 1 },
+];
+const ZONE_DIMS = () => [
+  { date: DAYS.at(-1).date, host: ZONE_HOST, dim: "cache", value: "miss", requests: 877, bytes: 2805320624 },
+  { date: DAYS.at(-1).date, host: ZONE_HOST, dim: "cache", value: "hit", requests: 91, bytes: 211002495 },
+  { date: DAYS.at(-1).date, host: ZONE_HOST, dim: "method", value: "HEAD", requests: 8274, bytes: 6868390 },
+];
 
 const load = async (query) => {
   const res = await worker.fetch(new Request(`https://stats.test/api/json?${query}`), { DB: db });
@@ -540,6 +563,18 @@ const load = async (query) => {
     zone.zoneNonContent.errorRequests, 1745 + 769);
   check("the two lenses are never merged into one total",
     "requests" in zone.zoneNonContent, false);
+
+  // R2: the bucket's latest night, the one before it, and what they cost.
+  check("an R2-backed host carries its bucket panel", zone.r2?.measured, true);
+  check("...from the latest night's summary", zone.r2.summary.objectCount, 26139);
+  check("...against the night before", zone.r2.previous.objectCount, 17605);
+  check("...with the history for the by-night table", zone.r2.history.length, 2);
+  check("...ops tagged by billing class", zone.r2.ops.map((op) => op.opClass).join(","), "A,unlisted");
+  check("...and a cost estimate", zone.r2.cost.storageUsd.toFixed(2), "2.29");
+  check("cache and method rows are split apart", zone.zoneCache.rows.length, 2);
+  check("...with the hit share over edge requests", zone.zoneCache.hitShare, 91 / 968);
+  check("...and methods on their own", zone.zoneMethods[0].value, "HEAD");
+  check("a host with no bucket gets no R2 panel", rum.r2, null);
 
   check("RUM sites get no zone decomposition", rum.zoneBots, null);
   check("...nor a non-content lens", rum.zoneNonContent, null);
