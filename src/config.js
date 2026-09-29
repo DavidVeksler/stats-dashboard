@@ -65,6 +65,14 @@ export const SITES = [
     // site's Bing figures were the forum's alone. Both strings re-confirmed
     // live via getUserSites 2026-08-27.
     bing: ["https://forum.objectivismonline.com/", "https://objectivismonline.com/"],
+    // Discourse has no /index.php (it 404s), so every hit there is a scanner
+    // probe. 2026-09-28/29: 3,135 of 3,141 "sessions" referred by www.aocr.org
+    // (a radiology society site, 1-8/day before 09-24) landed on it, all desktop
+    // Chrome on Windows, one pageview each, plus 761 more with no referer. That
+    // flood is invisible to the flood classifier because it arrives as
+    // "referral", not "direct". Dropped at the query so sessions, views and the
+    // referrer list reflect readers.
+    excludePaths: ["/index.php"],
   },
   {
     host: "cheatsheets.davidveksler.com",
