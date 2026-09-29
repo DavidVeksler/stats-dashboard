@@ -17,7 +17,7 @@
 // 2026-09-27, which is what lets the billing panel ask for month-to-date
 // operations directly instead of summing stored nightly rows.
 
-const GQL = "https://api.cloudflare.com/client/v4/graphql";
+import { gqlPost } from "./cloudflare.js";
 
 // Published R2 prices, from https://developers.cloudflare.com/r2/pricing/
 // (read 2026-09-27). Standard storage class; Infrequent Access has different
@@ -118,20 +118,13 @@ export async function pullR2(env, account, bucket, startISO, endISO) {
   const f = { bucketName: bucket, datetime_geq: startISO, datetime_leq: endISO };
   const storageStart = new Date(Date.parse(endISO) - 7 * 86400_000).toISOString();
   const mtdStart = monthStart(endISO);
-  const res = await fetch(GQL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.CF_API_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ query: QUERY, variables: {
-      account, f,
-      gf: { ...f, actionType: "GetObject", actionStatus: "success" },
-      xf: { ...f, actionType: "GetObject", actionStatus: "userError" },
-      mf: { bucketName: bucket, datetime_geq: mtdStart, datetime_leq: endISO },
-      sf: { bucketName: bucket, datetime_geq: storageStart, datetime_leq: endISO },
-    } }),
-  });
-  if (!res.ok) throw new Error(`CF R2 GraphQL ${res.status} for ${bucket}: ${await res.text()}`);
-  const body = await res.json();
-  if (body.errors) throw new Error(`CF R2 GraphQL errors for ${bucket}: ${JSON.stringify(body.errors)}`);
+  const body = await gqlPost(env, { query: QUERY, variables: {
+    account, f,
+    gf: { ...f, actionType: "GetObject", actionStatus: "success" },
+    xf: { ...f, actionType: "GetObject", actionStatus: "userError" },
+    mf: { bucketName: bucket, datetime_geq: mtdStart, datetime_leq: endISO },
+    sf: { bucketName: bucket, datetime_geq: storageStart, datetime_leq: endISO },
+  } }, `R2 ${bucket}`);
   const acct = body.data?.viewer?.accounts?.[0] ?? {};
 
   // Latest sample per storage class (rows arrive newest first).

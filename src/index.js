@@ -892,6 +892,34 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
   } catch (_) { /* non-fatal */ }
 }
 
+// The cron entry point. runDaily throws on a failed Cloudflare pull, and on
+// 2026-09-29 that escaped waitUntil with no runs row and no push, so the page went
+// a day stale with nothing saying so. A failure now leaves an ok=0 row (which the
+// severity-1 stale-pipeline signal and /health both read) and pushes an alert.
+// The row is keyed on the current time, so it never overwrites a successful run.
+async function runDailyGuarded(env) {
+  try {
+    return await runDaily(env);
+  } catch (err) {
+    const message = String(err?.message ?? err).slice(0, 500);
+    const now = new Date();
+    try {
+      await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
+        .bind(now.toISOString(), now.toISOString().slice(0, 10), 0, `runDaily threw: ${message}`).run();
+    } catch (_) { /* D1 down too; the push below is still worth sending */ }
+    if (env.NTFY_TOPIC) {
+      try {
+        await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+          method: "POST",
+          headers: { Title: "Stats dashboard: nightly pull FAILED", Tags: "warning", Priority: "high" },
+          body: `${message}\n\nRetry: npm run refresh`,
+        });
+      } catch (_) { /* non-fatal */ }
+    }
+    throw err;
+  }
+}
+
 // ---- Read from D1 and render ---------------------------------------------
 // Cards are laid out domain-first: every host of a registrable domain sits in
 // one run, the runs are ordered by the domain's own popularity, and hosts are
@@ -1807,7 +1835,7 @@ export default {
   // replacement — it fetches from outside Cloudflare and POSTs the results to
   // /ingest-bing.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDaily(env));
+    ctx.waitUntil(runDailyGuarded(env));
   },
 
   async fetch(request, env) {

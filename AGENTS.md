@@ -285,6 +285,13 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   filter (`rumFilter`) because two groupings have no path to drop rows on. A grouping that fills its cap
   (usually `pages` during a flood) is reported as `rumTruncated` from `/run` and in the `runs` note,
   without failing the run.
+- **Every Cloudflare GraphQL call goes through `gqlPost` (`src/cloudflare.js`), and the cron goes through
+  `runDailyGuarded`.** On 2026-09-29 the RUM query returned a transient `serviceUnavailable`, `runDaily`
+  threw, and the page went a day stale with no `runs` row and no push. `gqlPost` retries only what
+  Cloudflare marks retryable (5xx, 429, network faults, `serviceUnavailable`/`timeout`/`internalError`; 3
+  attempts, 1.5s then 4s backoff) and never a real query error; `runDailyGuarded` writes an `ok=0` runs row
+  (which feeds `/health` and the severity-1 `stale-pipeline` signal) and pushes a high-priority ntfy on any
+  throw. Do not add a raw `fetch(GQL…)`; `scripts/gql-check.mjs` covers the retry rules.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and
   contributes nothing either way. A hop between a site's *own different* hostnames does start a

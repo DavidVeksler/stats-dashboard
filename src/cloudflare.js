@@ -59,6 +59,49 @@ export function rumFilter(startISO, endISO) {
   return filter;
 }
 
+// POST one GraphQL request to Cloudflare, retrying transient failures. The nightly
+// cron once died on a single `serviceUnavailable` ("unable to execute query, please
+// try again later", 2026-09-29) from the RUM query: no retry, no runs row, no push,
+// so the dashboard just silently went a day stale. Only errors Cloudflare itself
+// marks as retryable (5xx, 429, network faults, serviceUnavailable/timeout codes)
+// are retried; a real query error (authz, bad field) throws immediately. Every
+// retry is another subrequest, but only on failure, so the 50-per-invocation
+// budget in AGENTS.md is untouched on a healthy night.
+const GQL_ATTEMPTS = 3;
+const GQL_BACKOFF_MS = [1500, 4000];
+const RETRYABLE_GQL_CODES = new Set(["serviceUnavailable", "timeout", "internalError"]);
+
+export async function gqlPost(env, payload, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= GQL_ATTEMPTS; attempt++) {
+    let retryable = false;
+    try {
+      const res = await fetch(GQL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.CF_API_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        retryable = res.status >= 500 || res.status === 429;
+        throw new Error(`CF GraphQL ${res.status} for ${label}: ${await res.text()}`);
+      }
+      const body = await res.json();
+      if (body.errors) {
+        retryable = body.errors.some((e) => RETRYABLE_GQL_CODES.has(e?.extensions?.code));
+        throw new Error(`CF GraphQL errors for ${label}: ${JSON.stringify(body.errors)}`);
+      }
+      return body;
+    } catch (err) {
+      lastErr = err;
+      // fetch() itself rejecting (no status yet) is a network fault: retry it.
+      if (!/^CF GraphQL/.test(String(err?.message))) retryable = true;
+      if (!retryable || attempt === GQL_ATTEMPTS) break;
+      await new Promise((r) => setTimeout(r, GQL_BACKOFF_MS[attempt - 1]));
+    }
+  }
+  throw lastErr;
+}
+
 // Pull the last-24h RUM rows from every account and merge by requestHost.
 // Returns { hosts, truncated } where hosts is
 // Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>
@@ -74,17 +117,7 @@ export async function pullTraffic(env, startISO, endISO) {
   };
 
   for (const account of CF_ACCOUNTS) {
-    const res = await fetch(GQL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.CF_API_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ query: QUERY, variables: { account, filter } }),
-    });
-    if (!res.ok) throw new Error(`CF GraphQL ${res.status} for ${account}: ${await res.text()}`);
-    const body = await res.json();
-    if (body.errors) throw new Error(`CF GraphQL errors: ${JSON.stringify(body.errors)}`);
+    const body = await gqlPost(env, { query: QUERY, variables: { account, filter } }, `RUM ${account}`);
 
     const acct = body.data?.viewer?.accounts?.[0] ?? {};
     for (const name of ["totals", "refs", "pages"]) {
@@ -184,20 +217,10 @@ ${groupings}
 // startISO/endISO span no wider than 24h.
 // Returns { visits, requests, bytes, paths, countries, statuses, bots, dims }.
 export async function pullZoneTraffic(env, zoneTag, host, startISO, endISO) {
-  const res = await fetch(GQL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.CF_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: zoneQuery(),
-      variables: { zoneTag, start: startISO, end: endISO, host },
-    }),
-  });
-  if (!res.ok) throw new Error(`CF zone GraphQL ${res.status} for ${host}: ${await res.text()}`);
-  const body = await res.json();
-  if (body.errors) throw new Error(`CF zone GraphQL errors for ${host}: ${JSON.stringify(body.errors)}`);
+  const body = await gqlPost(env, {
+    query: zoneQuery(),
+    variables: { zoneTag, start: startISO, end: endISO, host },
+  }, `zone ${host}`);
   const zone = body.data?.viewer?.zones?.[0] ?? {};
   const totalRows = zone.total ?? [];
   const pathRows = zone.path ?? [];
