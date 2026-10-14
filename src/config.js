@@ -82,6 +82,15 @@ export const SITES = [
     excludePaths: ["/history.php"],
     bing: "https://cheatsheets.davidveksler.com/", // confirmed live via getUserSites 2026-08-26
   },
+  // Dedicated sc-domain: property, confirmed via list_sites 2026-10-14 (created
+  // that day, so expect an empty search panel until Search Console backfills it;
+  // do not swap to the davidveksler.com parent + gscPageFilter to fill the gap
+  // unless the new property stays empty for days). No `bing` field: Bing's
+  // davidveksler.com apex property is domain-wide and unfilterable (see that row).
+  {
+    host: "concordia.davidveksler.com",
+    gsc: "sc-domain:concordia.davidveksler.com",
+  },
   {
     host: "coloradofirearmswatch.org",
     gsc: "sc-domain:coloradofirearmswatch.org",

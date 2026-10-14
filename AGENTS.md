@@ -434,8 +434,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
   `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
   is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
-  removes ~1 GSC call per site per night. **Re-counted 2026-09-27 with 17 `gsc` properties: 4 RUM + 1 zone + 1 R2
-  + 1 token + 34 GSC + 2 forums + 1 ntfy is 44 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
+  removes ~1 GSC call per site per night. **Re-counted 2026-10-14 with 18 `gsc` properties: 4 RUM + 1 zone + 1 R2
+  + 1 token + 36 GSC + 2 forums + 1 ntfy is 46 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
   at all; anything new either changes what an existing call asks for or runs as its own invocation (spec
   items 17 and 18 are shaped by exactly this). If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
