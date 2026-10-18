@@ -298,8 +298,9 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   interval. (Inferred, not captured: the Worker's raw response on a bad night was never logged, so the first guarded
   bad night's `runs` note is the confirmation.) The 2026-10-17 run stored `forum.objectivismonline.com` at exactly 18,000 visits, three hosts at
   3,000/2,000/1,000 and eleven of seventeen sites at zero; earlier bad nights were 2026-09-21, 09-30, 10-06 and
-  10-12. Re-reading the same window later returned exact figures at interval ~1.00 (except 10-06, which
-  Cloudflare still serves at interval 10, so that night is unrecoverable). `pullTraffic` now asks for
+  10-12. Re-reading the 10-12 and 10-17 windows days later returned exact figures at interval ~1.00, but the
+  09-21, 09-30 and 10-06 windows read back at interval 10 (Cloudflare coarsens older RUM data, somewhere between 6 and
+  12 days old), so those three nights are unrecoverable: run `backfill:rum` within a few days of a bad night. `pullTraffic` now asks for
   `avg { sampleInterval }` on `totals`, judges each account with `rumSamplingProblem` (pageview-weighted interval
   over `RUM_MAX_SAMPLE_INTERVAL` 1.5, or no rows from the primary account), retries from ONE shared budget of
   `RUM_SAMPLING_RETRIES` (3, backed off 5/15/30 s; runDaily is at 46-47 of 50 subrequests, so never per account),
