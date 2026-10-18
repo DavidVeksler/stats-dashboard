@@ -274,7 +274,19 @@ async function runDaily(env, now = new Date()) {
   // 1. Traffic + referrers (Cloudflare Web Analytics)
   // `rumTruncated` names any grouping that filled its row cap. Informational
   // (see `info` below), not a failure: the per-host totals are exact either way.
-  const { hosts: traffic, truncated: rumTruncated } = await pullTraffic(env, since, until);
+  const { hosts: traffic, truncated: rumTruncated, degraded: rumDegraded } = await pullTraffic(env, since, until);
+  // Cloudflare answered with a sampled RUM result (counts in multiples of the
+  // sample interval, small hosts rounding to zero) and it stayed sampled through
+  // the retry budget. Nothing from it is trustworthy, so no RUM host gets a row:
+  // writing none leaves any existing rows for the date untouched, where writing
+  // the sampled figures is how 2026-10-17 stored 18,000 and eleven zeros. Counts as
+  // a note, so the run is ok=0 and the stale-pipeline signal and push fire; zone,
+  // R2, forum and Search Console data are independent and still written.
+  const rumSkipped = rumDegraded.length > 0;
+  if (rumSkipped) {
+    traffic.clear();
+    notes.push(`rum sampled by Cloudflare, traffic rows not written: ${rumDegraded.join("; ")}`.slice(0, 200));
+  }
 
   // 1b. Zone-log traffic for hosts with no RUM beacon (trafficSource: "zone").
   // Merged into the same `traffic` map so the rest of this function doesn't
@@ -293,7 +305,8 @@ async function runDaily(env, now = new Date()) {
   }
 
   const stmts = [];
-  for (const { host } of SITES) {
+  for (const { host, trafficSource } of SITES) {
+    if (rumSkipped && trafficSource !== "zone") continue;
     const rec = traffic.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
     const zx = zoneExtra.get(host);
     stmts.push(
@@ -603,7 +616,7 @@ async function runDaily(env, now = new Date()) {
   // byte-for-byte what it was before.
   const dashboard = await loadDashboard(env).catch(() => null);
   const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal);
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal, rumSkipped);
 
   // 5. Persist every computed signal, not just the top one picked out above
   // (spec item 14) — the record item 15's recurrence reads, and what a
@@ -629,7 +642,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, rumTruncated, r2Buckets, notes };
+    truncatedPairHosts, rumTruncated, rumSkipped, r2Buckets, notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------
@@ -863,7 +876,7 @@ async function summarizeToday(env, date) {
   return { humanVisits, botVisits, perHost, flooded };
 }
 
-async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null) {
+async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null, rumSkipped = false) {
   if (!env.NTFY_TOPIC) return;
   const ranked = summary
     ? [...summary.perHost.entries()].sort((a, b) => b[1] - a[1])
@@ -882,7 +895,10 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
   // Only severity 1 ("act today") is added. Nothing else changes about the push,
   // so a quiet day still reads exactly as it did before the signal engine existed.
   const finding = topSignal ? `\n\n❗ ${topSignal.headline}\n→ ${topSignal.action}` : "";
-  const body = `${headline}\n${top}${crawlers}${gscWarn}${finding}`;
+  // A sampled RUM answer writes nothing, so the headline above is last night's
+  // history, not this window: say so rather than let it read as a quiet day.
+  const rumWarn = rumSkipped ? "\n⚠ Cloudflare sampled the RUM data; traffic not updated (retry: npm run refresh)" : "";
+  const body = `${headline}\n${top}${crawlers}${gscWarn}${rumWarn}${finding}`;
   try {
     await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
       method: "POST",

@@ -31,6 +31,7 @@ const QUERY = `query Rum($account: String!, $filter: AccountRumPageloadEventsAda
       totals: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [count_DESC]) {
         count
         sum { visits }
+        avg { sampleInterval }
         dimensions { requestHost }
       }
       refs: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
@@ -102,13 +103,55 @@ export async function gqlPost(env, payload, label) {
   throw lastErr;
 }
 
+
+// ---- Sampling guard --------------------------------------------------------
+// rumPageloadEventsAdaptiveGroups is an *adaptive* dataset: when Cloudflare is
+// under load it answers with a coarser sample, and every count comes back as a
+// multiple of the sample interval. That is what the 2026-10-17 run stored:
+// forum.objectivismonline.com 18,000 visits, three more hosts at 3,000/2,000/
+// 1,000, and eleven of seventeen sites at zero, while re-reading the identical
+// window afterwards returned the exact figures at interval ~1. Earlier bad runs:
+// 2026-09-21, 09-30, 10-06 and 10-12. The pull used to accept whatever came back.
+// `avg { sampleInterval }` says how coarse the answer is, so a sampled answer is
+// retried and, if it stays sampled, refused (pullTraffic reports it; runDaily
+// writes no RUM rows rather than wrong ones). A healthy answer reads 1.00-1.05.
+export const RUM_MAX_SAMPLE_INTERVAL = 1.5;
+// Retries are spent from ONE budget per pullTraffic call, not per account: runDaily
+// sits at 46-47 of the 50-subrequest ceiling, so a degraded night may add at most
+// RUM_SAMPLING_RETRIES requests (and still lands at <= 50 with gqlPost's own retries
+// quiet). Spaced out because sampling follows load, which a second does not clear.
+export const RUM_SAMPLING_RETRIES = 3;
+export const RUM_SAMPLING_BACKOFF_MS = [5000, 15000, 30000];
+
+// Judge one account's `totals` rows. Returns null when they can be trusted, else a
+// short reason. The interval is weighted by pageviews so a quiet host's noisy
+// interval cannot veto a healthy day, while a flood host's cannot hide a bad one.
+// `expectTraffic` is for the account that always has traffic: an empty answer
+// there is the 2026-10-06 shape (every site zero), not a quiet day.
+export function rumSamplingProblem(rows, expectTraffic) {
+  if (!rows.length) return expectTraffic ? "no rows returned" : null;
+  let weight = 0, weighted = 0;
+  for (const r of rows) {
+    const w = Number(r.count) || 0;
+    weight += w;
+    weighted += w * (Number(r.avg?.sampleInterval) || 1);
+  }
+  const interval = weight ? weighted / weight : 1;
+  return interval > RUM_MAX_SAMPLE_INTERVAL ? `sample interval ${interval.toFixed(1)}` : null;
+}
+
 // Pull the last-24h RUM rows from every account and merge by requestHost.
-// Returns { hosts, truncated } where hosts is
+// Returns { hosts, truncated, degraded } where hosts is
 // Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>
-// and truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT.
-export async function pullTraffic(env, startISO, endISO) {
+// truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT, and
+// degraded lists "account: reason" for every account still sampled after the retry
+// budget (see the sampling guard above). When degraded is non-empty `hosts` holds
+// nothing worth writing and the caller must not store it.
+export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLING_RETRIES, backoffMs = RUM_SAMPLING_BACKOFF_MS } = {}) {
   const hosts = new Map();
   const truncated = [];
+  const degraded = [];
+  let retriesLeft = retries;
   const filter = rumFilter(startISO, endISO);
   const recFor = (host) => {
     let rec = hosts.get(host);
@@ -116,10 +159,20 @@ export async function pullTraffic(env, startISO, endISO) {
     return rec;
   };
 
-  for (const account of CF_ACCOUNTS) {
-    const body = await gqlPost(env, { query: QUERY, variables: { account, filter } }, `RUM ${account}`);
-
-    const acct = body.data?.viewer?.accounts?.[0] ?? {};
+  for (const [index, account] of CF_ACCOUNTS.entries()) {
+    let acct, problem;
+    for (let attempt = 0; ; attempt++) {
+      const body = await gqlPost(env, { query: QUERY, variables: { account, filter } }, `RUM ${account}`);
+      acct = body.data?.viewer?.accounts?.[0] ?? {};
+      problem = rumSamplingProblem(acct.totals ?? [], index === 0);
+      if (!problem || retriesLeft <= 0) break;
+      retriesLeft -= 1;
+      await new Promise((r) => setTimeout(r, backoffMs[Math.min(attempt, backoffMs.length - 1)]));
+    }
+    if (problem) {
+      degraded.push(`${account.slice(0, 8)}: ${problem}`);
+      continue;
+    }
     for (const name of ["totals", "refs", "pages"]) {
       if ((acct[name]?.length ?? 0) >= RUM_ROW_LIMIT) truncated.push(`${account.slice(0, 8)}/${name}`);
     }
@@ -159,7 +212,7 @@ export async function pullTraffic(env, startISO, endISO) {
     }
   }
 
-  return { hosts, truncated };
+  return { hosts, truncated, degraded };
 }
 
 // httpRequestsAdaptiveGroups, one dimension per grouping. Kept to a single

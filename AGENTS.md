@@ -20,6 +20,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
+| RUM numbers that are round (1,000s) or zero, sampling guard, repairing bad nights | the `A sampled RUM answer is retried, then refused` gotcha below, `src/cloudflare.js` (`rumSamplingProblem`), `scripts/backfill-rum.mjs` |
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | R2 bucket stats (storage, ops by billing class, cost estimate, objects read from the bucket), edge cache status | `src/r2.js` + `r2Bucket`/`r2Account` on a `SITES` row; checked by `scripts/r2-check.mjs` |
@@ -292,6 +293,25 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   attempts, 1.5s then 4s backoff) and never a real query error; `runDailyGuarded` writes an `ok=0` runs row
   (which feeds `/health` and the severity-1 `stale-pipeline` signal) and pushes a high-priority ntfy on any
   throw. Do not add a raw `fetch(GQL…)`; `scripts/gql-check.mjs` covers the retry rules.
+- **A sampled RUM answer is retried, then refused, never stored.** `rumPageloadEventsAdaptiveGroups` is
+  adaptive: Cloudflare can answer with a coarse sample, and every count is then a multiple of the sample
+  interval. (Inferred, not captured: the Worker's raw response on a bad night was never logged, so the first guarded
+  bad night's `runs` note is the confirmation.) The 2026-10-17 run stored `forum.objectivismonline.com` at exactly 18,000 visits, three hosts at
+  3,000/2,000/1,000 and eleven of seventeen sites at zero; earlier bad nights were 2026-09-21, 09-30, 10-06 and
+  10-12. Re-reading the same window later returned exact figures at interval ~1.00 (except 10-06, which
+  Cloudflare still serves at interval 10, so that night is unrecoverable). `pullTraffic` now asks for
+  `avg { sampleInterval }` on `totals`, judges each account with `rumSamplingProblem` (pageview-weighted interval
+  over `RUM_MAX_SAMPLE_INTERVAL` 1.5, or no rows from the primary account), retries from ONE shared budget of
+  `RUM_SAMPLING_RETRIES` (3, backed off 5/15/30 s; runDaily is at 46-47 of 50 subrequests, so never per account),
+  and on exhaustion returns `degraded`. `runDaily` then writes **no** RUM host (existing rows for the date are left
+  alone), notes it (`ok=0`, so `/health` and `stale-pipeline` fire), adds a line to the ntfy push and returns
+  `rumSkipped`; zone, R2, forum and Search Console data are still written. A stored RUM count that is a multiple of
+  100 or 1,000, or a RUM host at zero beside a live site, is this failure until proven otherwise. Do not "fix" it by
+  rounding, scaling by the interval, or loosening the threshold. Repair bad nights with `npm run backfill:rum`
+  (`scripts/backfill-rum.mjs`): it re-reads the windows read-only, applies the same guard, skips nights still
+  sampled, and writes a reviewable `.deploy/backfill-rum-*.sql` for you to apply in the D1 console or the MCP
+  connector. It never writes D1 itself (the deploy token has no D1 scope). `write-check.mjs` (part 1a') and
+  `gql-check.mjs` cover the guard.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and
   contributes nothing either way. A hop between a site's *own different* hostnames does start a

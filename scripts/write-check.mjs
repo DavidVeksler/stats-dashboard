@@ -27,6 +27,7 @@
 import worker, { D1_MAX_BATCH_STATEMENTS } from "../src/index.js";
 import { KEYWORD_ROW_LIMIT, QUERY_PAGE_ROW_LIMIT } from "../src/gsc.js";
 import { SITES, FORUMS, CF_ACCOUNTS } from "../src/config.js";
+import { RUM_SAMPLING_RETRIES } from "../src/cloudflare.js";
 import { bingUrlsOf } from "../src/bing.js";
 
 const BING_SITES = SITES.filter((s) => bingUrlsOf(s).length);
@@ -114,6 +115,12 @@ let failBing = null;
 // Set true around a `run()` to fail every R2 GraphQL request — see part 1d.
 let failR2 = false;
 
+// Sample interval the RUM stub reports (1 = Cloudflare's exact answer). Set high
+// around a `run()` to simulate the sampled answers behind the 2026-10-17 round
+// numbers — see part 1a'. `rumRequests` counts the RUM requests a run makes.
+let rumInterval = 1;
+let rumRequests = 0;
+
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input?.url ?? input);
@@ -173,8 +180,9 @@ globalThis.fetch = async (input, init = {}) => {
     if (body.query.includes("rumPageloadEventsAdaptiveGroups")) {
       // The three aliased groupings pullTraffic asks for (totals / refs / pages).
       const rum = SITES.filter((s) => s.trafficSource !== "zone");
+      rumRequests += 1;
       return json({ data: { viewer: { accounts: [{
-        totals: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host } })),
+        totals: rum.map((s) => ({ count: 40, sum: { visits: 20 }, avg: { sampleInterval: rumInterval }, dimensions: { requestHost: s.host } })),
         refs: rum.map((s) => ({ sum: { visits: 20 }, dimensions: { requestHost: s.host, refererHost: "www.google.com" } })),
         pages: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host, requestPath: "/" } })),
       }] } } });
@@ -517,6 +525,49 @@ const runBing = async (env) => {
     flat.some((s) => /DELETE FROM daily_r2_|INTO daily_r2_summary/.test(s.sql)), false);
   check("...while the zone tables are still written",
     flat.some((s) => s.sql.startsWith("INSERT INTO daily_zone_dims ")), true);
+}
+
+// ---- 1a'. A sampled RUM answer is retried, then refused, never stored ------
+// 2026-10-17 stored forum.objectivismonline.com at exactly 18,000 visits and eleven
+// of seventeen sites at zero: Cloudflare's adaptive RUM dataset had answered with a
+// coarse sample, and the pull wrote it as though it were exact. The guard reads
+// `avg { sampleInterval }`, retries from a small shared budget, and if the answer is
+// still sampled writes NO RUM host (leaving any existing rows for the date alone).
+{
+  const realTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn) => realTimeout(fn, 0);
+  try {
+    rumInterval = 1;
+    rumRequests = 0;
+    const clean = await run({ GSC_SA_KEY });
+    check("a healthy RUM answer is not retried: one request per account", rumRequests, CF_ACCOUNTS.length);
+    check("...and the run is not marked skipped", clean.result.rumSkipped, false);
+
+    rumInterval = 1000;
+    rumRequests = 0;
+    const { result, flat } = await run({ GSC_SA_KEY, NTFY_TOPIC: "check" });
+    rumInterval = 1;
+    check("a sampled RUM answer is retried from a bounded budget",
+      rumRequests, CF_ACCOUNTS.length + RUM_SAMPLING_RETRIES);
+    check("...and reported skipped", result.rumSkipped, true);
+    check("...as a note, so the run is not ok", result.notes.some((n) => n.startsWith("rum sampled")), true);
+    check("...writing no RUM traffic row",
+      flat.filter((s) => s.sql.startsWith("INSERT INTO daily_traffic")
+        && SITES.find((site) => site.host === s.binds[1])?.trafficSource !== "zone").length, 0);
+    check("...deleting no RUM referrer or page rows",
+      flat.filter((s) => /DELETE FROM daily_(referrers|cf_pages) /.test(s.sql)
+        && SITES.find((site) => site.host === s.binds[1])?.trafficSource !== "zone").length, 0);
+    check("...while zone hosts are still written",
+      flat.some((s) => s.sql.startsWith("INSERT INTO daily_traffic")
+        && SITES.find((site) => site.host === s.binds[1])?.trafficSource === "zone"), true);
+    check("...and Search Console data is still written",
+      flat.some((s) => s.sql.startsWith("INSERT INTO daily_query_pages")), true);
+    check("...and the stored run row is ok=0",
+      ran.some((s) => s.sql.includes("INTO runs") && s.binds[2] === 0 && /rum sampled/.test(s.binds[3])), true);
+  } finally {
+    rumInterval = 1;
+    globalThis.setTimeout = realTimeout;
+  }
 }
 
 // ---- 1b. A transient per-host GSC failure must not erase existing data ----
