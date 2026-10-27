@@ -79,7 +79,8 @@ or inspect the `runs` table in D1. `npm run dev` runs
 
 The Worker has three entry points in `src/index.js`:
 
-- **`scheduled`** (cron `0 13 * * *`) and **`GET /run?key=…`** both call `runDaily(env)`, which:
+- **`scheduled`** (cron `0 13 * * *`; a second cron `0 17 * * *` only retries after a RUM-sampling failure, see the
+  sampled-RUM gotcha) and **`GET /run?key=…`** both call `runDaily(env)`, which:
   1. `pullTraffic()` (`cloudflare.js`) → Cloudflare GraphQL → 24h visitors/referrers.
   2. `queryQueryPages()` (`gsc.js`) → Google Search Console → top (query, page) pairs, from which the
      per-query rows are **derived** (`summarizeQueryPages`) rather than fetched — see the query-to-page
@@ -312,7 +313,12 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   (`scripts/backfill-rum.mjs`): it re-reads the windows read-only, applies the same guard, skips nights still
   sampled, and writes a reviewable `.deploy/backfill-rum-*.sql` for you to apply in the D1 console or the MCP
   connector. It never writes D1 itself (the deploy token has no D1 scope). `write-check.mjs` (part 1a') and
-  `gql-check.mjs` cover the guard.
+  `gql-check.mjs` cover the guard. The in-run retries only span ~50 s, so a **second cron, `0 17 * * *`
+  (`RETRY_CRON`, `runRetryIfSampled` in `src/index.js`)** re-runs `runDailyGuarded` four hours later, and only
+  when the newest `runs` row is `ok=0` with a `rum sampled` note from the last 12 hours; a healthy run, a thrown
+  run or an older failure makes it a silent no-op (part 1a'' of `write-check.mjs`). Keep the string in
+  `wrangler.jsonc` identical to `RETRY_CRON`. A retry that is still sampled just adds another `ok=0` row; the
+  next 13:00 run starts clean. Nothing here changes the backfill advice for nights that stay sampled for days.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and
   contributes nothing either way. A hop between a site's *own different* hostnames does start a

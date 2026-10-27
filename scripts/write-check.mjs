@@ -230,7 +230,8 @@ const db = {
     // Reads: loadDashboard runs at the end of runDaily to pick the ntfy finding,
     // and an empty database is a valid answer for it.
     stmt.all = async () => ({ results: [] });
-    stmt.first = async () => null;
+    // `latestRun` stands in for the newest runs row; null (no row) everywhere else.
+    stmt.first = async () => (sql.includes("FROM runs") ? latestRun : null);
     stmt.run = async () => { ran.push(stmt); return { success: true }; };
     return stmt;
   },
@@ -239,6 +240,7 @@ const db = {
     return list.map(() => ({ success: true }));
   },
 };
+let latestRun = null;
 
 const run = async (env) => {
   seq = 0;
@@ -568,6 +570,42 @@ const runBing = async (env) => {
     rumInterval = 1;
     globalThis.setTimeout = realTimeout;
   }
+}
+
+// ---- 1a''. The retry cron re-runs only after a RUM-sampling failure --------
+// The in-run retries span ~50 s, so a sampled 13:00 run used to stay broken until a
+// manual refresh. The 17:00 cron pulls again, but only when the newest runs row is a
+// recent ok=0 "rum sampled" one; every other state must be a no-op.
+{
+  const { readFileSync } = await import("node:fs");
+  const { RETRY_CRON } = await import("../src/index.js");
+  const wrangler = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+  check("wrangler.jsonc schedules the retry cron", wrangler.includes(`"${RETRY_CRON}"`), true);
+  check("...beside the nightly one", wrangler.includes('"0 13 * * *"'), true);
+
+  const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+  const sampled = (h) => ({ run_at: hoursAgo(h), ok: 0,
+    note: "rum sampled by Cloudflare, traffic rows not written: 556c237b: sample interval 100.0" });
+  const fire = async (cron, row) => {
+    seq = 0; batches = []; ran = []; fetchLog = [];
+    latestRun = row;
+    let pending;
+    await worker.scheduled({ cron }, { DB: db, REFRESH_KEY: "k", CF_API_TOKEN: "cf" },
+      { waitUntil: (p) => { pending = p; } });
+    await pending;
+    latestRun = null;
+    return fetchLog.length > 0 || batches.length > 0;
+  };
+
+  check("a recent sampled failure is retried", await fire(RETRY_CRON, sampled(4)), true);
+  check("a healthy last run is left alone",
+    await fire(RETRY_CRON, { run_at: hoursAgo(4), ok: 1, note: "" }), false);
+  check("a failure for another reason is left alone (it already pushed its own alert)",
+    await fire(RETRY_CRON, { run_at: hoursAgo(4), ok: 0, note: "runDaily threw: boom" }), false);
+  check("a stale sampled failure from a previous day is left alone", await fire(RETRY_CRON, sampled(20)), false);
+  check("no runs row at all is a no-op", await fire(RETRY_CRON, null), false);
+  check("the nightly cron still runs unconditionally",
+    await fire("0 13 * * *", { run_at: hoursAgo(4), ok: 1, note: "" }), true);
 }
 
 // ---- 1b. A transient per-host GSC failure must not erase existing data ----

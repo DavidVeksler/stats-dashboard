@@ -30,8 +30,12 @@
   // (.github/workflows/bing-pull.yml, scripts/bing-pull.mjs) that POSTs
   // results to this Worker's /ingest-bing endpoint instead -- see the note on
   // runBingDaily in src/index.js.
+  //
+  // The 17:00 UTC cron is a conditional retry (RETRY_CRON in src/index.js): it
+  // re-runs the pull only when the latest run was ok=0 from Cloudflare sampling
+  // the RUM data, and does nothing otherwise. Keep the two strings identical.
   "triggers": {
-    "crons": ["0 13 * * *"]
+    "crons": ["0 13 * * *", "0 17 * * *"]
   },
 
   // Serve the dashboard from the custom domain.

@@ -936,6 +936,26 @@ async function runDailyGuarded(env) {
   }
 }
 
+// The second cron (`RETRY_CRON`, four hours after the nightly one). Cloudflare's
+// sampled-RUM answers are transient, but the in-run retries only span about 50
+// seconds, so a sampled 13:00 run used to leave the page without traffic until
+// someone ran `npm run refresh`. This re-runs the pull only when the latest `runs`
+// row is a recent RUM-sampling failure; any other state (a healthy run, a thrown
+// run, a manual /run that already healed it) is a quiet no-op, because repeating a
+// pull that did not fail for this reason would only spend subrequests and re-push.
+// The runs row is keyed on time, so a retry that is still sampled just adds another
+// ok=0 row and the next day's 13:00 run starts clean.
+export const RETRY_CRON = "0 17 * * *";
+const RETRY_MAX_AGE_MS = 12 * 3600 * 1000;
+
+async function runRetryIfSampled(env, now = new Date()) {
+  const row = await env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first();
+  const age = row ? now.getTime() - new Date(row.run_at).getTime() : Infinity;
+  const sampled = row && Number(row.ok) === 0 && /rum sampled/.test(row.note ?? "") && age <= RETRY_MAX_AGE_MS;
+  if (!sampled) return { retried: false };
+  return { retried: true, result: await runDailyGuarded(env) };
+}
+
 // ---- Read from D1 and render ---------------------------------------------
 // Cards are laid out domain-first: every host of a registrable domain sits in
 // one run, the runs are ordered by the domain's own popularity, and hosts are
@@ -1851,7 +1871,7 @@ export default {
   // replacement — it fetches from outside Cloudflare and POSTs the results to
   // /ingest-bing.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDailyGuarded(env));
+    ctx.waitUntil(event.cron === RETRY_CRON ? runRetryIfSampled(env) : runDailyGuarded(env));
   },
 
   async fetch(request, env) {
