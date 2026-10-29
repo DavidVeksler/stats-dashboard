@@ -1,217 +1,196 @@
-// Separating crawler floods from human traffic.
+// Keeping crawlers out of the RUM session counts.
 //
 // We deliberately do NOT block crawlers (the sites opt into AI training via
 // Content-Signal). The problem is purely one of measurement: a headless-Chrome
 // crawler fires the RUM beacon exactly like a person does, so Cloudflare counts
-// it as a session and the dashboard's headline numbers become fiction.
+// it as a session. Cloudflare's own `bot` dimension on the RUM dataset is 0 for
+// all of it (checked 2026-10-29: 165,575 of 165,575 wiki.freecapitalists.org
+// sessions).
 //
-// The signature comes from the Aug 2026 floods (forum.objectivismonline.com,
-// wiki.freecapitalists.org, freecapitalists.org): every "session" was a single
-// pageview with no referrer, sustained for days, spread across thousands of URLs.
-// Any one of those traits alone is normal — a viral link is direct and spiky, a
-// single-page site is flat — so we require all of them together plus volume.
-
-export const FLOOD_MIN_VISITS = 500;   // below this, a "flood" is indistinguishable from noise
-export const FLOOD_MULTIPLE = 3;       // ...and must be this many times a normal day
-// How far back classifyTraffic's caller reads to find clean-baseline candidate
-// days — independent of the 14/30-day windows the rest of the dashboard uses.
-// A flood that runs long enough to dominate whatever window it's judged against
-// makes its own baseline: forum.objectivismonline.com ran flooded (2,300-56,000
-// visits/day against a true ~600-800/day baseline) for 26 of the 30 days in the
-// then-current window, so both the median-of-clean-days path (too few clean days
-// left) and the 25th-percentile-of-everything fallback (built from the same
-// flood) were computed from flood days, and the flood went undetected from
-// 2026-08-19 onward even though nothing about its shape had changed. Reaching
-// back further finds the 12+ genuinely clean days near project inception that a
-// fixed 30-day window had already aged out. Cheap to widen: these are one row a
-// day per host (daily_traffic) plus a handful per host (daily_referrers grouped
-// by kind), nothing like the per-keyword cost KEYWORD_ROW_LIMIT guards against.
-export const BASELINE_LOOKBACK_DAYS = 180;
-// Exported so the footer prose that explains these rules can interpolate them
-// rather than restate them as literals that drift out of sync with the code.
-// Was 1.15 (single-hit crawlers only) until forum.objectivismonline.com's
-// sustained flood — flagged correctly for 13 straight days (2026-08-15 through
-// -27) — shifted its own crawl pattern on 2026-08-28: pagesPerSession jumped
-// from ~1.0 to ~2.08 (still ≥99.9% direct, still ~10-26x the host's true
-// baseline) and slipped under the old cap, so the whole day flipped back to
-// "human" the moment the bot's own request shape changed mid-event. Raised
-// with margin above that observed value; direct share ≥ DIRECT_SHARE and
-// volume ≥ FLOOD_MIN_VISITS/FLOOD_MULTIPLE are what actually carry the
-// signal here — a real human traffic spike essentially never arrives ≥90%
-// direct at flood volume, so this cap only needs to separate "one hit and
-// gone" / "a couple of pages and gone" crawling from genuinely deep browsing.
-export const FLAT_PAGES_PER_SESSION = 3.0;
-export const DIRECT_SHARE = 0.9;              // crawlers send no referer
-// Minimum clean days (see directRatioStats) needed before a flooded day's direct
-// bucket gets a ratio estimate instead of the floor-only split. This gates on
-// data availability, not on how tight the ratio turns out to be — the spread
-// carried alongside every estimate is what communicates trustworthiness, so
-// there is deliberately no second gate on CV. Below this count the ratio is
-// too thin to trust at all (a two-point median has no real spread to report),
-// so splitDay falls back to floor-only rather than showing a number.
-export const RATIO_MIN_CLEAN_DAYS = 5;
-
-const quantile = (sorted, q) =>
-  sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))] : 0;
-
-// Build per-host, per-day traffic shape and mark the crawler-flooded days.
+// THE RULES: a RUM session counts only when (1) its browser is CURRENT, meaning
+// its major version is within BROWSER_LAG of the newest version real visitors of
+// that browser family are using, and (2) it is not part of a direct-only desktop
+// segment (isDirectOnlySegment, below), which is how a crawler sending a current
+// version shows itself. Everything else is "automated" and is reported beside
+// the count, never inside it.
 //
-// trafficRows:  { date, host, visits, views }     from daily_traffic
-// referrerRows: { date, host, kind, visits }      from daily_referrers, grouped by kind
+// Why this and not the old flood classifier. The old rule judged whole
+// site-days by shape (>=90% direct, flat pages/session) against a baseline of
+// the host's own "normal" days. Every way that can fail, it did: a flood that
+// lasts long enough becomes its own baseline (wiki.freecapitalists.org stored
+// 165,832 "human sessions" on 2026-10-29 at 1.0 pages/session), a crawler that
+// changes its click depth slips under the shape cap, and a day is either all
+// crawler or all human, so the page filled with floors, ratio estimates and
+// margins. The browser rule needs no history and no baseline, judges sessions
+// rather than days, and is exact for every session it counts.
 //
-// Returns Map<host, Map<date, day>> where day carries { visits, views, direct,
-// directShare, pagesPerSession, signature, baseline, flood }.
-export function classifyTraffic(trafficRows, referrerRows) {
-  const byHost = new Map();
-  for (const row of trafficRows ?? []) {
-    if (!byHost.has(row.host)) byHost.set(row.host, new Map());
-    byHost.get(row.host).set(row.date, {
-      date: row.date,
-      visits: Number(row.visits || 0),
-      views: Number(row.views || 0),
-      direct: 0,
-    });
+// Why browser age works. Chrome, Edge, Firefox and Safari update themselves, so
+// a real visitor is almost always on one of the last two or three releases.
+// Crawler fleets rotate through a fixed list of user agents that goes stale:
+// on 2026-10-29 (newest Chrome 156) the wiki fleet spread 165k sessions evenly
+// over Chrome 103-151, forum.objectivismonline.com's crawler sat on Chrome
+// 142/145/153 and on a uniform ChromeMobile 147-151 run, and the aocr.org
+// referral bot on walletrecovery.info used Chrome 146. Measured the same day:
+// lag 2 kept 8 of 165,647 wiki sessions, 160 of 6,499 on the forum, and 67 of
+// 161 on walletrecovery.info (whose real Google/Facebook/Reddit visitors were on
+// 154-156); lag 3 let the forum's Chrome 153 crawler back in (+228) and lag 4
+// let 2,700 wiki crawler sessions through on Chrome 152.
+//
+// What it costs. A real person on an out-of-date browser (an unpatched
+// corporate machine, an old phone that stopped getting updates) is not
+// counted. That is a few percent of real traffic, it is the same few percent
+// every day, so trends are unaffected, and the page says the count is "current
+// browsers". A crawler that sends a current user agent is the second rule's job;
+// one small enough to slip under SEGMENT_MIN_VISITS still counts, and the
+// `likely-bot-spike` signal is the alarm for that.
+
+// How many major versions behind the newest a browser may be and still count.
+export const BROWSER_LAG = 2;
+// The newest version of a family is the highest major version holding at least
+// this share (and at least NEWEST_MIN_SESSIONS) of that family's REFERRED
+// sessions estate-wide over the last EVIDENCE_DAYS. Referred sessions, because
+// a crawler mostly arrives direct, so this is the population least shaped by
+// crawler user agents; the highest qualifying version, not the most common,
+// because a referral bot on a stale version (aocr.org's Chrome 146 held more
+// referred sessions than Chrome 156 that day) must not drag the floor down; and
+// a share floor, so a handful of beta, dev or forged future versions (Chrome
+// Mobile "443"/"444" showed up) cannot push it up.
+export const NEWEST_MIN_SHARE = 0.05;
+export const NEWEST_MIN_SESSIONS = 3;
+export const EVIDENCE_DAYS = 7;
+// One release ahead of the newest is still counted: during a rollout the new
+// version is real but has not yet reached NEWEST_MIN_SHARE.
+export const BROWSER_LEAD = 1;
+
+// Apple renumbered Safari from 18 straight to 26 in 2025, so 18 is the release
+// before 26, not eight behind it. Mapping 18 and below up by 7 keeps "major
+// versions behind" meaning releases behind.
+const APPLE_RENUMBER = { last: 18, offset: 7 };
+const APPLE_FAMILIES = new Set(["Safari", "MobileSafari"]);
+
+// A browser version string as a comparable major release number, or null when
+// there is none ("", "Unknown", junk). A family with no version is never counted.
+export function browserMajor(browser, version) {
+  const major = Number.parseInt(String(version ?? "").split(".")[0], 10);
+  if (!Number.isFinite(major) || major <= 0) return null;
+  return APPLE_FAMILIES.has(browser) && major <= APPLE_RENUMBER.last ? major + APPLE_RENUMBER.offset : major;
+}
+
+// One family label can carry two unrelated version series. Cloudflare reports
+// Chrome on iOS and the Google app both as "ChromeMobile", the first with
+// Chrome's version (156) and the second with the app's own (GSA 443/444, real
+// Google-referred visitors). Versions more than SERIES_GAP apart are treated as
+// separate series, each with its own newest version. Chrome's own history is
+// one series: every release between a stale crawler user agent and today's is
+// somewhere in the evidence, so nothing in 1xx is ever that far from a neighbour.
+export const SERIES_GAP = 50;
+// Cloudflare could not parse the user agent, so there is no version to judge.
+// Never counted; the forum's crawler sent 37 sessions a day this way.
+export const UNCOUNTED_FAMILIES = new Set(["Unknown"]);
+
+// rows: { browser, version, visits } of referred sessions. Returns
+// Map<browser, [{ newest, evidence }]>, one entry per version series (see
+// SERIES_GAP), where evidence is that series' referred session count. A family
+// or series with too little evidence to name a newest version is absent, and
+// absent means none of its sessions count — failing closed, since a browser
+// nobody is referred from is not one real visitors are using.
+export function currentBrowsers(rows) {
+  const families = new Map();
+  for (const row of rows ?? []) {
+    if (UNCOUNTED_FAMILIES.has(row.browser)) continue;
+    const major = browserMajor(row.browser, row.version);
+    const visits = Number(row.visits || 0);
+    if (major == null || visits <= 0) continue;
+    const fam = families.get(row.browser) ?? new Map();
+    fam.set(major, (fam.get(major) ?? 0) + visits);
+    families.set(row.browser, fam);
   }
-  for (const row of referrerRows ?? []) {
-    if (row.kind !== "direct") continue;
-    const day = byHost.get(row.host)?.get(row.date);
-    if (day) day.direct += Number(row.visits || 0);
-  }
-
-  for (const days of byHost.values()) {
-    const all = [...days.values()];
-    for (const day of all) {
-      day.nonDirect = Math.max(0, day.visits - day.direct);
-      day.pagesPerSession = day.visits ? day.views / day.visits : 0;
-      day.directShare = day.visits ? day.direct / day.visits : 0;
-      // Shape only — deliberately volume-free, so the baseline below can be built
-      // from the days that fail this test without reasoning in a circle.
-      day.signature = day.visits > 0 &&
-        day.pagesPerSession > 0 && day.pagesPerSession <= FLAT_PAGES_PER_SESSION &&
-        day.directShare >= DIRECT_SHARE;
+  const current = new Map();
+  for (const [browser, majors] of families) {
+    const ascending = [...majors.entries()].sort((a, b) => a[0] - b[0]);
+    const series = [];
+    for (const entry of ascending) {
+      const last = series.at(-1);
+      if (last && entry[0] - last.at(-1)[0] <= SERIES_GAP) last.push(entry);
+      else series.push([entry]);
     }
-    // Normal days set the bar for what "normal" means. When a flood runs long
-    // enough that too few clean days remain, fall back to the 25th percentile of
-    // everything: a median would by then be half-built from flood days and would
-    // quietly bless the flood as the new baseline. That is exactly how the
-    // forum.objectivismonline.com flood went unflagged for eight days.
-    const cleanVisits = all.filter((day) => !day.signature).map((day) => day.visits).sort((a, b) => a - b);
-    const allVisits = all.map((day) => day.visits).sort((a, b) => a - b);
-    const baseline = cleanVisits.length >= 3 ? quantile(cleanVisits, .5) : quantile(allVisits, .25);
-    for (const day of all) {
-      day.baseline = baseline;
-      day.flood = day.signature && day.visits >= FLOOD_MIN_VISITS &&
-        day.visits >= Math.max(baseline, 1) * FLOOD_MULTIPLE;
+    const found = [];
+    for (const run of series) {
+      const evidence = run.reduce((sum, [, n]) => sum + n, 0);
+      const floor = Math.max(NEWEST_MIN_SESSIONS, evidence * NEWEST_MIN_SHARE);
+      const top = [...run].reverse().find(([, n]) => n >= floor);
+      if (top) found.push({ newest: top[0], evidence });
     }
+    if (found.length) current.set(browser, found);
   }
-  return byHost;
+  return current;
 }
 
-// A host's typical direct/referred visit ratio on its own clean (non-flood-
-// shaped) days, for estimating how much of a flooded day's direct bucket was
-// still human instead of discarding it outright.
-//
-// Built once per host over every clean day `classified` has in view, not per
-// call to splitDay — the estimate needs the host's whole clean-day history, not
-// just the one day being split. median/MAD for the same reason the flood
-// baseline uses them (see the comment on `baseline` above): a handful of
-// high-traffic clean days should not dominate a ratio meant to describe an
-// ordinary one, and MAD stays meaningful even when the ratio series itself has
-// a fat-tailed outlier.
-//
-// Returns null when there is not enough clean-day history to trust a ratio at
-// all — callers must treat that as "no estimate available", not as a ratio of
-// zero.
-export function directRatioStats(classified, host) {
-  const days = classified.get(host);
-  if (!days) return null;
-  const ratios = [...days.values()]
-    .filter((day) => !day.signature && day.nonDirect > 0)
-    .map((day) => day.direct / day.nonDirect)
-    .sort((a, b) => a - b);
-  if (ratios.length < RATIO_MIN_CLEAN_DAYS) return null;
-  const median = quantile(ratios, .5);
-  const mad = quantile(ratios.map((r) => Math.abs(r - median)).sort((a, b) => a - b), .5);
-  return { median, mad, sampleDays: ratios.length };
+export function isCurrentBrowser(current, browser, version) {
+  const major = browserMajor(browser, version);
+  if (major == null) return false;
+  return (current?.get(browser) ?? []).some(({ newest }) =>
+    major >= newest - BROWSER_LAG && major <= newest + BROWSER_LEAD);
 }
 
-// Split one classified day into the part that is still creditable to people and
-// the part that is crawler noise.
-//
-// A flooded day used to be discarded whole, which zeroed out an entire site card
-// whenever the only day in view was flooded. But the flood test is largely a test
-// for *direct* traffic (>=90% of sessions carry no referer, because that is how
-// crawlers arrive), so the referred sessions on a flooded day are still a real,
-// measured human signal — a referral from Google or Reddit is not something the
-// crawler produces. Those sessions are reported as a floor ("at least N").
-//
-// What genuinely cannot be recovered by counting is the direct bucket, where the
-// crawler and real direct visitors are mixed beyond separation, and pageviews,
-// which carry no referer dimension at all. Pageviews stay a hard floor always.
-// The direct bucket gets a second option: when `ratioStats` carries enough
-// clean-day history for this host (see directRatioStats), estimate the human
-// share of it as referred x that host's own typical direct/referred ratio,
-// capped at the day's actual direct count so the estimate can never claim more
-// direct humans than there were total direct visits. This is a deliberate,
-// bounded exception to "never interpolate": it is not filling in a number with
-// no basis, it is asking what this specific host's own referred traffic implies
-// about its direct traffic on an ordinary day, and it always ships with a
-// `spread` so the estimate is never presented with more precision than it has.
-// Without enough history, or without a ratioStats argument at all, this falls
-// back to the original floor-only split — existing callers that omit the second
-// argument keep exactly the old behavior.
-export function splitDay(day, ratioStats = null) {
-  if (!day) return { human: 0, crawler: 0, views: 0, crawlerViews: 0, partial: false, estimated: false, spread: 0, estimatedDirect: 0 };
-  if (!day.flood) {
-    return { human: day.visits, crawler: 0, views: day.views, crawlerViews: 0, partial: false, estimated: false, spread: 0, estimatedDirect: 0 };
+// SECOND RULE: a crawler that sends a current browser version. The browser rule
+// cannot see one, and on 2026-10-22..28 one ran on forum.objectivismonline.com:
+// Chrome 156, split evenly across macOS, Windows and Linux (777/753/753 sessions
+// on 10-25), 99-100% direct, flat over the day. It shows up as a SEGMENT —
+// (host, browser, version, OS) over the night — that is large and almost
+// entirely direct. Measured over those eight nights, every crawler segment was
+// 50-777 sessions at >=99% direct, and no real segment of 25+ sessions was above
+// 93% direct (the most direct ones were iPhone readers of cheatsheets at 79-92%
+// and forum regulars at 87-93%). Pages per session does NOT separate them: the
+// crawler's Linux segment ran 1.00-1.64. So the test is volume plus direct
+// share, per segment, desktop operating systems only (iOS and Android apps strip
+// referrers from real people, and no crawler seen so far claimed a phone). The
+// whole segment is set aside, including its 0-1% referred sessions.
+export const SEGMENT_MIN_VISITS = 50;
+export const SEGMENT_DIRECT_SHARE = 0.97;
+export const DESKTOP_OS = new Set(["Windows", "MacOSX", "Linux", "ChromeOS"]);
+
+export function isDirectOnlySegment({ os, visits, direct }) {
+  const v = Number(visits || 0);
+  return DESKTOP_OS.has(os) && v >= SEGMENT_MIN_VISITS && Number(direct || 0) / v >= SEGMENT_DIRECT_SHARE;
+}
+
+// Flagged segments as GraphQL filter clauses to AND onto the counted query: one
+// "not this segment" per flagged segment, written as an OR of _neq conditions
+// (the API has no NOT). Same shape as the excludePaths clauses in cloudflare.js.
+export function segmentExclusions(segments) {
+  return (segments ?? []).map((seg) => ({ OR: [
+    { requestHost_neq: seg.rawHost }, { userAgentBrowser_neq: seg.browser },
+    { browserVersion_neq: seg.version }, { userAgentOS_neq: seg.os },
+  ] }));
+}
+
+// The exact (browser, version-string) pairs that count, as a Cloudflare GraphQL
+// filter clause list for `OR`. Built from the census of version strings actually
+// seen in the same window, so a counted session cannot carry a string the
+// filter lacks. Empty when nothing counts; the caller must not send an empty OR.
+export function countedBrowserClauses(current, censusRows) {
+  const byBrowser = new Map();
+  for (const row of censusRows ?? []) {
+    if (!isCurrentBrowser(current, row.browser, row.version)) continue;
+    const versions = byBrowser.get(row.browser) ?? new Set();
+    versions.add(String(row.version));
+    byBrowser.set(row.browser, versions);
   }
-  if (ratioStats) {
-    const estimatedDirect = Math.round(Math.min(day.direct, day.nonDirect * ratioStats.median));
-    const human = day.nonDirect + estimatedDirect;
-    // Clamped into [nonDirect, visits] — the measured floor and the measured
-    // total — so the displayed range can never claim more certainty than the
-    // hard counts on either side of it.
-    const spread = Math.round(Math.min(day.nonDirect * ratioStats.mad,
-      human - day.nonDirect, day.visits - human));
-    return { human, crawler: day.visits - human, views: 0, crawlerViews: day.views,
-      partial: true, estimated: true, spread, estimatedDirect };
-  }
-  return { human: day.nonDirect, crawler: day.visits - day.nonDirect, views: 0,
-    crawlerViews: day.views, partial: true, estimated: false, spread: 0, estimatedDirect: 0 };
-}
-
-// Human-readable explanation for a flooded day, for the card callout.
-export function floodReason(day, ratioStats = null) {
-  if (!day?.flood) return null;
-  const shape = `${Math.round(day.directShare * 100)}% direct, ${day.pagesPerSession.toFixed(1)} pages/session, ` +
-    `${Math.round(day.visits / Math.max(day.baseline, 1))}x a normal day`;
-  if (!ratioStats) return shape;
-  return `${shape} — direct bucket estimated from ${ratioStats.sampleDays} clean days`;
-}
-
-// Dates (per host) that were crawler-flooded, for filtering referrer and
-// landing-page rows so the detail panels agree with the headline numbers.
-export function floodDates(classified, host) {
-  const days = classified.get(host);
-  if (!days) return new Set();
-  return new Set([...days.values()].filter((day) => day.flood).map((day) => day.date));
+  return [...byBrowser].sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([browser, versions]) => ({ userAgentBrowser: browser, browserVersion_in: [...versions].sort() }));
 }
 
 // ---- Zone-sourced hosts: the same problem, a different instrument ---------
 //
-// Everything above runs on RUM sessions and cannot fire on a zone-sourced host
-// at all. `classifyTraffic` derives `directShare` from daily_referrers rows, and
-// the zone log carries no referer dimension, so a zone host writes none: direct
-// is always 0, `signature` is always false, and no volume whatever can flag the
-// day. Left there, every crawler fetch of /robots.txt would flow into the page
-// as a human arrival by implication. `crawlerAccounting` is the routing that
-// stops that, and the two summaries below are what a zone host gets instead of
-// a flood verdict.
-//
-// Neither of them ever produces a human figure, and there is no field here from
-// which one could be subtracted out. That is deliberate — see summarizeVerifiedBots.
+// The browser rule above needs a user agent, and the zone log on this plan
+// exposes none (clientRequestUserAgent is not a dimension; botScore is
+// plan-gated). `crawlerAccounting` routes a zone host to the two summaries
+// below instead, and neither of them ever produces a human figure: there is no
+// field here from which one could be subtracted out. That is deliberate — see
+// summarizeVerifiedBots.
 export function crawlerAccounting(site) {
-  return site?.measurement === "zone" || site?.zoneSourced ? "zone" : "flood";
+  return site?.measurement === "zone" || site?.zoneSourced ? "zone" : "browser";
 }
 
 // Cloudflare labels the empty verifiedBotCategory nothing at all; we name it, so

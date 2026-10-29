@@ -69,7 +69,7 @@ export const SITES = [
     // probe. 2026-09-28/29: 3,135 of 3,141 "sessions" referred by www.aocr.org
     // (a radiology society site, 1-8/day before 09-24) landed on it, all desktop
     // Chrome on Windows, one pageview each, plus 761 more with no referer. That
-    // flood is invisible to the flood classifier because it arrives as
+    // flood was invisible to the old flood classifier because it arrives as
     // "referral", not "direct". Dropped at the query so sessions, views and the
     // referrer list reflect readers.
     excludePaths: ["/index.php"],

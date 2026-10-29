@@ -1,41 +1,61 @@
 import { CF_ACCOUNTS, HOST_ALIASES, EXCLUDE_PATHS, classifyReferrer } from "./config.js";
-import { UNVERIFIED_CATEGORY } from "./bots.js";
+import { UNVERIFIED_CATEGORY, EVIDENCE_DAYS, currentBrowsers, isCurrentBrowser, countedBrowserClauses,
+  isDirectOnlySegment, segmentExclusions } from "./bots.js";
 
 const GQL = "https://api.cloudflare.com/client/v4/graphql";
 
 // Per-grouping row cap on the RUM dataset.
 export const RUM_ROW_LIMIT = 5000;
 
-// Three groupings of the same dataset in ONE request (GraphQL aliases), so the
-// split costs no extra subrequests — runDaily sits near the 50-per-invocation
-// ceiling.
+// The RUM pull is TWO requests, each covering every account at once (one
+// `accounts(filter: { accountTag })` alias per account), never one per account.
 //
-// This used to be a single `refererHost x requestHost x requestPath` grouping,
-// capped at 5,000 rows and ordered by pageviews across EVERY host in the
-// account. A crawler flood (direct hits spread over many paths) filled that
-// budget and pushed out the small referred rows: on 2026-09-24
-// cheatsheets.davidveksler.com stored no referrers at all against Cloudflare's
-// own 44 Google + 17 Bing sessions, and because visits were summed from the same
-// truncated rows, the day read as 100% direct and the card had no human figure.
-// Each grouping below carries only the dimensions its consumer needs:
-//   totals: per host — exact visits/views
-//   refs:   per (host, referrer) — no path dimension to explode it
-//   pages:  per (host, path), ranked by landing sessions — the one a flood can
-//           still fill; pullTraffic reports which groupings hit the cap.
-// Per-host EXCLUDE_PATHS go into the shared filter as
-// `OR: [{ requestHost_neq }, { requestPath_notin }]`, since two of the three
-// groupings have no path to drop rows on after the fact.
-const QUERY = `query Rum($account: String!, $filter: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!) {
+// 1. CENSUS. Per account, `census` counts every session by (host, browser,
+//    version, OS) over the window, `censusDirect` the direct ones by the same
+//    dimensions, and `evidence` counts REFERRED sessions by (browser, version)
+//    over the last EVIDENCE_DAYS. `evidence` names the newest version real
+//    visitors use (currentBrowsers in bots.js); the census then splits each host
+//    into counted sessions and automated ones — a stale browser, or a
+//    direct-only desktop segment (isDirectOnlySegment) — exactly, and lists the
+//    version strings that count.
+// 2. COUNTED. The same window filtered server-side to those counted (browser,
+//    version) pairs, minus the direct-only segments, grouped two ways:
+//      refs:  per (host, referrer)
+//      pages: per (host, path), ranked by landing sessions
+//    Filtering in the query, not after it, is the point: a crawler spreads one
+//    session over each of 100,000+ paths, and unfiltered it fills the 5,000-row
+//    cap before a single real landing page is ranked.
+//
+// Two subrequests where there used to be four (one per account), so the
+// census costs nothing out of runDaily's 50-per-invocation budget.
+const CENSUS_QUERY = (accounts) => `query RumCensus($filter: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!, $direct: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!, $evidence: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!) {
   viewer {
-    accounts(filter: { accountTag: $account }) {
-      totals: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [count_DESC]) {
+${accounts.map((account, i) => `    a${i}: accounts(filter: { accountTag: "${account}" }) {
+      census: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [count_DESC]) {
         count
         sum { visits }
         avg { sampleInterval }
-        dimensions { requestHost }
+        dimensions { requestHost userAgentBrowser browserVersion userAgentOS }
       }
-      refs: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
+      censusDirect: rumPageloadEventsAdaptiveGroups(filter: $direct, limit: ${RUM_ROW_LIMIT}, orderBy: [count_DESC]) {
         sum { visits }
+        dimensions { requestHost userAgentBrowser browserVersion userAgentOS }
+      }
+      evidence: rumPageloadEventsAdaptiveGroups(filter: $evidence, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
+        sum { visits }
+        dimensions { userAgentBrowser browserVersion }
+      }
+    }`).join("\n")}
+  }
+}`;
+
+const COUNTED_QUERY = (accounts) => `query RumCounted($filter: AccountRumPageloadEventsAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+${accounts.map((account, i) => `    a${i}: accounts(filter: { accountTag: "${account}" }) {
+      refs: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
+        count
+        sum { visits }
+        avg { sampleInterval }
         dimensions { requestHost refererHost }
       }
       pages: rumPageloadEventsAdaptiveGroups(filter: $filter, limit: ${RUM_ROW_LIMIT}, orderBy: [sum_visits_DESC]) {
@@ -43,7 +63,7 @@ const QUERY = `query Rum($account: String!, $filter: AccountRumPageloadEventsAda
         sum { visits }
         dimensions { requestHost requestPath }
       }
-    }
+    }`).join("\n")}
   }
 }`;
 
@@ -140,51 +160,108 @@ export function rumSamplingProblem(rows, expectTraffic) {
   return interval > RUM_MAX_SAMPLE_INTERVAL ? `sample interval ${interval.toFixed(1)}` : null;
 }
 
+// One aliased request over every account, retried while Cloudflare answers with
+// a sampled result. `judge(account)` returns the rows the sampling guard weighs.
+// Retries come out of the shared `budget` ({ left }) so one pullTraffic call
+// spends at most RUM_SAMPLING_RETRIES extra subrequests across both requests.
+async function rumRequest(env, query, variables, label, judge, budget, backoffMs) {
+  for (let attempt = 0; ; attempt++) {
+    const body = await gqlPost(env, { query, variables }, label);
+    const accounts = CF_ACCOUNTS.map((_, i) => body.data?.viewer?.[`a${i}`]?.[0] ?? {});
+    const degraded = [];
+    accounts.forEach((acct, i) => {
+      const problem = rumSamplingProblem(judge(acct), i === 0);
+      if (problem) degraded.push(`${CF_ACCOUNTS[i].slice(0, 8)}: ${problem}`);
+    });
+    if (!degraded.length || budget.left <= 0) return { accounts, degraded };
+    budget.left -= 1;
+    await new Promise((r) => setTimeout(r, backoffMs[Math.min(attempt, backoffMs.length - 1)]));
+  }
+}
+
 // Pull the last-24h RUM rows from every account and merge by requestHost.
-// Returns { hosts, truncated, degraded } where hosts is
-// Map<host, { views, visits, referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>
-// truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT, and
-// degraded lists "account: reason" for every account still sampled after the retry
-// budget (see the sampling guard above). When degraded is non-empty `hosts` holds
-// nothing worth writing and the caller must not store it.
+// Returns { hosts, truncated, degraded, browsers, segments } where hosts is
+// Map<host, { views, visits, automatedVisits, automatedViews,
+//             referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>.
+// visits/views/referrers/pages are COUNTED sessions only (current browsers, see
+// bots.js); automated* is everything the two rules set aside. `browsers` is the
+// newest version per family the rule used, and `segments` the direct-only
+// desktop segments set aside, both for the runs note and the page.
+// truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT,
+// and degraded lists "account: reason" for every account still sampled after
+// the retry budget (see the sampling guard above), or a reason the rule could
+// not run at all. When degraded is non-empty `hosts` holds nothing worth
+// writing and the caller must not store it.
 export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLING_RETRIES, backoffMs = RUM_SAMPLING_BACKOFF_MS } = {}) {
   const hosts = new Map();
   const truncated = [];
-  const degraded = [];
-  let retriesLeft = retries;
+  const budget = { left: retries };
   const filter = rumFilter(startISO, endISO);
+  const evidenceStart = new Date(new Date(endISO).getTime() - EVIDENCE_DAYS * 86400e3).toISOString();
+  const evidence = { ...rumFilter(evidenceStart, endISO), refererHost_neq: "" };
   const recFor = (host) => {
     let rec = hosts.get(host);
-    if (!rec) hosts.set(host, rec = { views: 0, visits: 0, referrers: new Map(), pages: new Map() });
+    if (!rec) hosts.set(host, rec = { views: 0, visits: 0, automatedViews: 0, automatedVisits: 0,
+      referrers: new Map(), pages: new Map() });
     return rec;
   };
+  const noteTruncation = (accounts, names) => accounts.forEach((acct, i) => {
+    for (const name of names) {
+      if ((acct[name]?.length ?? 0) >= RUM_ROW_LIMIT) truncated.push(`${CF_ACCOUNTS[i].slice(0, 8)}/${name}`);
+    }
+  });
 
-  for (const [index, account] of CF_ACCOUNTS.entries()) {
-    let acct, problem;
-    for (let attempt = 0; ; attempt++) {
-      const body = await gqlPost(env, { query: QUERY, variables: { account, filter } }, `RUM ${account}`);
-      acct = body.data?.viewer?.accounts?.[0] ?? {};
-      problem = rumSamplingProblem(acct.totals ?? [], index === 0);
-      if (!problem || retriesLeft <= 0) break;
-      retriesLeft -= 1;
-      await new Promise((r) => setTimeout(r, backoffMs[Math.min(attempt, backoffMs.length - 1)]));
-    }
-    if (problem) {
-      degraded.push(`${account.slice(0, 8)}: ${problem}`);
-      continue;
-    }
-    for (const name of ["totals", "refs", "pages"]) {
-      if ((acct[name]?.length ?? 0) >= RUM_ROW_LIMIT) truncated.push(`${account.slice(0, 8)}/${name}`);
-    }
+  // 1. Census + evidence.
+  const census = await rumRequest(env, CENSUS_QUERY(CF_ACCOUNTS), { filter, direct: { ...filter, refererHost: "" }, evidence }, "RUM census",
+    (acct) => acct.census ?? [], budget, backoffMs);
+  if (census.degraded.length) return { hosts, truncated, degraded: census.degraded, browsers: [], segments: [] };
+  noteTruncation(census.accounts, ["census", "censusDirect", "evidence"]);
+  const current = currentBrowsers(census.accounts.flatMap((acct) => (acct.evidence ?? []).map((g) => ({
+    browser: g.dimensions.userAgentBrowser, version: g.dimensions.browserVersion, visits: g.sum.visits }))));
+  const browsers = [...current].flatMap(([browser, series]) =>
+    series.map(({ newest, evidence }) => ({ browser, newest, evidence })))
+    .sort((a, b) => b.evidence - a.evidence);
+  // Fail closed: with no evidence there is no newest version, nothing would
+  // count, and writing every site at zero is the 2026-10-17 failure in a new shape.
+  if (!current.size) return { hosts, truncated, degraded: ["no referred sessions to date the current browsers from"], browsers, segments: [] };
 
-    // Aliases (e.g. an apex landing page) roll up into the site's primary host.
-    for (const g of acct.totals ?? []) {
+  const censusRows = [];
+  const segments = [];
+  const segmentKey = (d) => [d.requestHost, d.userAgentBrowser, d.browserVersion, d.userAgentOS].join("\u0000");
+  for (const acct of census.accounts) {
+    const direct = new Map((acct.censusDirect ?? []).map((g) => [segmentKey(g.dimensions), g.sum.visits]));
+    for (const g of acct.census ?? []) {
+      // Aliases (e.g. an apex landing page) roll up into the site's primary host.
       const host = HOST_ALIASES.get(g.dimensions.requestHost);
       if (!host) continue;
+      const row = { browser: g.dimensions.userAgentBrowser, version: g.dimensions.browserVersion };
+      const isCurrent = isCurrentBrowser(current, row.browser, row.version);
+      const segment = { host, rawHost: g.dimensions.requestHost, browser: row.browser, version: row.version,
+        os: g.dimensions.userAgentOS, visits: g.sum.visits, direct: direct.get(segmentKey(g.dimensions)) ?? 0 };
+      const directOnly = isCurrent && isDirectOnlySegment(segment);
+      if (directOnly) segments.push(segment);
+      if (isCurrent) censusRows.push(row);
       const rec = recFor(host);
-      rec.views += g.count;
-      rec.visits += g.sum.visits;
+      if (isCurrent && !directOnly) {
+        rec.views += g.count;
+        rec.visits += g.sum.visits;
+      } else {
+        rec.automatedViews += g.count;
+        rec.automatedVisits += g.sum.visits;
+      }
     }
+  }
+  segments.sort((a, b) => b.visits - a.visits);
+  const clauses = countedBrowserClauses(current, censusRows);
+  if (!clauses.length) return { hosts, truncated, degraded: [], browsers, segments };
+
+  // 2. Referrers and landing pages, counted sessions only.
+  const counted = await rumRequest(env, COUNTED_QUERY(CF_ACCOUNTS),
+    { filter: { ...filter, AND: [...(filter.AND ?? []), { OR: clauses }, ...segmentExclusions(segments)] } }, "RUM counted",
+    (acct) => acct.refs ?? [], budget, backoffMs);
+  if (counted.degraded.length) return { hosts, truncated, degraded: counted.degraded, browsers, segments };
+  noteTruncation(counted.accounts, ["refs", "pages"]);
+  for (const acct of counted.accounts) {
     // A session ("visit") is only counted on its first pageview, so navigation
     // within one hostname carries visits: 0 and contributes nothing here either
     // way. A hop between a site's own hostnames (landing page -> forum) does
@@ -212,7 +289,7 @@ export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLIN
     }
   }
 
-  return { hosts, truncated, degraded };
+  return { hosts, truncated, degraded: [], browsers, segments };
 }
 
 // httpRequestsAdaptiveGroups, one dimension per grouping. Kept to a single

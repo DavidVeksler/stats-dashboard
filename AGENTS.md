@@ -9,18 +9,19 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | What this is / architecture / data flow | this file |
 | Commands | this file (`## Commands`) |
 | Signal rules, severities, thresholds | `src/signals.js` (one module, all rules) |
+| Which RUM sessions count and which are "automated" (crawlers), and why | `src/bots.js` (the two browser rules, with the 2026-10-29 measurements behind them); the `Crawlers are counted as people by RUM` gotcha below |
 | Planned work / why a thing is shaped this way | `docs/actionability-spec.md` |
 | Secrets / env | this file (`## Secrets`) |
 | Deploy | `deploy.sh` / `deploy.ps1` (+ README) |
 | Home-screen icons / manifest / splash screens | `scripts/generate-icons.mjs` (regen with `npm run icons`) |
 | Content / marketing / SEO / KPI docs | N/A — internal WAF-gated dashboard, not a marketing surface |
-| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_query_pages`, `daily_keywords`, `daily_pages`, `daily_zone_bots`, `daily_zone_dims`, `daily_r2_summary`, `daily_r2_ops`, `daily_r2_objects`, `daily_r2_dims`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
+| Measurement data | the D1 database (`schema.sql`: `daily_traffic`, `daily_referrers`, `daily_query_pages`, `daily_keywords`, `daily_pages`, `daily_zone_bots`, `daily_zone_dims`, `daily_rum_filter`, `daily_browser_current`, `daily_r2_summary`, `daily_r2_ops`, `daily_r2_objects`, `daily_r2_dims`, `daily_forum_activity`, `daily_bing_summary`, `daily_bing_keywords`, `runs`), not docs |
 | Making the dashboard actionable / open design work | `docs/actionability-spec.md` (items 1–8, 12–17 implemented; 9, 10, 11 and 18 proposed) |
 | Which page ranks for a query, per-page opportunity lists, split (cannibalized) queries | `src/opportunities.js` (`groupQueryPages`, `attachPages`, `rankPageOpportunities`, `findCannibalized`) fed by `daily_query_pages`; the pull is `queryQueryPages` in `src/gsc.js` |
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
-| RUM numbers that are round (1,000s) or zero, sampling guard, repairing bad nights | the `A sampled RUM answer is retried, then refused` gotcha below, `src/cloudflare.js` (`rumSamplingProblem`), `scripts/backfill-rum.mjs` |
+| RUM numbers that are round (1,000s) or zero, sampling guard, repairing bad nights | the `A sampled RUM answer is retried, then refused` gotcha below, `src/cloudflare.js` (`rumSamplingProblem`), `GET /backfill-rum` + `npm run backfill:rum` |
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | R2 bucket stats (storage, ops by billing class, cost estimate, objects read from the bucket), edge cache status | `src/r2.js` + `r2Bucket`/`r2Account` on a `SITES` row; checked by `scripts/r2-check.mjs` |
@@ -55,11 +56,11 @@ npm run refresh                 # trigger /run without deploying; reads .deploy/
 npm run tail                    # live Worker logs (npx wrangler tail)
 ```
 
-`npm run check` covers syntax, the crawler classifier (`scripts/bots-check.mjs`, real Aug 2026
-traffic shapes — since a false positive deletes real traffic from the dashboard), the aggregation
-layer above it (`scripts/dashboard-check.mjs` drives `loadDashboard` against a stubbed D1, because
-that is where a flooded day used to erase a whole site card, and where the signal rules are exercised
-end-to-end against the real 2026-08-13 fixtures), the **write** path
+`npm run check` covers syntax, the browser rules (`scripts/bots-check.mjs`, the real 2026-10-29
+version and segment shapes — a rule that counts a crawler fills the page with fiction, one that drops
+real visitors hides the audience), the aggregation layer above it (`scripts/dashboard-check.mjs`
+drives `loadDashboard` against a stubbed D1: counted rows shown as stored, automated beside them,
+pre-rule rows dropped, and the signal rules exercised end-to-end against the 2026-08-13 fixtures), the **write** path
 (`scripts/write-check.mjs` drives `runDaily` against a stubbed D1, Cloudflare and Search Console —
 it is the only check that touches writes, and it exists because the night's batch is now chunked;
 see the chunked-write gotcha below), and a render smoke test.
@@ -70,7 +71,9 @@ the shape of a night's write (statements, batches, statements per table), which 
 see what moving `KEYWORD_ROW_LIMIT` or `D1_MAX_BATCH_STATEMENTS` costs.
 `npm run preview` writes `.preview/dashboard.html`
 for inspection without deploying (the WAF blocks non-browser user agents on the live host, so parse
-the file rather than curling the site). Beyond that, verification is
+the file rather than curling the site). `npm run backfill:rum` calls the guarded `GET /backfill-rum`
+once per night for the last 8 nights (or `--dates a,b`): the Worker re-reads each window and rewrites
+that night's RUM rows itself, refusing any window Cloudflare now only serves sampled. Beyond that, verification is
 end-to-end: hit `/run` and read the returned `{gscOk, totalVisits, humanVisits, botVisits, notes}`,
 or inspect the `runs` table in D1. `npm run dev` runs
 `wrangler dev` locally, but the data pulls need the real secrets and network.
@@ -81,12 +84,15 @@ The Worker has three entry points in `src/index.js`:
 
 - **`scheduled`** (cron `0 13 * * *`; a second cron `0 17 * * *` only retries after a RUM-sampling failure, see the
   sampled-RUM gotcha) and **`GET /run?key=…`** both call `runDaily(env)`, which:
-  1. `pullTraffic()` (`cloudflare.js`) → Cloudflare GraphQL → 24h visitors/referrers.
+  1. `pullTraffic()` (`cloudflare.js`) → Cloudflare GraphQL → 24h sessions, split by the browser rules
+     (`bots.js`) into **counted** (stored in `daily_traffic`/`daily_referrers`/`daily_cf_pages`) and
+     **automated** (stored beside them in `daily_rum_filter`).
   2. `queryQueryPages()` (`gsc.js`) → Google Search Console → top (query, page) pairs, from which the
      per-query rows are **derived** (`summarizeQueryPages`) rather than fetched — see the query-to-page
      gotcha below; plus `queryPages()` for per-page totals (only if `GSC_SA_KEY` set).
   3. Writes one snapshot per domain into **D1** (`daily_traffic`, `daily_referrers`, `daily_query_pages`,
-     `daily_keywords`, `daily_pages`, `daily_search_summary`), plus a `runs` row.
+     `daily_keywords`, `daily_pages`, `daily_search_summary`, `daily_rum_filter`, `daily_browser_current`),
+     plus a `runs` row.
   4. `sendNtfy()` pushes a summary to `ntfy.sh/$NTFY_TOPIC`.
 - **Bing's pull is a scheduled GitHub Action, not a Worker cron** (`.github/workflows/bing-pull.yml`,
   `scripts/bing-pull.mjs`) — moved out 2026-09-11 after confirming Bing throttles every call routed
@@ -109,7 +115,7 @@ The Worker has three entry points in `src/index.js`:
   into a local script. The response names every site in the Bing account, which is why it is guarded.
 - **`GET /`** calls `loadDashboard()` → reads the latest snapshot from D1 → `computeSignals()` (`signals.js`) ranks what needs doing → `renderDashboard()` (`render.js`) returns a self-contained HTML page. The page is served from stored snapshots (not live pulls), which is what makes 14-day sparklines possible. `GET /api/json` returns the same data; `GET /health` returns `ok`.
 
-**The signal engine** (`src/signals.js`) is where every rule lives. `computeSignals` is a **pure function of rows `loadDashboard` has already read** — it queries nothing — which is what lets `runDaily` reuse it for the ntfy push instead of growing a second copy of the rules. When a rule needs more history, **widen an existing read rather than adding a query** (`daily_zone_status` was widened from latest-day to the history window for the `error-spike` baseline). Signals are `{ severity, kind, host, headline, evidence, action, href, recurrence }`, severity 1 = act today, 2 = look at it, 3 = context; the top three severity-1/2 signals render as "Today's actions" above the KPI tiles, and the top severity-1 signal is appended to the ntfy push. `recurrence` is populated only where the loaded history answers it exactly (today: consecutive flooded days behind `no-comparison`, in the 24h view) — nothing guesses it, because a wrong "3rd consecutive day" is worse than an absent one.
+**The signal engine** (`src/signals.js`) is where every rule lives. `computeSignals` is a **pure function of rows `loadDashboard` has already read** — it queries nothing — which is what lets `runDaily` reuse it for the ntfy push instead of growing a second copy of the rules. When a rule needs more history, **widen an existing read rather than adding a query** (`daily_zone_status` was widened from latest-day to the history window for the `error-spike` baseline). Signals are `{ severity, kind, host, headline, evidence, action, href, recurrence }`, severity 1 = act today, 2 = look at it, 3 = context; the top three severity-1/2 signals render as "Today's actions" above the KPI tiles, and the top severity-1 signal is appended to the ntfy push. `recurrence` is read from what `daily_signals` persisted (consecutive prior nights the same kind and host fired) — nothing guesses it, because a wrong "3rd consecutive day" is worse than an absent one.
 
 **Cards are laid out domain-first.** `groupByDomain` (`src/index.js`) puts every host of a
 registrable domain (`registrableDomain` in `src/config.js` — the naive last-two-labels rule, correct
@@ -278,15 +284,17 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `rumPageloadEventsAdaptiveGroups` under `viewer.accounts`, NOT under `zones` (querying it on a
   zone errors with "unknown field"). `pullTraffic` queries all `CF_ACCOUNTS` and merges rows by
   `requestHost`, because a host can live on any account.
-- **The RUM pull is three aliased groupings in one request, never one three-dimension grouping.**
-  `pullTraffic` asks for per-host `totals`, per-(host, referrer) `refs` and per-(host, path) `pages`
-  separately. The old single `refererHost x requestHost x requestPath` query shared one 5,000-row cap
-  across every host in the account; a crawler flood filled it and cheatsheets.davidveksler.com stored
-  zero referrers on 2026-09-24 against Cloudflare's own 44 Google + 17 Bing, which made the day read as
-  100% direct. Aliases keep it at one subrequest per account. `excludePaths` is applied in the query
-  filter (`rumFilter`) because two groupings have no path to drop rows on. A grouping that fills its cap
-  (usually `pages` during a flood) is reported as `rumTruncated` from `/run` and in the `runs` note,
-  without failing the run.
+- **The RUM pull is two requests that each cover every account (one `accounts` alias per account).**
+  The census request groups every session by (host, browser, version, OS), the direct ones by the same,
+  and 7 days of referred sessions by (browser, version); `pullTraffic` applies the browser rules to it
+  exactly. The counted request then asks for per-(host, referrer) `refs` and per-(host, path) `pages`
+  **filtered server-side** to the counted (browser, version) pairs minus the direct-only segments.
+  Filtering in the query is the point: a crawler puts one session on each of 100,000+ paths and would
+  fill the 5,000-row cap before any real landing page ranked (the old unfiltered `pages` grouping did,
+  and on 2026-09-24 an unfiltered combined grouping left cheatsheets.davidveksler.com with zero
+  referrers). Two subrequests total, down from one per account. `excludePaths` is applied in the query
+  filter (`rumFilter`). A grouping that fills its cap is reported as `rumTruncated` from `/run` and in
+  the `runs` note, without failing the run.
 - **Every Cloudflare GraphQL call goes through `gqlPost` (`src/cloudflare.js`), and the cron goes through
   `runDailyGuarded`.** On 2026-09-29 the RUM query returned a transient `serviceUnavailable`, `runDaily`
   threw, and the page went a day stale with no `runs` row and no push. `gqlPost` retries only what
@@ -302,17 +310,18 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   10-12. Re-reading the 10-12 and 10-17 windows days later returned exact figures at interval ~1.00, but the
   09-21, 09-30 and 10-06 windows read back at interval 10 (Cloudflare coarsens older RUM data, somewhere between 6 and
   12 days old), so those three nights are unrecoverable: run `backfill:rum` within a few days of a bad night. `pullTraffic` now asks for
-  `avg { sampleInterval }` on `totals`, judges each account with `rumSamplingProblem` (pageview-weighted interval
+  `avg { sampleInterval }` on the census (and the counted request's `refs`), judges each account with `rumSamplingProblem` (pageview-weighted interval
   over `RUM_MAX_SAMPLE_INTERVAL` 1.5, or no rows from the primary account), retries from ONE shared budget of
-  `RUM_SAMPLING_RETRIES` (3, backed off 5/15/30 s; runDaily is at 46-47 of 50 subrequests, so never per account),
+  `RUM_SAMPLING_RETRIES` (3, backed off 5/15/30 s, shared across both RUM requests),
   and on exhaustion returns `degraded`. `runDaily` then writes **no** RUM host (existing rows for the date are left
   alone), notes it (`ok=0`, so `/health` and `stale-pipeline` fire), adds a line to the ntfy push and returns
   `rumSkipped`; zone, R2, forum and Search Console data are still written. A stored RUM count that is a multiple of
   100 or 1,000, or a RUM host at zero beside a live site, is this failure until proven otherwise. Do not "fix" it by
-  rounding, scaling by the interval, or loosening the threshold. Repair bad nights with `npm run backfill:rum`
-  (`scripts/backfill-rum.mjs`): it re-reads the windows read-only, applies the same guard, skips nights still
-  sampled, and writes a reviewable `.deploy/backfill-rum-*.sql` for you to apply in the D1 console or the MCP
-  connector. It never writes D1 itself (the deploy token has no D1 scope). `write-check.mjs` (part 1a') and
+  rounding, scaling by the interval, or loosening the threshold. Repair bad nights with `npm run backfill:rum -- --dates …`
+  (`scripts/backfill-rum.mjs` → `GET /backfill-rum?key=…&date=…`, `backfillRum` in `src/index.js`): the Worker
+  re-reads that night's window (its `runs.run_at`, else 13:00Z), applies the same guard and the same browser
+  rules, and rewrites the night's RUM rows through its own D1 binding with the same `rumWriteStatements`
+  runDaily uses. A night still sampled on re-read is reported and left alone. `write-check.mjs` (part 1a') and
   `gql-check.mjs` cover the guard. The in-run retries only span ~50 s, so a **second cron, `0 17 * * *`
   (`RETRY_CRON`, `runRetryIfSampled` in `src/index.js`)** re-runs `runDailyGuarded` four hours later, and only
   when the newest `runs` row is `ok=0` with a `rum sampled` note from the last 12 hours; a healthy run, a thrown
@@ -450,7 +459,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   and its advice — merge two pages — is the most destructive on the page. Promote it to 2 only after a
   real case has been confirmed by eye.
 - **The Worker's own subrequest budget is a real ceiling, and it was already close.** One `runDaily`
-  invocation makes roughly 4 (RUM, one per `CF_ACCOUNTS`) + 1 per zone host (one aliased request since
+  invocation makes 2 (RUM: census + counted, every account aliased into each, since 2026-10-29; it was one
+  per `CF_ACCOUNTS`) + 1 per zone host (one aliased request since
   2026-09-27; it was 5) + 1 per `r2Bucket`
   + up to 3 × `SITES.length` (GSC: keywords, pages, summary) + `FORUMS.length` + 1 (ntfy) fetches — with
   12 GSC sites that is up to 36 GSC calls alone. On 2026-08-26 vellum.capital, last in `SITES`, lost its
@@ -461,8 +471,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
   `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
   is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
-  removes ~1 GSC call per site per night. **Re-counted 2026-10-14 with 18 `gsc` properties: 4 RUM + 1 zone + 1 R2
-  + 1 token + 36 GSC + 2 forums + 1 ntfy is 46 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
+  removes ~1 GSC call per site per night. **Re-counted 2026-10-29 with 18 `gsc` properties: 2 RUM + 1 zone + 1 R2
+  + 1 token + 36 GSC + 2 forums + 1 ntfy is 44 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
   at all; anything new either changes what an existing call asks for or runs as its own invocation (spec
   items 17 and 18 are shaped by exactly this). If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the
@@ -614,95 +624,44 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   weighted mean is dragged around by whichever position-60 stray happens to be in the stored rows and
   stays put when the work lands. `totals.gscPosition` still holds the old mean for `/api/json`
   continuity; do not put it back on a tile.
-- **Crawlers are counted as humans by RUM, and we do NOT block them.** These sites opt into AI
-  training (`Content-Signal: ai-train=yes`); the fix is measurement, not blocking. `src/bots.js`
-  classifies each *site-day* and sets aside "floods" (≥90% direct, ≤3.0 pages/session, ≥500
-  sessions, ≥3× a normal day). On a flooded day the direct bucket and the landing-page rows are
-  set aside; referred sessions still count (see the next bullet). Excluded volume is always
-  reported separately — never silently dropped. Two things to preserve:
-  (1) the flood test is deliberately **volume-free** (`day.signature`) so the baseline can be
-  built from the days that fail it without circular reasoning; (2) when too few clean days
-  remain, the baseline falls back to the **25th percentile**, not the median — a median inside a
-  sustained flood blesses the flood as normal, which is exactly how the Aug 2026
-  forum.objectivismonline.com flood went unflagged for eight days.
-- **A flood's own shape can drift mid-event, and the pages/session cap has to have margin for
-  that.** `FLAT_PAGES_PER_SESSION` was 1.15 (tuned for the Aug 2026 floods, which were all
-  single-hit crawls) until forum.objectivismonline.com's flood — correctly flagged for 13 straight
-  days, 2026-08-15 through -27 — flipped back to `flood: false` on 2026-08-28 the moment the
-  crawler itself started requesting ~2 pages a visit instead of 1 (pagesPerSession ~1.0 → ~2.08),
-  even though the day was still ≥99.9% direct and ~10-26× the host's true baseline. One shape trait
-  drifting killed the whole AND'd signature and the entire day counted as human. Raised to 3.0 with
-  margin above that observed value — see the comment on the constant in `src/bots.js` for why this
-  cap is the least load-bearing of the three tests (direct share + volume already do most of the
-  discriminating; a real human spike essentially never arrives ≥90% direct at flood volume). If a
-  future flood's pages/session drifts past 3.0 too, re-measure from a live pull before raising it
-  again rather than guessing — and note that `likely-bot-subflood` in `src/signals.js` shares this
-  same constant, so widening it here also widens that rule's shape gate.
-- **The baseline window itself can run out of clean days, not just the fallback percentile.**
-  Both percentile paths in `classifyTraffic` are computed over whatever window the caller reads —
-  and by 2026-08-24 the forum.objectivismonline.com flood (started 2026-07-30, a true baseline of
-  ~618/day) had been running for 26 of the 30 days in the then-current read, so the 25th-percentile
-  fallback from the fix above was itself built almost entirely from flood days. The flood settled
-  into an elevated "new normal" (10k-30k/day, matching its own shape day over day) that never
-  tripped `FLOOD_MULTIPLE` against that inflated baseline, so every day from 2026-08-19 on rendered
-  as clean "human sessions" — the same failure mode recurring in a form the 25th-percentile fix
-  didn't reach. `BASELINE_LOOKBACK_DAYS` (`src/bots.js`, 180 days) is a second, wider window read
-  *only* for the two queries that feed `classifyTraffic` (`hist`/`histRefs` in `loadDashboard`, and
-  the equivalent pair in `summarizeToday` for the nightly ntfy push — these were two independent
-  30-day windows, both had the bug, both needed the fix). Every other read keeps the narrower
-  `historyStart`/`-29 days` window, so this costs nothing beyond a few hundred extra
-  one-row-a-day-per-host `daily_traffic` rows and a handful of grouped `daily_referrers` rows — see
-  the comment on `BASELINE_LOOKBACK_DAYS` for why that's cheap. If a flood ever outlasts 180 days
-  too, the same fix applies again: widen further, don't add a third window.
-- **A flooded day is partially recoverable — only the direct bucket is uncertain.** The flood test is
-  largely a test for direct traffic (crawlers arrive with no referer), so the *referred* sessions
-  on a flooded day are still a real measurement and are counted (`splitDay` in `src/bots.js`).
-  What can't be recovered **by counting** is the direct bucket, where crawler and human are mixed
-  beyond separation, and pageviews, which carry no referer dimension at all and stay a hard
-  exclusion always. The direct bucket itself has two outcomes — see the next bullet for the second
-  one. Consequences to preserve either way: pages/session divides clean views by **clean** sessions
-  only; deltas are suppressed when either side of the comparison is partial (a floor/estimate vs a
-  full count is not a like-for-like change); `daily_cf_pages` rows on flooded days stay excluded
-  whole. Before this split existed, a site whose only day in view was flooded rendered a completely
-  blank card (freecapitalists.org, 2026-08-09).
-- **The direct bucket gets a ratio estimate once a host has enough clean-day history, and a bare
-  floor otherwise — never anything in between.** `directRatioStats` (`src/bots.js`) builds a
-  host's typical direct/referred visit ratio from its own clean (non-flood-shaped) days —
-  median and MAD, for the same reason the flood baseline uses them (a handful of high-traffic
-  clean days should not dominate a ratio meant to describe an ordinary one). Below
-  `RATIO_MIN_CLEAN_DAYS` (5) clean days, `directRatioStats` returns `null` and `splitDay` falls
-  back to the original floor-only split (`human = nonDirect`), rendered `≥`. At or above it, the
-  flooded day's direct bucket is estimated as `referred × that ratio's median`, capped at the
-  day's own measured direct count so the estimate can never claim more direct humans than there
-  were total direct visits, rendered `~` with a `±spread` (the ratio's MAD, itself clamped into
-  `[nonDirect, visits]` so the printed margin can never exceed the hard counts on either side of
-  it). This is a deliberate, bounded exception to "never interpolate": it does not invent a number
-  with no basis, it asks what this specific host's own referred traffic implies about its direct
-  traffic on an ordinary day, and it always ships with a margin so it is never shown with more
-  precision than it has. **The estimated-direct amount must be credited into the `direct` bucket of
-  `sources`/`sourceMix`, never left uncredited** — `summarizeSources` in `src/index.js` takes an
-  `estimatedDirect` param for exactly this; without it, the estimate has no referrer row to sit in
-  and balloons `unattributed` into the largest slice of the mix, which is what happened the first
-  time this was wired up and is why the fix is called out here rather than left to be rediscovered.
-  A host either has enough clean-day history to estimate every one of its flooded days or none —
-  the gate is per-host, not per-day, so a site's own days are never a mix of floor and estimate.
-  A 2026-08-26 pull across the live estate found the ratio's dispersion (MAD/median) ranges from
-  ~14% on the tightest sites to 100%+ on ones with almost no clean-day sample — which is exactly
-  why there is no second gate on CV: the spread is what communicates trustworthiness, a fixed
-  cutoff would just relocate the floor/estimate discontinuity rather than remove it, and a
-  99%-direct small personal site's *normal* daily shape already looks identical to a flood's
-  shape (see the two-out-of-three-signals-agree design above) — the ratio, not the shape, is what
-  is being trusted here.
-- **A zone-sourced host can never be flagged as flooded, so it must never sit in a session total.**
-  `classifyTraffic` derives `directShare` from `daily_referrers` rows, and a zone host writes none
-  (zone logs carry no referer dimension), so `direct = 0`, `signature` is always false, and no
-  volume flags it. Until the RUM/zone split landed, library.freecapitalists.org's raw crawler
+- **Crawlers are counted as people by RUM, and we do NOT block them.** These sites opt into AI
+  training (`Content-Signal: ai-train=yes`); the fix is measurement, not blocking. Cloudflare's own `bot`
+  dimension on the RUM dataset is 0 for all of it. Since 2026-10-29 two rules in `src/bots.js` decide,
+  **per session at pull time**, what counts; everything else is stored as **automated** in
+  `daily_rum_filter` and shown beside the count, never inside it:
+  1. **Current browser.** A session counts only when its browser's major version is within
+     `BROWSER_LAG` (2) behind, or `BROWSER_LEAD` (1) ahead of, the newest version real visitors use.
+     "Newest" (`currentBrowsers`) is the highest version holding ≥ `NEWEST_MIN_SHARE` (5%) of that
+     family's **referred** sessions over `EVIDENCE_DAYS` (7), per version series (`SERIES_GAP`: the Google
+     app reports as "ChromeMobile 443/444" beside Chrome's own 156, real visitors both). Apple's 18→26
+     renumbering is mapped (`browserMajor`). `Unknown` never counts. Crawler fleets rotate stale user
+     agents: on 2026-10-29 the wiki.freecapitalists.org fleet spread 165k sessions over Chrome 103-151.
+     Lag 2 was measured against lag 3 and 4 on live data (see the comment in `bots.js`); do not widen it
+     without re-measuring.
+  2. **Direct-only desktop segment.** A crawler sending a current version shows up as one (host, browser,
+     version, OS) segment with ≥ `SEGMENT_MIN_VISITS` (50) sessions a night, ≥ `SEGMENT_DIRECT_SHARE`
+     (97%) direct, on a desktop OS. The forum.objectivismonline.com crawler of 2026-10-22..28 (Chrome 156,
+     even thirds across macOS/Windows/Linux) was 50-777 per segment at ≥99% direct; no real segment of
+     25+ was above 93%. Pages/session does **not** separate them (the crawler ran 1.00-1.64), so it is not
+     a test. Phones are exempt (apps strip referrers). The flagged segments are listed in the `runs` note
+     and `/run`'s `segments`, so a wrong call is auditable.
+  What to preserve: the rules need **no history and no baseline**. The flood classifier they replaced
+  judged whole site-days against the host's "normal" days, and every long flood became its own baseline
+  (by 2026-10-29 the wiki showed 165,832 "human sessions" at 1.0 pages/session); it also could not count a
+  flooded day, only floor or ratio-estimate it. Do not reintroduce a baseline, a per-day verdict or an
+  estimate. RUM rows written **before** 2026-10-29 hold raw totals, crawlers included; `loadDashboard`
+  drops every RUM row without a `daily_rum_filter` marker for its (date, host), deltas require both
+  periods to have the same number of counted nights, and `totals.countedSince` says where counting began.
+  The cost of the rules is the few percent of real visitors on stale browsers, the same every day. A
+  crawler small enough to slip under rule 2 still counts; `likely-bot-spike` is the alarm for that.
+- **A zone-sourced host gets no browser rule, so it must never sit in a session total.** The zone log
+  on this plan carries no user agent. Until the RUM/zone split landed, library.freecapitalists.org's raw crawler
   traffic flowed straight into "Human sessions", supplying 1,059 of 2,012 (52.6%) on 2026-08-13
   while its own top file was `/robots.txt` at 684 requests. Keep every session-shaped aggregate
   RUM-only (see "Two measurement classes" above). `crawlerAccounting(site)` in `src/bots.js` is the
-  routing that replaces the missing verdict — see the next bullet for what it routes to.
+  routing — see the next bullet for what it routes to.
 - **Verified bots are a FLOOR on crawler volume, never a bot/human split.** Zone hosts get two
-  independent lenses instead of a flood verdict, both on the zone card, and **the renderer is
+  independent lenses instead, both on the zone card, and **the renderer is
   required to say they must not be added** (they overlap: a verified crawler fetches `robots.txt`
   too, and there is no stored `(path, status)` pair to measure the overlap with).
   1. **Verified crawlers** — the `verifiedBotCategory` dimension on `httpRequestsAdaptiveGroups`,
@@ -732,15 +691,15 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   API ceiling. The same spike confirmed `{ clientRequestPath, edgeResponseStatus }` filtered
   `edgeResponseStatus_geq: 400` returns 1,376 rows on this zone without approaching the cap. Pair
   dimensions only where a filter keeps the product that small.
-- **Footer prose is interpolated, not retyped.** The flood thresholds and the opportunity
+- **Footer prose is interpolated, not retyped.** The browser-rule thresholds and the opportunity
   thresholds in `render.js`'s footer come from the exported constants in `src/bots.js`
-  (`FLOOD_MIN_VISITS`, `FLOOD_MULTIPLE`, `FLAT_PAGES_PER_SESSION`, `DIRECT_SHARE`) and
+  (`BROWSER_LAG`, `BROWSER_LEAD`, `NEWEST_MIN_SHARE`, `EVIDENCE_DAYS`, `SEGMENT_MIN_VISITS`,
+  `SEGMENT_DIRECT_SHARE`) and
   `src/opportunities.js` (`SNIPPET_MAX_POSITION`, `RANK_MAX_POSITION`, `TARGET_POSITION`,
   `SNIPPET_CTR_RATIO`, `OPPORTUNITY_MIN_IMPRESSIONS`, `MIN_ACTIONABLE_CLICKS`,
   `POSITION_MIN_IMPRESSIONS`). `render-check.mjs` asserts the rendered sentence against those same
-  imports, so changing a threshold and not the prose fails `npm run check`. The prose had already
-  drifted once: it claimed flooded days were "excluded whole, from sessions, referrers, and landing
-  pages alike" for as long as `splitDay` had been keeping the referred sessions.
+  imports, so changing a threshold and not the prose fails `npm run check`, and the same check fails if
+  any flood-era wording ("flooded", "~", "ratio estimate") reappears on the page.
 - **Signals respect measurement class, and the gate is not optional.** Session-delta and
   pages-per-session rules run on **RUM sites only**. A zone-sourced host is measured in HTTP requests
   out of the zone log, so "sessions rose 40%" or "pages/session fell by 2.1" about one is not a weak
@@ -755,12 +714,12 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   dressed as signal (`whopaysforai.org ↑600%` was 6 sessions to 7). `DELTA_MIN_ABSOLUTE` in
   `src/signals.js` is imported by `deltaBadge` in `src/render.js` so the per-card badge and the
   signal list share one floor: below it the badge renders the raw change (`+13`) muted instead of a
-  percentage. `likely-bot-subflood` has its own, deliberately lower floor (≥ 50 sessions of change
+  percentage. `likely-bot-spike` has its own, deliberately lower floor (≥ 50 sessions of change
   **and** ≥ 100 resulting sessions, not the ≥ 100 absolute change the spec first proposed, which
   would have missed the live wiki.freecapitalists.org spike it was written for at +97). The three
   shape tests beside it — flat pages/session, ≥ 80% direct, one landing page taking ≥ 80% of
   entrances — are what make a low volume floor safe there.
-- **`likely-bot-subflood` and `traffic-rise` are mutually exclusive by construction.** A spike is
+- **`likely-bot-spike` and `traffic-rise` are mutually exclusive by construction.** A spike is
   either growth or a crawler; reporting it as both is how the reader learns to ignore the list.
 - **GSC lags ~2 days.** `runDaily` requests the window `date-4 … date-2`, so keyword data is
   never truly "last 24h". The dashboard labels this.

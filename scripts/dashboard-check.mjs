@@ -1,12 +1,9 @@
-// Exercises loadDashboard's aggregation against a stubbed D1, using the shape
-// that broke it: freecapitalists.org on 2026-08-09, where a 1,689-session
-// crawler flood on the only day in view emptied the entire card.
-//
-// The classifier has its own unit checks; this one covers the layer above it —
-// how classified days turn into the numbers the page prints — because that is
-// where a flooded day used to erase a site's traffic, referrers and all.
+// Exercises loadDashboard's aggregation against a stubbed D1. The browser rule
+// itself has unit checks (bots-check.mjs) and the write path its own
+// (write-check.mjs); this covers the read: counted sessions shown as stored,
+// automated sessions reported beside them, and RUM rows from before the rule
+// (no daily_rum_filter marker) dropped rather than shown.
 import worker from "../src/index.js";
-import { classifyTraffic, splitDay, directRatioStats } from "../src/bots.js";
 import { looksMalformed } from "../src/urls.js";
 import { expectedCtr, classifyOpportunity, TARGET_POSITION, MIN_ACTIONABLE_CLICKS,
   POSITION_MIN_IMPRESSIONS, RANK_MAX_POSITION, OPPORTUNITY_MIN_IMPRESSIONS } from "../src/opportunities.js";
@@ -23,7 +20,6 @@ function check(name, actual, expected) {
 }
 
 const HOST = "freecapitalists.org";
-const DIRECT_SHARE_FLOOD = .99;
 
 const dayAfter = (start, n) => {
   const d = new Date(`${start}T00:00:00Z`);
@@ -31,14 +27,18 @@ const dayAfter = (start, n) => {
   return d.toISOString().slice(0, 10);
 };
 
-// 12 ordinary days, then two crawler-flooded ones (08-08, 08-09).
+// 14 counted days. The last two are the real 2026-08-08/09 crawler floods as the
+// browser rule writes them: the counted sessions in daily_traffic, the crawler's
+// 3,400 and 1,660 in daily_rum_filter. The first two are LEGACY nights, written
+// before the rule existed, so they carry no marker and must never be shown.
 const DAYS = [
   ...[13, 10, 32, 13, 25, 11, 29, 18, 22, 16, 27, 24].map((visits, index) => ({
     date: dayAfter("2026-07-27", index), visits, direct: .6, pps: 1.4,
   })),
-  { date: "2026-08-08", visits: 3428, direct: DIRECT_SHARE_FLOOD, pps: 1.08 },
-  { date: "2026-08-09", visits: 1689, direct: DIRECT_SHARE_FLOOD, pps: 1.08 },
+  { date: "2026-08-08", visits: 28, direct: .6, pps: 1.4, automated: 3400 },
+  { date: "2026-08-09", visits: 29, direct: .6, pps: 1.4, automated: 1660 },
 ];
+const LEGACY_DATES = new Set([DAYS[0].date, DAYS[1].date]);
 
 // A zone-log host (config.js marks library.freecapitalists.org trafficSource:
 // "zone"): no RUM beacon, so `visits` is Cloudflare's zone-log arrival heuristic
@@ -54,8 +54,8 @@ const ZONE_DAYS = [
 
 // The 2026-08-13 wiki.freecapitalists.org shape: 151 sessions up from about 54,
 // flat at 1.0 pages/session, ~90% direct, and 134 of 151 entrances on one URL.
-// A crawler spike sitting under FLOOD_MIN_VISITS, which is exactly why the flood
-// classifier is right not to fire and why the subflood signal has to.
+// A crawler spike on a current browser, small enough that neither browser rule
+// sets it aside, which is why the likely-bot-spike signal has to fire.
 const WIKI_HOST = "wiki.freecapitalists.org";
 const WIKI_DAYS = [
   { date: "2026-08-08", visits: 54, views: 76, direct: 30 },
@@ -288,17 +288,21 @@ const referrers = [
   // matches on the stored referer host, so it still counts there.
   { date: "2026-08-08", host: SMALL_HOST, referrer: "notebook.google.com", kind: "ref", visits: 1 },
 ];
-const nonDirect = (date) =>
-  referrers.find((r) => r.host === HOST && r.date === date && r.kind === "search").visits;
-// The DAYS fixture gives HOST 12 clean days at a fixed direct/referred ratio of
-// 1.5, so it clears RATIO_MIN_CLEAN_DAYS and the real 2026-08-08/09 flood days
-// get a ratio estimate rather than the older floor-only split — computed here
-// from the same bots.js functions loadDashboard calls, not hand-derived, so a
-// change to the estimator's arithmetic fails this file instead of silently
-// going stale.
-const hostClassified = classifyTraffic(traffic, referrers);
-const hostRatioStats = directRatioStats(hostClassified, HOST);
-const estimatedHuman = (date) => splitDay(hostClassified.get(HOST).get(date), hostRatioStats).human;
+// The browser rule's per-night markers: one for every (date, RUM host) any
+// fixture row uses, except HOST's legacy nights, carrying HOST's crawler volume
+// on its two flood nights. Derived on each read, so the sections below that push
+// their own traffic or referrer rows get markers for them too.
+const isRumHost = (host) => SITES.find((site) => site.host === host)?.trafficSource !== "zone";
+const rumFilterRows = () => {
+  const keys = new Map();
+  for (const row of [...traffic, ...referrers, ...ZONE_PAGES]) {
+    if (!isRumHost(row.host) || (row.host === HOST && LEGACY_DATES.has(row.date))) continue;
+    keys.set(`${row.date}|${row.host}`, { date: row.date, host: row.host,
+      automated_visits: row.host === HOST ? DAYS.find((day) => day.date === row.date)?.automated ?? 0 : 0,
+      automated_views: 0 });
+  }
+  return [...keys.values()];
+};
 
 // A deliberately deep tail of stored queries, appended to the keyword rows only
 // inside the block that exercises the raised KEYWORD_ROW_LIMIT. Empty otherwise,
@@ -319,8 +323,15 @@ const db = {
   prepare(sql) {
     let binds = [];
     const run = () => {
+      if (sql.includes("MIN(date)") && sql.includes("daily_rum_filter")) {
+        return { d: rumFilterRows().map((row) => row.date).sort()[0] };
+      }
+      if (sql.includes("daily_browser_current")) {
+        return { results: [{ browser: "Chrome", newest: 156, evidence: 1350 }, { browser: "ChromeMobile", newest: 444, evidence: 40 }] };
+      }
       if (sql.includes("MAX(date)")) return { d: DAYS.at(-1).date };
       if (sql.includes("FROM runs")) return runsRow;
+      if (sql.includes("daily_rum_filter")) return { results: between(rumFilterRows(), binds) };
       if (sql.includes("daily_traffic")) return { results: between(traffic, binds) };
       if (sql.includes("daily_referrers")) return { results: between(referrers, binds) };
       // The three GSC reads are NOT the same width, and that asymmetry is load
@@ -392,63 +403,48 @@ const load = async (query) => {
   return { data, site: data.sites.find((s) => s.host === HOST) };
 };
 
-// 1. The 24h view, where the only day available is flooded. This is the exact
-//    case that rendered an empty card. HOST's 12 clean prior days clear
-//    RATIO_MIN_CLEAN_DAYS, so the direct bucket gets a ratio estimate instead
-//    of the older floor-only split (see hostRatioStats above).
+// 1. The 24h view on a flood night: the counted sessions are shown as stored,
+//    whole, with the crawler beside them and nothing estimated, floored or split.
 {
   const { data, site } = await load(`domain=${HOST}&period=1`);
-  const recovered = nonDirect("2026-08-09");           // referred sessions, measured
-  const estimated = estimatedHuman("2026-08-09");       // referred + estimated direct
-  check("flooded-only day reports the ratio-estimated total", site.visits, estimated);
-  check("...flagged as an estimate, not a bare floor", site.estimatedVisits, true);
-  check("...marked as a partial day", site.partialVisits, estimated);
-  check("...over the one flooded day", site.partialDays, 1);
-  check("...with no clean day claimed", site.cleanDays, 0);
-  check("...crediting the crawler with what the estimate leaves over",
-    site.botVisits, 1689 - estimated);
-  check("...and keeps the referrers that survived", site.referrers.length, 1);
-  check("...at the measured (not estimated) referred volume", site.referrers[0]?.visits, recovered);
-  check("...counted as search traffic", site.sources.search, recovered);
-  // The estimated direct portion has no referrer row to sit in, so it is
-  // credited straight into the direct bucket rather than ballooning
-  // "unattributed" into the largest slice of the mix.
-  check("...and the estimated direct portion lands in the direct bucket, not unattributed",
-    site.sources.direct, estimated - recovered);
-  check("...without inventing pageviews", site.views, 0);
-  check("...or a pages/session rate", site.pagesPerSession, 0);
-  // Previous day was flooded too, so an estimate would be compared against one.
-  check("...and suppresses the delta across partial days", site.delta, null);
-  check("previous period is estimated the same way", site.previousVisits, estimatedHuman("2026-08-08"));
-  check("totals follow the site", data.totals.visits, estimated);
-  check("totals report the estimated volume", data.totals.partialVisits, estimated);
+  check("a flood night shows its counted sessions as stored", site.visits, 29);
+  check("...with the crawler reported beside them", site.automatedVisits, 1660);
+  check("...and never inside them", data.totals.visits, 29);
+  check("...in the estate total too", data.totals.automatedVisits, 1660);
+  check("...as a share of what Cloudflare recorded",
+    Number(data.totals.automatedShare.toFixed(4)), Number((1660 / (1660 + 29)).toFixed(4)));
+  check("...with real pageviews", site.views, Math.round(29 * 1.4));
+  check("...a real pages/session", Number(site.pagesPerSession.toFixed(2)), Number((Math.round(29 * 1.4) / 29).toFixed(2)));
+  check("...and a real delta against a counted night", Number(site.delta.toFixed(4)), Number(((29 - 28) / 28).toFixed(4)));
+  check("...whose own crawler is reported too", site.previousAutomatedVisits, 3400);
+  check("the referrers are the stored counted rows", site.sources.direct + site.sources.search, 29);
+  check("the browsers the night counted from reach the page", data.totals.browsers[0]?.newest, 156);
+  check("none of the old flood fields survive",
+    ["partialVisits", "partialDays", "estimatedVisits", "botVisits", "anomaly", "spread"].some((key) => key in site), false);
 }
 
-// 2. A window that mixes clean and flooded days: clean days count whole, flooded
-//    days contribute their ratio-estimated total, and pageviews stay clean-only
-//    (a flooded day's views carry no referer dimension at all, so they cannot
-//    be estimated the same way and stay a hard exclusion).
+// 2. Legacy nights (no daily_rum_filter marker) are dropped from every RUM read,
+//    and a period that reaches back over them says how many nights it counted.
+{
+  const { data, site } = await load(`domain=${HOST}&period=30`);
+  const counted = DAYS.filter((day) => !LEGACY_DATES.has(day.date));
+  check("the 30-day view sums counted nights only",
+    site.visits, counted.reduce((sum, day) => sum + day.visits, 0));
+  check("...and says how many it had", site.measuredDays, counted.length);
+  check("...the sparkline skips legacy nights",
+    site.spark.some((point) => LEGACY_DATES.has(point.date)), false);
+  check("...so does the 14-day comparator's history", data.totals.trend.days <= counted.length, true);
+  check("the page knows when counting started", data.totals.countedSince, counted[0].date);
+}
+
+// 3. No comparison across a gap: a period with fewer counted nights than the one
+//    before it is a missing night, not a change in traffic.
 {
   const { site } = await load(`domain=${HOST}&period=7`);
-  const window = DAYS.slice(-7);
-  const clean = window.filter((day) => day.date < "2026-08-08");
-  const cleanVisits = clean.reduce((sum, day) => sum + day.visits, 0);
-  const cleanViews = clean.reduce((sum, day) => sum + Math.round(day.visits * day.pps), 0);
-  const estimated = estimatedHuman("2026-08-08") + estimatedHuman("2026-08-09");
-  check("clean days count whole", site.cleanDays, clean.length);
-  check("mixed window sums clean plus the ratio estimate", site.visits, cleanVisits + estimated);
-  check("pageviews come only from clean days", site.views, cleanViews);
-  check("pages/session divides by clean sessions only",
-    Number(site.pagesPerSession.toFixed(3)), Number((cleanViews / cleanVisits).toFixed(3)));
-  check("flooded days in a mixed window are still flagged", site.partialDays, 2);
-}
-
-// 3. A site with no flood at all must be untouched by any of this.
-{
-  const { data } = await load("period=7");
-  const quiet = data.sites.find((s) => s.host !== HOST && !s.zoneSourced);
-  check("unflooded sites report no partial days", quiet.partialDays, 0);
-  check("unflooded sites report no recovered sessions", quiet.partialVisits, 0);
+  check("a 7-night period against a previous one reaching into legacy nights has no delta", site.delta, null);
+  check("...because the previous period counted fewer nights", site.previousMeasuredDays, 5);
+  const { site: wide } = await load(`domain=${HOST}&period=30`);
+  check("a period against an empty previous one has none", wide.delta, null);
 }
 
 // 4. Measurement classes stay separate. A zone-log host counts HTTP requests, not
@@ -467,9 +463,9 @@ const load = async (query) => {
   check("totals.visits excludes every zoneSourced site", data.totals.visits, rumVisits);
   check("totals.views excludes every zoneSourced site", data.totals.views, rumViews);
   check("...so the headline carries no zone visits", data.totals.visits,
-    estimatedHuman("2026-08-09") + WIKI_DAYS.at(-1).visits + SMALL_DAYS.at(-1).visits);
+    DAYS.at(-1).visits + WIKI_DAYS.at(-1).visits + SMALL_DAYS.at(-1).visits);
   check("...and no zone requests, only RUM pageviews", data.totals.views,
-    WIKI_DAYS.at(-1).views + SMALL_DAYS.at(-1).views);
+    Math.round(DAYS.at(-1).visits * DAYS.at(-1).pps) + WIKI_DAYS.at(-1).views + SMALL_DAYS.at(-1).views);
   check("previous-period totals exclude them too", data.totals.previousVisits,
     rumSites.reduce((sum, s) => sum + s.previousVisits, 0));
   check("zone volume is reported separately, not dropped", data.totals.zone.visits, today.visits);
@@ -534,17 +530,17 @@ const load = async (query) => {
     nameRuns.every((run) => run.sites.every((s, i) => i === 0 || run.sites[i - 1].host.localeCompare(s.host) <= 0)), true);
 }
 
-// 5. Zone crawler accounting. The flood classifier cannot fire on a zone host
-//    (no referrer rows, so directShare is always 0), so its crawler volume would
-//    otherwise be counted as an audience by implication. Two lenses replace the
+// 5. Zone crawler accounting. The browser rule cannot run on a zone host (the
+//    zone log carries no user agent), so its crawler volume would otherwise be
+//    counted as an audience by implication. Two lenses replace the
 //    verdict, and neither may yield a human figure.
 {
   const { data } = await load("period=1");
   const zone = data.sites.find((s) => s.host === ZONE_HOST);
   const rum = data.sites.find((s) => s.host === HOST);
 
-  check("the zone host is never flagged as flooded", zone.botDays, 0);
-  check("...and gets the zone decomposition instead of that silence",
+  check("the browser rule sets nothing aside on a zone host", zone.automatedVisits, 0);
+  check("...which gets the zone decomposition instead",
     zone.zoneBots !== null, true);
   check("verified crawlers are summed as a floor", zone.zoneBots.verifiedRequests, VERIFIED_REQUESTS);
   check("...in visits as well as requests", zone.zoneBots.verifiedVisits, VERIFIED_VISITS);
@@ -631,10 +627,10 @@ const load = async (query) => {
       signal.recurrence === null || Number.isInteger(signal.recurrence), true);
   }
 
-  // The sub-flood: 151 sessions, +180%, flat, direct, one landing page. Exactly
+  // A crawler on a current browser: 151 sessions, +180%, flat, direct, one landing page. Exactly
   // one severity-1 signal, and traffic-rise must NOT also fire — a spike is
   // either growth or a crawler, never reported as both.
-  check("a sub-flood crawler spike is called what it is", kinds(WIKI_HOST), "likely-bot-subflood");
+  check("a crawler spike the browser rule counted is called what it is", kinds(WIKI_HOST), "likely-bot-spike");
   check("...at severity 1", of(WIKI_HOST)[0]?.severity, 1);
   check("...and suppresses traffic-rise for the same host",
     of(WIKI_HOST).some((s) => s.kind === "traffic-rise"), false);
@@ -652,7 +648,7 @@ const load = async (query) => {
   // unmeasured day as 0% errors would manufacture a spike out of a normal day.
   check("...built from the days that were measured, not from zeroes",
     of(ZONE_HOST)[0]?.evidence.includes("4-day mean of 1.1%"), true);
-  for (const kind of ["traffic-rise", "traffic-drop", "likely-bot-subflood", "no-comparison"]) {
+  for (const kind of ["traffic-rise", "traffic-drop", "likely-bot-spike"]) {
     check(`no ${kind} signal for a zone-sourced host`, of(ZONE_HOST).some((s) => s.kind === kind), false);
   }
 
@@ -667,14 +663,9 @@ const load = async (query) => {
   check("...at severity 2", of(MALFORMED_HOST)[0]?.severity, 2);
   check("...counting only the malformed ones", of(MALFORMED_HOST)[0]?.headline.includes("3 malformed"), true);
 
-  // Say when you are silent: a flooded site used to drop out of NOTABLE with no
-  // explanation because site.delta was null.
-  check("a flooded site explains its missing comparison", kinds(HOST), "no-comparison");
-  check("...as context, not an alarm", of(HOST)[0]?.severity, 3);
-  // The one recurrence the loaded history answers exactly: consecutive flooded
-  // days ending today, in the 24h view where that is the same statement.
-  check("...counting the consecutive flooded days it can actually see",
-    of(HOST)[0]?.recurrence, 2);
+  // A flood night under the browser rule is an ordinary counted night: the
+  // crawler sits in automatedVisits, so it raises no signal and suppresses none.
+  check("a flood night set aside by the browser rule raises no signal", of(HOST).length, 0);
 }
 
 // 7b. The malformed-URL predicate itself, against the live paths and against the
@@ -918,14 +909,21 @@ for (const period of [7, 30]) {
   const totals = data.totals;
   const trend = totals.trend;
 
-  check("the traffic comparator spans 14 daily snapshots", trend.days, 14);
-  // HOST's flood days fall inside this 14-day window and now carry a ratio
-  // estimate (see hostRatioStats above) rather than the older floor, which is
-  // why this mean is higher than the pre-estimator figure.
-  check("...averaging human sessions the same way the cards do",
-    trend.visitsPerDay.toFixed(1), "45.7");
-  check("...pageviews from clean days only", trend.viewsPerDay.toFixed(1), "49.9");
-  check("...and search sessions off the same referrer history", trend.searchPerDay.toFixed(1), "15.0");
+  // The two legacy nights carry no marker, so the 14-day window holds 12
+  // counted nights, and the means are over those, computed here from the same
+  // fixture rows rather than typed in.
+  const countedRum = traffic.filter((row) => isRumHost(row.host) && row.date >= "2026-07-27"
+    && !(row.host === HOST && LEGACY_DATES.has(row.date)));
+  const countedDates = new Set(countedRum.map((row) => row.date));
+  const searchRows = referrers.filter((row) => row.kind === "search" && isRumHost(row.host)
+    && countedDates.has(row.date) && !(row.host === HOST && LEGACY_DATES.has(row.date)));
+  const per = (rows, pick) => (rows.reduce((sum, row) => sum + pick(row), 0) / countedDates.size).toFixed(1);
+  check("the traffic comparator spans the counted nights only", trend.days, 12);
+  check("...averaging counted sessions the same way the cards do",
+    trend.visitsPerDay.toFixed(1), per(countedRum, (row) => row.visits));
+  check("...and pageviews", trend.viewsPerDay.toFixed(1), per(countedRum, (row) => row.views));
+  check("...and search sessions off the same referrer history",
+    trend.searchPerDay.toFixed(1), per(searchRows, (row) => row.visits));
 
   // GSC rows are keyed by snapshot date and each covers a three-day window
   // lagging two days, so consecutive rows overlap: the field is named per
@@ -1215,69 +1213,14 @@ for (const period of [7, 30]) {
   }
 }
 
-// 15. The baseline window itself can be entirely flood, not just the 25th-
-//     percentile fallback within it. This is the real forum.objectivismonline.com
-//     incident (2026-08-24): a flood that started 2026-07-30 against a true
-//     ~618/day baseline was still running 26 days later, so a 30-day read never
-//     contained enough (or any) clean days — every fallback computed inside that
-//     window was itself built from flood, and the flood read as "human sessions"
-//     from 2026-08-19 on. BASELINE_LOOKBACK_DAYS widens only the two reads that
-//     feed classifyTraffic, independent of the 30-day floor every other read
-//     keeps; this section proves that widening is actually wired in, not just
-//     that classifyTraffic behaves correctly when handed a wide window (bots-
-//     check.mjs already covers that).
-//
-//     FORUM_HOST gets its own traffic/referrer rows here — nowhere else in this
-//     file gives it any, so this cannot perturb the opportunity-classifier
-//     checks above that use the same host for keywords/search-summary fixtures.
+// 15. No RUM read reaches back past the history window any more. The flood
+//     classifier needed 180 days of baseline (BASELINE_LOOKBACK_DAYS) because a
+//     long flood became its own baseline; the browser rule needs none.
 {
-  const FLOOD_TODAY = "2026-08-09"; // matches DAYS.at(-1).date, i.e. MAX(date)
-  // 21 genuinely clean days, entirely outside the 30-day floor (`date - 29` =
-  // 2026-07-11): real browsing shape, well under FLOOD_MIN_VISITS.
-  const cleanDays = Array.from({ length: 21 }, (_, i) => ({
-    date: dayAfter("2026-06-20", i), visits: 700 + (i % 3) * 40,
-  }));
-  // 30 flood days filling the entire 30-day floor, including today: matches the
-  // flood signature (>=90% direct, <=FLAT_PAGES_PER_SESSION pages/session) throughout, so the
-  // narrow window has zero clean days to build a baseline from.
-  const floodDays = Array.from({ length: 30 }, (_, i) => ({
-    date: dayAfter("2026-07-11", i), visits: i === 29 ? 8000 : 20000,
-  }));
-  for (const day of [...cleanDays, ...floodDays]) {
-    const direct = day.visits >= 5000 ? Math.round(day.visits * .98) : Math.round(day.visits * .7);
-    const pps = day.visits >= 5000 ? 1.05 : 1.35;
-    traffic.push({ date: day.date, host: FORUM_HOST, visits: day.visits, views: Math.round(day.visits * pps) });
-    referrers.push({ date: day.date, host: FORUM_HOST, referrer: "(direct)", kind: "direct", visits: direct });
-    referrers.push({ date: day.date, host: FORUM_HOST, referrer: "www.google.com", kind: "search", visits: day.visits - direct });
-  }
-  // Sanity on the fixture itself: with only the narrow 30-day window (no clean
-  // days in range), the flood's own 25th percentile is 20000, so 8000 must NOT
-  // clear FLOOD_MULTIPLE x that on its own — otherwise this test would pass for
-  // the wrong reason.
-  check("fixture check: today's volume is below 3x the flood's own 25th percentile",
-    8000 < 3 * 20000, true);
-
-  // FORUM_HOST's 21 genuinely clean days (a fixed .7 direct/.3 referred ratio)
-  // clear RATIO_MIN_CLEAN_DAYS too, so today's direct bucket gets the same ratio
-  // estimate treatment as HOST above rather than the floor-only split — computed
-  // the same way, from the real bots.js functions over this block's own fixture.
-  const forumClassified = classifyTraffic(traffic, referrers);
-  const forumRatioStats = directRatioStats(forumClassified, FORUM_HOST);
-  const forumEstimated = splitDay(forumClassified.get(FORUM_HOST).get(FLOOD_TODAY), forumRatioStats).human;
-
   readWidths = [];
-  const { data } = await load(`domain=${FORUM_HOST}&period=1`);
-  const site = data.sites.find((s) => s.host === FORUM_HOST);
-  check("the classifier still finds today a bot flood despite 29 flood-shaped days in the 30-day window",
-    site.botVisits > 0, true);
-  check("...specifically the crawler volume computed against the true, older baseline",
-    site.botVisits, 8000 - forumEstimated);
-  check("...leaving the ratio-estimated total as human",
-    site.visits, forumEstimated);
-  check("...marked partial, not a clean day",
-    site.partialDays, 1);
-  check("the daily_traffic read for the classifier reaches back past the 30-day floor",
-    readWidths.some((r) => r.table === "daily_traffic" && r.binds[0] <= "2026-03-01"), true);
+  await load("period=1");
+  check("the daily_traffic reads stay inside the 30-day history window",
+    readWidths.filter((r) => r.table === "daily_traffic").every((r) => !r.binds[0] || r.binds[0] >= "2026-07-11"), true);
   readWidths = [];
 }
 
@@ -1400,18 +1343,6 @@ for (const period of [7, 30]) {
     check("...at its original severity", signal?.severity, 2);
   }
 
-  // no-comparison keeps its OWN existing method (floodRun over floodDatesByHost)
-  // rather than reading daily_signals at all — planting daily_signals rows for
-  // its (host, kind) must not change what it reports.
-  dailySignalRows = ["2026-08-06", "2026-08-07", "2026-08-08"].map((date) => ({
-    date, host: HOST, kind: "no-comparison",
-  }));
-  {
-    const { data } = await load(`domain=${HOST}&period=1`);
-    const noComparison = (data.signals ?? []).find((s) => s.host === HOST && s.kind === "no-comparison");
-    check("no-comparison ignores daily_signals and keeps its own recurrence method",
-      noComparison?.recurrence, 2);
-  }
   dailySignalRows = saved;
 }
 

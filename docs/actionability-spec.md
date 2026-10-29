@@ -1,5 +1,10 @@
 # Spec: make the dashboard actionable
 
+> **2026-10-29:** the crawler-flood classifier this spec refers to (`classifyTraffic`, `splitDay`,
+> ratio estimates, `no-comparison`, `likely-bot-subflood`) was replaced by the two browser rules in
+> `src/bots.js`; see `AGENTS.md` ("Crawlers are counted as people by RUM"). The items below are kept as
+> the record of why each piece of the page is shaped the way it is.
+
 Status: **items 1 through 8 implemented** — items 1–3 in `bd7e14d`, `b774260`, `ce541c1`,
 `e28f6ba` (2026-08-12); items 4 and 5 in `c7eefc5` (2026-08-13); items 6, 7 and 8 in `e96c949`
 (2026-08-13), with item 8's comparator corrected in `c629dfa` and its stored-keyword coverage

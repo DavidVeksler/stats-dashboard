@@ -1,6 +1,6 @@
 // Renders the dashboard HTML from data read out of D1.
 import { APPLE_SPLASH_LINKS } from "./appleSplashLinks.js";
-import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE, RATIO_MIN_CLEAN_DAYS } from "./bots.js";
+import { BROWSER_LAG, BROWSER_LEAD, NEWEST_MIN_SHARE, EVIDENCE_DAYS, SEGMENT_MIN_VISITS, SEGMENT_DIRECT_SHARE } from "./bots.js";
 import {
   classifyOpportunity, OPPORTUNITY_MIN_IMPRESSIONS, POSITION_MIN_IMPRESSIONS,
   SNIPPET_MAX_POSITION, RANK_MAX_POSITION, SNIPPET_CTR_RATIO, MIN_ACTIONABLE_CLICKS,
@@ -36,7 +36,7 @@ function meanNote(value, mean, days, periodDays, unit = "") {
   const perDay = periodDays > 1 && days > 0 ? Number(value || 0) / days : null;
   const head = perDay === null ? "" : `${fmt(Math.round(perDay))}${suffix}/day here · `;
   return cmp(`${head}14-day mean ${fmt(Math.round(mean))}${suffix}/day`,
-    "Mean over the last 14 daily snapshots, computed from the same human/crawler split the cards use.");
+    "Mean over the last 14 daily snapshots, counted the same way as the cards (current browsers only).");
 }
 
 // `absolute` is the session change behind the ratio. Below DELTA_MIN_ABSOLUTE the
@@ -102,26 +102,26 @@ function sparkline(points, host, unit = "sessions") {
   const line = coords.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   const area = `${pad},${h - pad} ${line} ${w - pad},${h - pad}`;
   const id = `spark-${host.replace(/[^a-z0-9]/gi, "-")}`;
-  const floodCount = points.filter((point) => point.flood).length;
-  // The line plots every measured day, crawler floods included — a flood is a
-  // real event worth seeing — but the flooded points are marked so the spike
-  // never reads as an audience the site does not have.
-  const label = `${points.length}-day ${unit} for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}` +
-    (floodCount ? `; ${floodCount} day${floodCount === 1 ? "" : "s"} crawler-flooded` : "");
+  const label = `${points.length}-day ${unit} for ${host}: ${vals.join(", ")}; latest ${vals.at(-1)}`;
   const pointsWithTitles = coords.map(({ x, y }, index) =>
     `<circle class="spark-hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4">
-      <title>${esc(points[index].date)}: ${fmt(vals[index])} ${unit}${points[index].flood ? " — crawler flood, direct traffic excluded" : ""}</title>
+      <title>${esc(points[index].date)}: ${fmt(vals[index])} ${unit}</title>
     </circle>`).join("");
-  const floodMarks = coords.map(({ x, y }, index) => points[index].flood
-    ? `<circle class="spark-flood" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.4"/>` : "").join("");
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(label)}">
     <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--traffic)" stop-opacity=".22"/><stop offset="1" stop-color="var(--traffic)" stop-opacity="0"/></linearGradient></defs>
     <polygon points="${area}" fill="url(#${id})"/>
     <polyline points="${line}" fill="none" stroke="var(--traffic)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
     ${pointsWithTitles}
     <circle cx="${coords.at(-1).x.toFixed(1)}" cy="${coords.at(-1).y.toFixed(1)}" r="2.7" fill="var(--traffic)"/>
-    ${floodMarks}
   </svg>`;
+}
+
+// The newest version per browser the latest night counted from, for the footer:
+// ", currently Chrome 156, Edge 156, Mobile Safari 27 ...". Empty before the
+// first night under the rule.
+function browserList(browsers) {
+  const top = (browsers ?? []).filter((b) => b.evidence > 0).slice(0, 6);
+  return top.length ? ` (last night: ${top.map((b) => `${esc(b.browser)} ${b.newest}`).join(", ")})` : "";
 }
 
 function referrerList(site) {
@@ -416,8 +416,8 @@ function zoneStrip(sites) {
   </aside>`;
 }
 
-// Crawler accounting for a zone-sourced host. The RUM flood classifier cannot
-// fire on these hosts at all, so instead of one verdict they get two independent
+// Crawler accounting for a zone-sourced host. The RUM browser rule needs a user
+// agent the zone log does not carry, so instead they get two independent
 // lenses — and the one thing this panel must never do is turn either of them into
 // a human count. It does not subtract, does not interpolate, and says outright
 // which part of the day it cannot characterize.
@@ -461,83 +461,53 @@ function zoneCrawlerPanel(site) {
   </div>`;
 }
 
-// Today's actions plus the two "aside" banners (zone-log sites, crawler
-// exclusion) grouped into one collapsible panel. They used to sit on either
+// Today's actions plus the two "aside" banners (zone-log sites, automated
+// traffic) grouped into one collapsible panel. They used to sit on either
 // side of the KPI tiles — actions above, asides below — so getting to "what
 // are the numbers today" meant scrolling past three unrelated blocks first.
 // Collapsing this one panel now gets straight to the KPI tiles beneath it.
 function insightsPanel(signals, totals, sites) {
   const top = (signals ?? []).filter((signal) => signal.severity <= 2).slice(0, 3);
   const labelParts = [top.length ? `${top.length} action${top.length === 1 ? "" : "s"}` : "no actions today"];
-  if (totals.botVisits) labelParts.push("crawler note");
+  if (totals.automatedVisits) labelParts.push("automated traffic");
   if (sites.some((site) => site.zoneSourced)) labelParts.push("zone-log sites");
   return `<details class="insights" open>
     <summary><span class="insights-label">Today's actions &amp; notes<span class="insights-count">${esc(labelParts.join(" · "))}</span></span><span class="summary-action">Hide details</span></summary>
     <div class="insights-body">
       ${actionsBlock(signals)}
       ${zoneStrip(sites)}
-      ${crawlerNote(totals, sites)}
+      ${automatedNote(totals, sites)}
     </div>
   </details>`;
 }
 
 // Crawlers are welcome here (the sites opt into AI training) — they just are not
 // an audience. This banner keeps the excluded volume visible and named, so the
-// headline drop from "13,870 sessions" to a few hundred is explained, not silent.
-function crawlerNote(totals, sites) {
-  if (!totals.botVisits) return "";
-  const named = sites.filter((site) => site.botVisits > 0)
-    .sort((a, b) => b.botVisits - a.botVisits)
-    .map((site) => `${esc(site.host)} (${fmt(site.botVisits)})`)
+// gap between Cloudflare's own session count and the one on this page is
+// explained, not silent.
+function automatedNote(totals, sites) {
+  if (!totals.automatedVisits) return "";
+  const named = sites.filter((site) => site.automatedVisits > 0)
+    .sort((a, b) => b.automatedVisits - a.automatedVisits)
+    .slice(0, 4)
+    .map((site) => `${esc(site.host)} (${fmt(site.automatedVisits)})`)
     .join(", ");
-  const days = totals.floodedSiteDays;
-  const measuredReferred = totals.partialVisits - (totals.estimatedDirect || 0);
-  const estimateNote = totals.estimatedSites
-    ? ` For ${totals.estimatedSites} site${totals.estimatedSites === 1 ? "" : "s"} with enough clean-day history,
-      that direct bucket also gets a ratio estimate (that site's own typical direct/referred split) —
-      ${fmt(totals.estimatedDirect)} more sessions, with its own margin, shown as "~"; everywhere else it
-      stays a hard floor, shown as "&ge;".`
-    : "";
   return `<aside class="crawler" role="note">
-    <strong>${fmt(totals.botVisits)} crawler sessions excluded</strong> — ${pct(totals.botShare, 0)} of everything measured
-    in this period, across ${days} flooded site-day${days === 1 ? "" : "s"}: ${named}.
-    Nothing is blocked. On those days only the direct bucket is unusable — a crawler arrives without a
-    referer, so referred sessions still count${measuredReferred
-      ? ` (${fmt(measuredReferred)} of them here)` : ""}.${estimateNote}
+    <strong>${fmt(totals.automatedVisits)} automated sessions not counted</strong> (${pct(totals.automatedShare, 1)} of what
+    Cloudflare recorded), mostly ${named}. They came from out-of-date browser versions, which crawlers use and
+    people almost never do, or from a desktop browser that sent hundreds of sessions with no referrer at all. Nothing is blocked.
   </aside>`;
 }
 
-// What the headline number actually covers once a flood is in the window. A
-// flooded day is no longer a hole: its referred sessions still count, so the
-// number is a floor. Say which parts came from where, and say plainly when the
-// referred sessions are all there is.
-function crawlerRowDetail(site) {
-  const clean = site.cleanDays
-    ? `Human figures above cover the ${site.cleanDays} clean day${site.cleanDays === 1 ? "" : "s"}` : "";
-  if (!site.partialDays) return clean ? `${clean}.` : "";
-  if (!site.partialVisits) {
-    return clean
-      ? `${clean}; the flooded day${site.botDays === 1 ? "" : "s"} produced no referred sessions at all.`
-      : `No referred sessions were measured on those days, so there is no human figure to report.`;
+// One line under a card's headline: what the browser rule set aside here, or
+// that the period reaches back before the rule existed.
+function automatedRowDetail(site, periodDays) {
+  const parts = [];
+  if (site.automatedVisits) parts.push(`+ ${fmt(site.automatedVisits)} automated session${site.automatedVisits === 1 ? "" : "s"} not counted`);
+  if (site.measuredDays && site.measuredDays < periodDays) {
+    parts.push(`${site.measuredDays} of ${periodDays} days counted`);
   }
-  // partialVisits is the reported total for those days — a bare floor, or, once
-  // estimated, referred (measured) plus the estimated direct share. Keep the two
-  // apart here so "referred sessions" only ever describes the measured part.
-  const measuredReferred = site.partialVisits - (site.estimatedDirect || 0);
-  const recovered = `${fmt(measuredReferred)} referred session${measuredReferred === 1 ? "" : "s"} ` +
-    `that survived the flooded day${site.botDays === 1 ? "" : "s"}`;
-  // Two honest framings for the direct bucket: a bare floor (referred sessions
-  // only, direct traffic set aside as unseparable), or — when this host has
-  // enough clean-day history — a ratio estimate of it (see directRatioStats in
-  // bots.js), always stated with its margin so it never reads as a hard count.
-  const why = site.estimatedVisits
-    ? `A crawler arrives without a referer, so a referral is still a person. Its direct bucket on those ` +
-      `days adds an estimated ${fmt(site.estimatedDirect)} more, from this site's own direct/referred ` +
-      `ratio over ${site.ratioSampleDays} clean days, so the total above is "~" a figure` +
-      `${site.spread ? `, plus or minus about ${fmt(site.spread)}` : ""} — an estimate, not a count.`
-    : `A crawler arrives without a referer, so a referral is still a person; the direct traffic ` +
-      `on those days is not separable, which is why the total is a floor.`;
-  return `${clean ? `${clean}, plus ${recovered}` : `The figure above is the ${recovered}`}. ${why}`;
+  return parts.length ? `<p class="crawler-row" role="note">${parts.join(" · ")}</p>` : "";
 }
 
 // Consecutive-run grouping, never a re-sort: loadDashboard has already ordered
@@ -611,23 +581,17 @@ function domainGrids(sites, allSites, periodDays, unit) {
 // time (toggled client-side — see the bottom-of-page script and the
 // "Bot-resistant view" select in the toolbar). "all" is the existing figure,
 // unchanged. "search"/"referred" read straight off `site.sources`, which is
-// already the crawler-clean quantity: a flooded day's direct bucket is set
-// aside, but its referred/search rows survive (see splitDay/refRows in
-// index.js), so these two views need no separate bot-handling of their own —
-// that is the whole premise of the toggle (a crawler arrives without a referer,
-// so it cannot fake one). Neither carries a delta badge or a
+// counted under the same browser rule as the headline, and a crawler mostly
+// arrives without a referer, so these two slices are a second line of defence
+// against one that sends a current browser version. Neither carries a delta badge or a
 // pages/session figure: no previous-period channel breakdown is stored, and
 // pageviews carry no referrer dimension to split by channel, so showing either
 // would fabricate a comparison the data does not support.
 function numsBlocks(site, periodLabel) {
-  const allBlock = `<div class="nums tv-all"><div class="big">${site.visits
-    ? `${site.partialDays ? (site.estimatedVisits ? "&sim;&nbsp;" : "&ge;&nbsp;") : ""}${fmt(site.visits)}`
-    : "—"}${site.estimatedVisits && site.spread ? `<span class="spread" title="Ratio estimate of the flooded day's direct bucket, plus or minus this margin — see the note below.">&plusmn;${fmt(site.spread)}</span>` : ""}</div><div class="lbl">${site.zoneSourced ? "zone visits" : "human sessions"} ${periodLabel}</div>
+  const allBlock = `<div class="nums tv-all"><div class="big">${site.visits ? fmt(site.visits) : "—"}</div><div class="lbl">${site.zoneSourced ? "zone visits" : "sessions"} ${periodLabel}</div>
     ${deltaBadge(site.delta, true, site.visits - site.previousVisits)}<div class="pv">${site.zoneSourced
       ? `${fmt(site.views)} requests · ${bytesLabel(site.bytes)}`
-      : site.cleanDays
-        ? `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`
-        : `pageviews not separable on flooded days`}</div></div>`;
+      : `${fmt(site.views)} views · ${site.pagesPerSession ? site.pagesPerSession.toFixed(1) : "0.0"} pages/session`}</div></div>`;
   if (site.zoneSourced) {
     // Zone hosts write no daily_referrers rows at all (no referer dimension in
     // the zone log), so there is no channel to break out — say so rather than
@@ -647,15 +611,15 @@ function numsBlocks(site, periodLabel) {
   // (site.sources), and on a card with a Google/Bing search-summary panel it
   // renders directly above numbers from a completely different system — Search
   // Console / Bing's own CLICK counts, on their own rolling/lagged window,
-  // unaffected by whether this device's browser sent a referrer or by today's
-  // crawler flood. A RUM-referrer count of 2 sitting over a GSC click count of
-  // 352 (forum.objectivismonline.com, a heavily flooded day) reads as a bug if
+  // unaffected by whether this device's browser sent a referrer or by the
+  // browser rule. A RUM-referrer count of 2 sitting over a GSC click count of
+  // 352 (forum.objectivismonline.com, 2026-08) reads as a bug if
   // the two aren't told apart in the visible text — see the "two populations,
   // never mixed" gotcha in AGENTS.md for the same trap elsewhere on this page.
   const popNote = `RUM referrer, not GSC/Bing clicks`;
   const popTitle = "Cloudflare Web Analytics sessions classified by referrer — not the same measurement as the "
     + "Search Console / Bing panels on this card, which report their own click counts on their own rolling, "
-    + "lagged window and are unaffected by referrers or today's crawler flood. The two numbers are not comparable.";
+    + "lagged window and are unaffected by referrers or the browser rule. The two numbers are not comparable.";
   const searchBlock = `<div class="nums tv-search" hidden><div class="big">${fmt(site.sources?.search)}</div>
     <div class="lbl" title="${esc(popTitle)}">search-referred sessions ${periodLabel}</div>
     <div class="pv">${popNote}</div></div>`;
@@ -831,7 +795,7 @@ function siteCard(site, index, periodDays) {
       Requests include crawlers, assets, and robots.txt, so this is not comparable to the session counts above.</p>` : ""}
     ${site.zoneSourced ? zoneCrawlerPanel(site) : ""}
     ${r2Panel(site)}
-    ${site.botVisits ? `<p class="crawler-row" role="note"><strong>+ ${fmt(site.botVisits)} crawler sessions</strong> over ${site.botDays} flooded day${site.botDays === 1 ? "" : "s"}${site.anomaly ? ` — ${esc(site.anomaly)}` : ""}. ${crawlerRowDetail(site)}</p>` : ""}
+    ${site.zoneSourced ? "" : automatedRowDetail(site, periodDays)}
     ${searchSummary(site.searchSummary)}
     ${bingSummary(site)}
     ${hasDetails ? (site.zoneSourced ? `<details class="detail" open data-card-index="${index}">
@@ -1027,16 +991,16 @@ export function renderDashboard(data) {
   const trend = totals.trend ?? {};
   const zoneDomains = totals.zoneDomains ?? 0;
   // The zone hosts are counted in "Domains shown" and deliberately not in
-  // "Human sessions", which is exactly the pair of tiles that read "12 / 12 with
+  // "Sessions", which is exactly the pair of tiles that read "12 / 12 with
   // traffic" beside "11 RUM sites" and looked like a bug. State the split.
   const domainSplit = zoneDomains
     ? `${rumDomains} RUM + ${zoneDomains} zone · ${totals.active} with traffic`
     : `${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${totals.active} with traffic`;
-  // The "Human sessions" tile gets three renderings — all/search/referred — same
+  // The "Sessions" tile gets three renderings — all/search/referred — same
   // client-side toggle as the site cards and domain headings (see numsBlocks and
   // the bottom-of-page script). `totals.sourceMix` is already RUM-only and
-  // already crawler-clean (see the "Two measurement classes" and flood-splitting
-  // notes in AGENTS.md), so no new aggregate is computed here — just read back.
+  // already counted under the browser rule (see bots.js), so no new aggregate
+  // is computed here — just read back.
   // Neither channel view carries a delta or 14-day mean: no previous-period
   // channel breakdown is stored, so showing one would fabricate a comparator.
   const searchTotal = Number(totals.sourceMix?.search || 0);
@@ -1050,14 +1014,14 @@ export function renderDashboard(data) {
   // mixed" trap as numsBlocks above, just at the page level instead of the card
   // level.
   const sessionsTile = `<div class="stat">
-    <div class="k tv-all"><span class="dot traffic" aria-hidden="true"></span>Human sessions</div>
+    <div class="k tv-all"><span class="dot traffic" aria-hidden="true"></span>Sessions</div>
     <div class="k tv-search" hidden><span class="dot search" aria-hidden="true"></span>Search-referred sessions</div>
     <div class="k tv-referred" hidden><span class="dot social" aria-hidden="true"></span>Non-direct sessions</div>
     <div class="v tv-all">${fmt(totals.visits)}</div>
     <div class="v tv-search" hidden>${fmt(searchTotal)}</div>
     <div class="v tv-referred" hidden>${fmt(referredTotal)}</div>
-    <div class="s tv-all">${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}</div>
-    <div class="s tv-search" hidden><span>RUM sessions with a search-engine referrer — any of them, not just Google and Bing. A crawler doesn't fake this, so it holds up even on a flooded day. Not the same measurement as the Google clicks / search impressions tiles below: those are Search Console's own click counts on their own rolling, lagged window.</span></div>
+    <div class="s tv-all">${deltaBadge(totals.delta, false, totals.visits - totals.previousVisits)}<span>${rumDomains} RUM site${rumDomains === 1 ? "" : "s"} · ${coverageNote || periodLabel.toLowerCase()} · current browsers${totals.automatedVisits ? `, ${fmt(totals.automatedVisits)} automated not counted` : ""}</span>${meanNote(totals.visits, trend.visitsPerDay, totals.daysAvailable, data.periodDays)}</div>
+    <div class="s tv-search" hidden><span>RUM sessions with a search-engine referrer — any of them, not just Google and Bing. A crawler rarely fakes this. Not the same measurement as the Google clicks / search impressions tiles below: those are Search Console's own click counts on their own rolling, lagged window.</span></div>
     <div class="s tv-referred" hidden><span>RUM sessions with any non-direct referrer (search, social, external link). Bots almost never carry one. Not the same measurement as the search tiles below, which come from Search Console's own click reporting.</span></div>
   </div>`;
   // Fourth tuple item is the color of the small `.dot` icon rendered beside the
@@ -1154,7 +1118,6 @@ header.top{display:flex;align-items:flex-start;justify-content:space-between;gap
 .anomaly{margin:0 0 14px;padding:9px 12px;border-radius:9px;background:var(--danger-soft);color:var(--danger);font-size:12px;line-height:1.45;border:1px solid color-mix(in srgb,var(--danger) 28%,transparent)}.anomaly strong{font-weight:700}
 .crawler{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--social);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.crawler strong{color:var(--ink);font-weight:700}
 .crawler-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--social) 10%,transparent);border:1px solid color-mix(in srgb,var(--social) 24%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}.crawler-row strong{color:var(--social);font-weight:700}
-.spark-flood{fill:var(--paper);stroke:var(--social);stroke-width:1.6}
 .zone-strip{margin:-2px 0 18px;padding:11px 14px;border-radius:var(--radius);background:var(--card);border:1px solid var(--line);border-left:3px solid var(--faint);box-shadow:var(--shadow);font-size:12px;line-height:1.5;color:var(--muted)}.zone-strip-label{font-size:10px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;color:var(--faint)}.zone-strip-label span{text-transform:none;letter-spacing:0;font-weight:400}.zone-strip ul{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}.zone-strip b{color:var(--ink);font-weight:650}
 .zone-section{margin-top:22px}.domain-group+.domain-group{margin-top:20px}.domain-heading{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;font-weight:700;letter-spacing:-.01em;margin:0 0 9px;padding-bottom:6px;border-bottom:1px solid var(--line);cursor:pointer;list-style:none}.domain-heading::-webkit-details-marker{display:none}.domain-heading::before{content:"▾";font-size:9px;color:var(--faint)}.domain-group:not([open])>.domain-heading::before{content:"▸"}.domain-heading span{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--faint)}.section-heading{font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);margin:0 0 11px;font-weight:700}.card--zone{border-left:3px solid var(--faint)}.zone-row{margin:0;padding:8px 11px;border-radius:9px;background:color-mix(in srgb,var(--faint) 9%,transparent);border:1px solid color-mix(in srgb,var(--faint) 22%,transparent);font-size:11.5px;line-height:1.45;color:var(--muted)}
 .zone-bots{margin:0;padding:10px 12px;border-radius:9px;background:color-mix(in srgb,var(--social) 8%,transparent);border:1px solid color-mix(in srgb,var(--social) 22%,transparent);font-size:11.5px;line-height:1.5;color:var(--muted)}.zone-bots h3{font-size:9.5px;text-transform:uppercase;letter-spacing:.11em;font-weight:700;margin:0 0 5px;color:var(--social)}.zone-bots h3:not(:first-child){margin-top:11px;padding-top:9px;border-top:1px dashed color-mix(in srgb,var(--social) 26%,transparent)}.zone-bots p{margin:0 0 6px}.zone-bots p:last-child{margin-bottom:0}.zone-bots b{color:var(--ink);font-weight:650}.zone-bots .cats{list-style:none;margin:0 0 6px;padding:0;display:flex;flex-wrap:wrap;gap:3px 12px;font-size:11px}
@@ -1216,17 +1179,17 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
     ${forumSection(data.forums)}
   </main>
   <footer>
-    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable. Each KPI tile carries a <b>14-day mean</b> beside it, computed from the same daily snapshots and the same human/crawler split the cards use, so every figure can be read against what normal looks like.</div>
+    <div><b>Sessions</b> are Cloudflare Web Analytics visits; pageviews, referrers, and "landing pages (all traffic)" use the selected traffic period and cover every referrer (search, social, direct, etc.) — "ent" is entrances, sessions that started on that page. Direct traffic is shown separately so smaller external sources remain readable. Each KPI tile carries a <b>14-day mean</b> beside it, computed from the same daily snapshots and counted the same way the cards are, so every figure can be read against what normal looks like.</div>
     <div><b>Cards are grouped by domain.</b> Every host of a registrable domain (freecapitalists.org covers wiki., forum., library. and the apex) sits in one block, blocks are ordered by that domain's own total, and hosts are ordered by theirs inside it — the same metric at both levels, so the sort control moves them together. Grouping happens within a measurement class, never across one: a domain with both a RUM host and a zone-log host appears in both sections, ranked against its own class each time, because sessions and HTTP requests are not the same quantity.</div>
     <div><b>Traffic sources</b> covers RUM sites only, and <b>Unattributed is a residual, not a channel</b>: it is the arithmetic gap between the sessions the traffic table counted and the referrer rows the referrer table stored, so it sits outside the mix bar with its causes named rather than competing with Direct and Search. <b>Internal</b> is sessions arriving from one of a site's own hostnames — an apex landing page handing off to the forum, say. Those were dropped rather than stored and reappeared inside the residual; they are recorded from 2026-08-13 forward. The channel is frozen into each stored row at write time, so it cannot be backfilled: over a window that reaches back before that date the channel is simply absent rather than shown as a measured zero.</div>
-    <div><b>Human vs crawler.</b> Crawlers fire the same analytics beacon a person does, so a site-day is set aside as a crawler flood when it is ≥${pct(DIRECT_SHARE, 0)} direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, at least ${fmt(FLOOD_MIN_VISITS)} sessions, and at least ${FLOOD_MULTIPLE}× a normal day for that site. On a flooded day only the direct bucket and the landing-page rows are set aside: a crawler arrives without a referer, so the referred sessions are still a real measurement and still count. For a site with at least ${RATIO_MIN_CLEAN_DAYS} clean days on record, the direct bucket is also given a ratio estimate — that site's own typical direct-to-referred split on ordinary days — and shown as "~" with its own margin; otherwise the day's sessions read as a floor (≥) rather than a count. Either way, pages/session divides by clean sessions only, and a delta is suppressed whenever either side of the comparison is partial. Excluded volume is counted separately and flooded days are marked on each sparkline. Crawling is not blocked, and search/GSC figures are unaffected.</div>
-    <div><b>Bot-resistant view</b> (toolbar) switches every card, domain heading, and the Human sessions tile to a slice of RUM traffic a crawler is structurally unlikely to fake: <b>Search traffic only</b> ("search-referred sessions") is sessions whose Cloudflare Web Analytics referrer was a search engine, and <b>Referred traffic only</b> ("non-direct sessions") is any non-direct referrer (search, social, or an external link) — a crawler arrives without a referer, so both are already the crawler-clean part of the numbers above, flooded days included. It is instant and client-side, so it never re-sorts the cards (still ranked by total traffic) and carries no delta or 14-day mean, because no previous-period channel breakdown is stored to compare against. Zone-log hosts have no referrer dimension and show "not tracked by referrer" in both views. <b>These are not the Google/Bing search figures on the same card or in the KPI tiles below</b>: this is a Cloudflare Web Analytics referrer classification, an entirely different measurement from Search Console/Bing's own click counts, which are pulled on their own rolling, lagged window and unaffected by whether a browser sent a referrer or by today's crawler flood. A small RUM search-referred count sitting above a much larger GSC click count for the same host is not a contradiction — see the "two populations, never mixed" gotchas elsewhere on this page for why the two are never merged into one number.</div>
-    <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. Flooded days are called out as "no like-for-like comparison" rather than quietly dropping off the list.</div>
+    <div><b>Sessions count current browsers only.</b> Crawlers fire the same analytics beacon a person does, and Cloudflare's own bot flag marks none of them. What gives them away is the browser they claim: Chrome, Edge, Firefox and Safari update themselves, so a real visitor is almost always on one of the last few releases, while crawler fleets rotate through user agents years out of date. A session counts when its browser's major version is no more than ${BROWSER_LAG} behind (or ${BROWSER_LEAD} ahead of) the newest version real visitors use, where "newest" is the highest version holding at least ${pct(NEWEST_MIN_SHARE, 0)} of that browser's referred sessions over the last ${EVIDENCE_DAYS} days${browserList(data.totals?.browsers)}. A crawler that sends a current version gives itself away differently: one browser, version and desktop OS sending at least ${fmt(SEGMENT_MIN_VISITS)} sessions in a night, ${pct(SEGMENT_DIRECT_SHARE, 0)} or more of them with no referrer, which no group of real visitors here has come close to. Phones are exempt, because apps strip referrers from real people. Everything either rule sets aside is reported as <b>automated</b>, beside the count and never inside it. Nothing is blocked. The cost is the few percent of real people on an out-of-date browser, the same few percent every day, so trends hold. A crawler too small for the second rule still counts; the "looks like a crawler" signal is the alarm for that.${data.totals?.countedSince ? ` Counted this way from ${esc(data.totals.countedSince)}; earlier RUM history held crawler traffic and is not shown.` : ""}</div>
+    <div><b>Bot-resistant view</b> (toolbar) switches every card, domain heading, and the Sessions tile to a slice of RUM traffic a crawler is structurally unlikely to fake: <b>Search traffic only</b> ("search-referred sessions") is sessions whose Cloudflare Web Analytics referrer was a search engine, and <b>Referred traffic only</b> ("non-direct sessions") is any non-direct referrer (search, social, or an external link) — a crawler mostly arrives without a referer, so both are a second check on the numbers above. It is instant and client-side, so it never re-sorts the cards (still ranked by total traffic) and carries no delta or 14-day mean, because no previous-period channel breakdown is stored to compare against. Zone-log hosts have no referrer dimension and show "not tracked by referrer" in both views. <b>These are not the Google/Bing search figures on the same card or in the KPI tiles below</b>: this is a Cloudflare Web Analytics referrer classification, an entirely different measurement from Search Console/Bing's own click counts, which are pulled on their own rolling, lagged window and unaffected by whether a browser sent a referrer. A small RUM search-referred count sitting above a much larger GSC click count for the same host is not a contradiction — see the "two populations, never mixed" gotchas elsewhere on this page for why the two are never merged into one number.</div>
+    <div><b>Today's actions</b> lists the highest-severity signals the page can justify from its own data, not every change. Percentage changes are only shown where the absolute movement is at least ${fmt(DELTA_MIN_ABSOLUTE)} sessions — below that the raw change is shown instead, because a percentage on a small base is noise. Session and pages/session rules run on RUM sites only: a zone-log host is measured in HTTP requests, so "sessions rose 40%" or "pages/session fell by 2.1" about one of them would be a different quantity wearing the same words. Zone hosts get their own rules instead, today an error-rate spike against a ${fmt(ERROR_BASELINE_DAYS)}-day baseline. A delta is shown only when both periods have the same number of counted days.</div>
     <div><b>Search performance, queries, and landing pages (Google Search)</b> use the latest complete Google Search Console window and only cover organic Google traffic. Summary totals come from an aggregate query rather than the ranked rows. <b>Median search position</b> is the median across queries with at least ${fmt(POSITION_MIN_IMPRESSIONS)} impressions, not a mean: a mean across a branded position-1 query and a position-90 stray moves when the junk moves and stays put when the work lands. <b>Two populations, never mixed:</b> the <b>Search CTR</b> headline is every query on every property, tail included, but expected CTR needs a per-query position and the only per-query rows stored are the top queries Google returns per site. So the CTR comparison states both of its sides over those stored rows and reports what share of impressions they cover, and the position line counts stored top queries rather than the whole estate. Comparing a top-query expectation against a whole-corpus actual made a roughly 6× gap read as 15×. <b>GSC figures are a rolling window, not a daily series</b> — each nightly snapshot asks Google for a three-day window that lags two days, so consecutive snapshots overlap by two days out of three; only trailing averages are taken from them, a snapshot-over-snapshot difference is never presented as a change, and every date shown here is the window Google measured rather than the night we asked.</div>
-    <div><b>Forum activity</b> is read from each Discourse forum's own <code>/about.json</code>, the same rolling-window counters its admin dashboard shows (active users today / 7 days / 30 days, new signups on the same three windows) — not re-derived from the paginated admin user list. These are Discourse's own counts, not this dashboard's; no comparator or crawler-flood logic applies to them.</div>
+    <div><b>Forum activity</b> is read from each Discourse forum's own <code>/about.json</code>, the same rolling-window counters its admin dashboard shows (active users today / 7 days / 30 days, new signups on the same three windows) — not re-derived from the paginated admin user list. These are Discourse's own counts, not this dashboard's; no comparator or browser rule applies to them.</div>
     <div><b>Search opportunities come in two classes with two different remedies, ranked by two different metrics.</b> A <b>snippet</b> gap is a query at position ${SNIPPET_MAX_POSITION} or better taking under ${pct(SNIPPET_CTR_RATIO, 0)} of the click-through its rank would ordinarily deliver: the ranking is already there, so the fix is the title and meta description, and these are ranked by <b>lost clicks</b> — impressions × (expected CTR − actual CTR) — which is what is recoverable without moving at all. A <b>rank</b> gap is a query between position ${SNIPPET_MAX_POSITION} and ${RANK_MAX_POSITION}, where nobody ever saw the snippet, so the fix is content and internal links, and these are ranked by <b>potential clicks</b> — what the query would earn at position ${TARGET_POSITION}, less what it earns now. Ranking both classes by lost clicks would guarantee that a deep, valuable query always lost to a shallow trivial one. Both classes need at least ${fmt(OPPORTUNITY_MIN_IMPRESSIONS)} impressions and at least ${MIN_ACTIONABLE_CLICKS} clicks of gain over the window; past position ${RANK_MAX_POSITION} a query is neither badged nor counted. Expected CTR by position is approximated from the SISTRIX 2020 CTR study (~80M keywords; positions 1, 2, 3 and 10 measured, the rest interpolated and the tail past 10 estimated), so it is a comparator and never a target — that is why no number derived from it is shown to more than one decimal place. Where a site sets <code>queryDenyPatterns</code> in <code>src/config.js</code>, matching queries still appear in the list and carry no badge.</div>
     <div><b>Each badged query names the page it ranks, and <i>Pages to fix</i> regroups both classes by page</b> — from the stored (query, page) pairs, each class summed in its own unit and never added to the other. Those pairs omit the queries Google anonymizes, so a page's figures there are <i>over stored queries</i> and are not the same population as its row under <i>Top landing pages (Google Search)</i>, which counts everything Google measured. A <b>split query</b> is one with at least ${fmt(CANNIBAL_MIN_IMPRESSIONS)} stored impressions where two or more of the site's own pages each hold at least ${pct(CANNIBAL_MIN_SHARE, 0)} of them: Google is choosing between them, so the fix is to pick one and consolidate, not to strengthen either.</div>
-    ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other. The crawler-flood classifier cannot run on them either — it needs a referrer dimension the zone log does not have — so each zone card carries its own two-lens accounting instead: <b>verified crawlers</b>, from the categories Cloudflare cryptographically verifies, which is a floor on crawler volume rather than a bot/human split (this plan does not expose bot scores, so unverified crawlers are unmeasurable and sit in the same bucket as real readers), and <b>non-content requests</b>, meaning crawler-protocol and asset paths plus every response ≥ 400. The two overlap, so they are never added, and no human count is claimed for a zone host at all.</div>` : ""}
+    ${hasZoneSite ? `<div><b>Zone-log sites</b> (file hosts with no HTML page to carry the Web Analytics beacon) report Cloudflare's zone-level HTTP request log instead of RUM, so their numbers are request counts, not sessions: "zone visits" is Cloudflare's heuristic arrival count over raw HTTP requests — crawler fetches of robots.txt included — "requests" is total HTTP hits, and country / status-code panels stand in for the referrer and search-console data those sites don't have. They are excluded from every headline total, from pages/session, and from the traffic-source mix, and ranked only against each other. The browser rule cannot run on them either — it needs a user agent the zone log does not carry — so each zone card carries its own two-lens accounting instead: <b>verified crawlers</b>, from the categories Cloudflare cryptographically verifies, which is a floor on crawler volume rather than a bot/human split (this plan does not expose bot scores, so unverified crawlers are unmeasurable and sit in the same bucket as real readers), and <b>non-content requests</b>, meaning crawler-protocol and asset paths plus every response ≥ 400. The two overlap, so they are never added, and no human count is claimed for a zone host at all.</div>` : ""}
     ${hasBingSite ? `<div><b>Bing Search</b> is pulled from Bing Webmaster Tools, a separate account-wide API key rather than GSC's OAuth. Per site, it stays on its own card row, never merged into that site's Google figures — a different engine's audience, measured by a different tool. Only the estate-wide tiles above add the two together: "Search clicks", "Search impressions", and the headline CTR on the <b>Search CTR · position</b> tile, all whole-corpus clicks over impressions on both engines. Position is never pooled: the headline is Google's median, Bing's median over its own stored query rows sits on its own line, and the expected-CTR comparison and 14-snapshot mean are Google-only and say so. The site-wide summary (clicks, impressions, CTR) updates daily; per-query rows update weekly, so a query list can be several days further behind than the summary beside it — each carries its own window. Bing reports two positions per query (where clicks landed, and where every impression landed) rather than GSC's one, shown as reported rather than averaged into a single figure. Only sites with a verified Bing Webmaster Tools property (<code>bing</code> in <code>src/config.js</code>) are pulled; page-level Bing data is not collected, to stay within the Worker's per-invocation subrequest budget.</div>` : ""}
     <div>Data pulled ${esc(formatTimestamp(updatedAt))} · ${data.run?.ok ? "last run OK" : "see run log"} · rendered ${esc(formatTimestamp(data.generatedAt))} · sources: Cloudflare GraphQL Analytics, Google Search Console${hasBingSite ? ", and Bing Webmaster Tools" : ""}.</div>
   </footer>
@@ -1317,7 +1280,7 @@ footer{margin-top:32px;padding-top:17px;border-top:1px solid var(--line);font-si
   // it needs (site.sources, totals.sourceMix) is already in the rendered page.
   // Only one of .tv-all/.tv-search/.tv-referred is ever unhidden at a time, on
   // every element that carries the three variants (site cards, domain headings,
-  // the Human sessions tile); card order is left alone (still ranked by total
+  // the Sessions tile); card order is left alone (still ranked by total
   // traffic), and the source-mix bar just dims the channels the view excludes.
   var trafficSelect = document.getElementById("traffic-view");
   var applyTrafficView = function (view) {

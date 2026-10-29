@@ -37,7 +37,6 @@
 //                owns real recurrence; a wrong "3rd consecutive day" is worse
 //                than an absent one, so nothing here guesses.
 
-import { FLAT_PAGES_PER_SESSION } from "./bots.js";
 import { looksMalformed, pagePath } from "./urls.js";
 
 // Session-delta floors. Shared with the renderer's delta badge so the page shows
@@ -54,23 +53,24 @@ export const DROP_MAX_DELTA = -0.25;
 // in this estate.
 export const AI_RISE_MIN_ABSOLUTE = 3;
 
-// likely-bot-subflood: a crawler spike sitting just under FLOOD_MIN_VISITS, which
-// the flood classifier is right not to fire on (below 500 sessions a flood is
-// indistinguishable from noise on volume alone) but which the four shape tests
-// together identify with no volume ambiguity at all.
+// likely-bot-spike: a crawler the current-browser rule counted, because it
+// sends a current user agent (see bots.js — the one thing that rule cannot
+// catch). Four shape tests together identify one: a real spike is not
+// simultaneously flat, ~all direct, and ~all landing on one URL.
 //
 // The volume floor here is 50 sessions of absolute change and 100 resulting
 // sessions, NOT the 100 absolute change the spec originally wrote down. The live
-// case this rule exists for — wiki.freecapitalists.org on 2026-08-13, 151
+// case this rule was written for — wiki.freecapitalists.org on 2026-08-13, 151
 // sessions up from about 54 — is an absolute change of +97 and would have failed
-// its own rule. The other three tests are what make a low volume floor safe:
-// a real 100-session day is not simultaneously flat, ~all direct, and ~all
-// landing on one URL.
+// its own rule. The other three tests are what make a low volume floor safe.
 export const SUBFLOOD_MIN_DELTA = 1.0;             // +100%
 export const SUBFLOOD_MIN_ABSOLUTE_CHANGE = 50;
 export const SUBFLOOD_MIN_VISITS = 100;
 export const SUBFLOOD_DIRECT_SHARE = 0.8;
 export const SUBFLOOD_TOP_PAGE_SHARE = 0.8;
+// Crawlers seen so far requested 1-2 pages a session (forum.objectivismonline.com
+// moved from ~1.0 to ~2.08 mid-crawl in Aug 2026); margin above that.
+export const SUBFLOOD_MAX_PAGES_PER_SESSION = 3.0;
 
 // error-spike, over daily_zone_status history. Both a relative and an absolute
 // trigger, plus two floors so a 2x rise from 0.1% to 0.2% cannot fire.
@@ -127,7 +127,7 @@ function errorSeries(host, zoneStatusRows, trafficRows) {
 // Share of entrances taken by the single busiest landing page. The denominator is
 // the larger of the measured entrances and the site's session count, because only
 // the top rows are kept per day — taking the smaller one would inflate the share
-// and make the subflood rule easier to trip, which is the wrong direction for a
+// and make the likely-bot-spike rule easier to trip, which is the wrong direction for a
 // rule that tells the reader to discount their own traffic.
 function topLandingShare(site) {
   const rows = site.cfPages ?? [];
@@ -139,28 +139,12 @@ function topLandingShare(site) {
     page: top.page, entries: Number(top.visits || 0) };
 }
 
-// Consecutive days ending at `date` on which this host was crawler-flooded.
-// The one recurrence the loaded history answers exactly, and only in the 24h
-// view: at periodDays === 1 a flooded day is precisely a day whose delta was
-// suppressed, so "flooded N days running" and "no-comparison fired N days
-// running" are the same statement. Every other rule gets null (see the header).
-function floodRun(floodDates, date) {
-  if (!floodDates?.size || !floodDates.has(date)) return null;
-  let run = 0;
-  const cursor = new Date(`${date}T00:00:00Z`);
-  while (floodDates.has(cursor.toISOString().slice(0, 10))) {
-    run += 1;
-    cursor.setUTCDate(cursor.getUTCDate() - 1);
-  }
-  return run;
-}
-
 // Rank inside a severity band: how big the thing is, in its own units. Rough
 // across kinds by design — severity is the real ordering, this only breaks ties.
 function weigh(kind, site, extra) {
   switch (kind) {
     case "error-spike": return extra.errorRequests;
-    case "likely-bot-subflood": return Math.abs(extra.absolute);
+    case "likely-bot-spike": return Math.abs(extra.absolute);
     case "traffic-drop":
     case "traffic-rise": return Math.abs(extra.absolute);
     case "malformed-urls": return extra.count * 10;
@@ -169,7 +153,6 @@ function weigh(kind, site, extra) {
     case "snippet-gap":
     case "rank-gap": return extra.clicks;
     case "query-cannibalization": return extra.impressions;
-    case "no-comparison": return Number(site.visits || 0);
     case "ai-referral-rise": return Math.abs(extra.absolute);
     // Pipeline-health signals (item 12) are estate-wide, not site-shaped, so
     // their weight is a fixed ordering among themselves (main > Bing > forum)
@@ -197,7 +180,6 @@ function daysBetween(a, b) {
  * @param {number} input.periodDays 1 | 7 | 30
  * @param {Array}  input.zoneStatusRows  {date,host,status,requests} over the history window
  * @param {Array}  input.trafficRows     {date,host,visits,views} over the history window
- * @param {Map}    input.floodDatesByHost Map<host, Set<date>>
  * @param {object|null} input.run   latest `runs` row ({run_at, ok, note}) or null
  * @param {boolean} input.bingConfigured   at least one SITES entry carries a `bing` property
  * @param {boolean} input.bingHasRowsToday `daily_bing_summary` has a row for `date`
@@ -207,7 +189,7 @@ function daysBetween(a, b) {
  * @param {Map}    input.aiBaselineByHost Map<host, trailing daily mean of the same sum>
  */
 export function computeSignals({ sites = [], date = null, periodDays = 1,
-  zoneStatusRows = [], trafficRows = [], floodDatesByHost = new Map(),
+  zoneStatusRows = [], trafficRows = [],
   run = null, bingConfigured = false, bingHasRowsToday = false,
   forumsConfigured = false, forumHasRowsToday = false,
   aiCurrentByHost = new Map(), aiBaselineByHost = new Map() } = {}) {
@@ -308,24 +290,24 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
     const pagesPerSession = Number(site.pagesPerSession || 0);
     const landing = topLandingShare(site);
 
-    // likely-bot-subflood. Mutually exclusive with traffic-rise by construction:
+    // likely-bot-spike. Mutually exclusive with traffic-rise by construction:
     // the rise rule below is guarded on this not having fired.
-    const subflood = hasDelta
+    const crawlerSpike = hasDelta
       && delta >= SUBFLOOD_MIN_DELTA
       && absolute >= SUBFLOOD_MIN_ABSOLUTE_CHANGE
       && visits >= SUBFLOOD_MIN_VISITS
-      && pagesPerSession > 0 && pagesPerSession <= FLAT_PAGES_PER_SESSION
+      && pagesPerSession > 0 && pagesPerSession <= SUBFLOOD_MAX_PAGES_PER_SESSION
       && directShare >= SUBFLOOD_DIRECT_SHARE
       && landing.share >= SUBFLOOD_TOP_PAGE_SHARE;
-    if (subflood) {
+    if (crawlerSpike) {
       add({
-        severity: 1, kind: "likely-bot-subflood", host,
+        severity: 1, kind: "likely-bot-spike", host,
         headline: `${host} is up ${pctText(delta, 0)}, and it looks like a crawler rather than growth`,
         evidence: `${num(visits)} sessions (was ${num(previousVisits)}), ${pctText(directShare, 0)} direct, ` +
           `${pagesPerSession.toFixed(1)} pages/session, ${pctText(landing.share, 0)} of entrances on ${landing.page}.`,
-        action: "Treat as crawler traffic, not growth, and consider lowering the flood floor for this host.",
+        action: "Treat as crawler traffic, not growth: it is sending a current browser version, so the browser rule counts it.",
         href, recurrence: null,
-      }, weigh("likely-bot-subflood", site, { absolute }));
+      }, weigh("likely-bot-spike", site, { absolute }));
     }
 
     // malformed-urls. Item 10 owns badging the individual rows; this counts them.
@@ -425,7 +407,7 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
         href, recurrence: null,
       }, weigh("traffic-drop", site, { absolute }));
     }
-    if (!subflood && hasDelta && delta >= RISE_MIN_DELTA && Math.abs(absolute) >= SIGNAL_MIN_ABSOLUTE_CHANGE) {
+    if (!crawlerSpike && hasDelta && delta >= RISE_MIN_DELTA && Math.abs(absolute) >= SIGNAL_MIN_ABSOLUTE_CHANGE) {
       add({
         severity: 3, kind: "traffic-rise", host,
         headline: `${host} sessions rose ${pctText(delta, 0)}`,
@@ -459,21 +441,6 @@ export function computeSignals({ sites = [], date = null, periodDays = 1,
       }, weigh("ai-referral-rise", site, { absolute: aiAbsolute }));
     }
 
-    // no-comparison. Says out loud what the page used to leave silent: a flooded
-    // site simply dropped out of NOTABLE because site.delta was null, with no
-    // explanation rendered anywhere.
-    const partial = Number(site.partialDays || 0) > 0 || Number(site.previousPartialDays || 0) > 0;
-    if (!hasDelta && partial) {
-      add({
-        severity: 3, kind: "no-comparison", host,
-        headline: `${host} has no like-for-like comparison`,
-        evidence: `${num(visits)} sessions is a floor: ${Number(site.partialDays || 0) > 0 ? "this" : "the previous"} ` +
-          `period contains a crawler-flooded day whose direct bucket is not separable.`,
-        action: "Read the figure as a floor, and wait for a clean day before judging the trend.",
-        href,
-        recurrence: periodDays === 1 ? floodRun(floodDatesByHost.get(host), date) : null,
-      }, weigh("no-comparison", site, {}));
-    }
   }
 
   ranked.sort((a, b) => a.signal.severity - b.signal.severity || b.weight - a.weight

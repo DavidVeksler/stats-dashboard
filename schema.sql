@@ -110,6 +110,28 @@ CREATE TABLE IF NOT EXISTS daily_zone_status (
 -- row, which mixes real people with unverified and spoofing crawlers and cannot
 -- be separated further (botScore is plan-gated on this zone). Nothing derives a
 -- human count from this table.
+-- RUM sessions the browser rules set aside as automated (see src/bots.js), one
+-- row per RUM host per night. Its existence also marks that night's
+-- daily_traffic/daily_referrers/daily_cf_pages rows as counted under the rules:
+-- RUM rows from before 2026-10-29 hold raw totals, crawlers included, and the
+-- dashboard reads no RUM row without a marker.
+CREATE TABLE IF NOT EXISTS daily_rum_filter (
+  date             TEXT NOT NULL,
+  host             TEXT NOT NULL,
+  automated_visits INTEGER NOT NULL DEFAULT 0,
+  automated_views  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, host)
+);
+
+-- The newest version per browser series each night's rule counted from.
+CREATE TABLE IF NOT EXISTS daily_browser_current (
+  date     TEXT NOT NULL,
+  browser  TEXT NOT NULL,             -- Cloudflare's userAgentBrowser, e.g. 'Chrome', 'MobileSafari'
+  newest   INTEGER NOT NULL,          -- major version; one family can carry two series
+  evidence INTEGER NOT NULL DEFAULT 0, -- referred sessions behind it, over EVIDENCE_DAYS
+  PRIMARY KEY (date, browser, newest)
+);
+
 CREATE TABLE IF NOT EXISTS daily_zone_bots (
   date     TEXT NOT NULL,
   host     TEXT NOT NULL,

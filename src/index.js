@@ -7,8 +7,7 @@ import { getAccessToken, queryKeywords, queryPages, querySearchSummary, summariz
 import { queryRankAndTraffic as queryBingSummary, queryKeywords as queryBingKeywords,
   getUserSites as getBingSites, diffBingSites, bingUrlsOf,
   mergeBingSummaries, mergeBingKeywords } from "./bing.js";
-import { classifyTraffic, floodReason, floodDates, splitDay, directRatioStats,
-  crawlerAccounting, summarizeVerifiedBots, summarizeNonContent, BASELINE_LOOKBACK_DAYS } from "./bots.js";
+import { crawlerAccounting, summarizeVerifiedBots, summarizeNonContent } from "./bots.js";
 import { rankOpportunities, expectedCtr, POSITION_MIN_IMPRESSIONS,
   groupQueryPages, pageForQuery, attachPages, rankPageOpportunities, findCannibalized } from "./opportunities.js";
 import { computeSignals, STALE_PIPELINE_DAYS } from "./signals.js";
@@ -216,6 +215,22 @@ async function ensureSchema(env) {
       PRIMARY KEY (date, host, query, page)
     )`),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_qp_dh ON daily_query_pages(date, host)`),
+    // RUM sessions the current-browser rule set aside (see bots.js), one row per
+    // RUM host per night. The row's existence is also what marks that night's
+    // daily_traffic/daily_referrers/daily_cf_pages rows as counted under the
+    // rule: older rows hold raw totals, crawlers included, and loadDashboard
+    // reads no RUM row without a marker.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_rum_filter (
+      date TEXT NOT NULL, host TEXT NOT NULL,
+      automated_visits INTEGER NOT NULL DEFAULT 0, automated_views INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, host)
+    )`),
+    // The newest version per browser series that night's rule counted from.
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_browser_current (
+      date TEXT NOT NULL, browser TEXT NOT NULL, newest INTEGER NOT NULL,
+      evidence INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (date, browser, newest)
+    )`),
   ]);
   // Additive column on a pre-existing table: D1 has no "ADD COLUMN IF NOT
   // EXISTS", so swallow the one error that means it's already there.
@@ -263,6 +278,78 @@ function shapeR2(site, date, summaryRows, opRows, objectRows, dimRows) {
   };
 }
 
+// The RUM half of a night's write: every RUM host's counted traffic, referrers
+// and landing pages, its daily_rum_filter marker, and the browser versions the
+// rule counted from. Shared by runDaily and /backfill-rum so a rebuilt night is
+// written exactly the way a live one is. DELETE-then-INSERT per (table, host),
+// in order — see batchInChunks.
+function rumWriteStatements(env, date, traffic, browsers) {
+  const stmts = [];
+  for (const { host } of SITES.filter((site) => site.trafficSource !== "zone")) {
+    const rec = traffic.get(host) ?? { views: 0, visits: 0, automatedVisits: 0, automatedViews: 0,
+      referrers: new Map(), pages: new Map() };
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO daily_traffic (date,host,visits,views,bytes) VALUES (?,?,?,?,?)
+         ON CONFLICT(date,host) DO UPDATE SET visits=excluded.visits, views=excluded.views, bytes=excluded.bytes`
+      ).bind(date, host, rec.visits, rec.views, 0),
+      env.DB.prepare(
+        `INSERT OR REPLACE INTO daily_rum_filter (date,host,automated_visits,automated_views) VALUES (?,?,?,?)`
+      ).bind(date, host, rec.automatedVisits ?? 0, rec.automatedViews ?? 0),
+      env.DB.prepare(`DELETE FROM daily_referrers WHERE date=? AND host=?`).bind(date, host),
+      env.DB.prepare(`DELETE FROM daily_cf_pages WHERE date=? AND host=?`).bind(date, host),
+    );
+    // Keep enough rows for accurate source-mix totals; the dashboard still
+    // renders only the top eight referrers per domain.
+    for (const r of topReferrers(rec.referrers, 50, host)) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_referrers (date,host,referrer,kind,visits) VALUES (?,?,?,?,?)`
+        ).bind(date, host, r.referrer, r.kind, r.visits),
+      );
+    }
+    for (const p of topPages(rec.pages, 50)) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
+        ).bind(date, host, p.page, p.visits, p.views),
+      );
+    }
+  }
+  stmts.push(env.DB.prepare(`DELETE FROM daily_browser_current WHERE date=?`).bind(date));
+  for (const b of browsers ?? []) {
+    stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO daily_browser_current (date,browser,newest,evidence) VALUES (?,?,?,?)`
+    ).bind(date, b.browser, b.newest, b.evidence));
+  }
+  return stmts;
+}
+
+// "forum.objectivismonline.com Chrome 156 MacOSX 777, ..." for the runs note.
+const segmentSummary = (segments) =>
+  segments.map((seg) => `${seg.rawHost} ${seg.browser} ${seg.version} ${seg.os} ${seg.visits}`).join(", ");
+
+// Rebuild one past night's RUM rows under the current-browser rule (GET
+// /backfill-rum?date=YYYY-MM-DD). Re-reads the 24h window that night's run
+// covered (its runs.run_at when there is one, else the 13:00 cron time) and
+// writes it the way runDaily would. Refuses a sampled answer like the nightly
+// pull does: Cloudflare serves exact RUM for roughly the last week and a
+// 1-in-10 sample after that, so older nights cannot be rebuilt and are left as
+// they are. Touches only RUM tables; zone, R2, forum and search rows stay.
+async function backfillRum(env, date) {
+  await ensureSchema(env);
+  const run = await env.DB.prepare(`SELECT run_at FROM runs WHERE date=? AND ok=1 ORDER BY run_at DESC LIMIT 1`)
+    .bind(date).first().catch(() => null);
+  const until = run?.run_at ?? `${date}T13:00:00.000Z`;
+  const since = new Date(new Date(until).getTime() - 24 * 3600 * 1000).toISOString();
+  const { hosts, truncated, degraded, browsers, segments } = await pullTraffic(env, since, until);
+  if (degraded.length) return { date, written: false, window: [since, until], degraded };
+  const batches = await batchInChunks(env.DB, rumWriteStatements(env, date, hosts, browsers));
+  const counted = [...hosts.values()].reduce((sum, rec) => sum + rec.visits, 0);
+  const automated = [...hosts.values()].reduce((sum, rec) => sum + rec.automatedVisits, 0);
+  return { date, written: true, window: [since, until], counted, automated, batches, truncated, browsers, segments };
+}
+
 // ---- Nightly pull: Cloudflare + GSC -> D1 -> ntfy -------------------------
 async function runDaily(env, now = new Date()) {
   await ensureSchema(env);
@@ -274,7 +361,7 @@ async function runDaily(env, now = new Date()) {
   // 1. Traffic + referrers (Cloudflare Web Analytics)
   // `rumTruncated` names any grouping that filled its row cap. Informational
   // (see `info` below), not a failure: the per-host totals are exact either way.
-  const { hosts: traffic, truncated: rumTruncated, degraded: rumDegraded } = await pullTraffic(env, since, until);
+  const { hosts: traffic, truncated: rumTruncated, degraded: rumDegraded, browsers, segments } = await pullTraffic(env, since, until);
   // Cloudflare answered with a sampled RUM result (counts in multiples of the
   // sample interval, small hosts rounding to zero) and it stayed sampled through
   // the retry budget. Nothing from it is trustworthy, so no RUM host gets a row:
@@ -304,9 +391,8 @@ async function runDaily(env, now = new Date()) {
     }
   }
 
-  const stmts = [];
-  for (const { host, trafficSource } of SITES) {
-    if (rumSkipped && trafficSource !== "zone") continue;
+  const stmts = rumSkipped ? [] : rumWriteStatements(env, date, traffic, browsers);
+  for (const { host } of SITES.filter((site) => site.trafficSource === "zone")) {
     const rec = traffic.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
     const zx = zoneExtra.get(host);
     stmts.push(
@@ -367,14 +453,6 @@ async function runDaily(env, now = new Date()) {
             .bind(date, host, d.dim, d.value, d.requests, d.bytes),
         );
       }
-      continue;
-    }
-    for (const p of topPages(rec.pages, 50)) {
-      stmts.push(
-        env.DB.prepare(
-          `INSERT INTO daily_cf_pages (date,host,page,visits,views) VALUES (?,?,?,?,?)`
-        ).bind(date, host, p.page, p.visits, p.views),
-      );
     }
   }
 
@@ -600,13 +678,15 @@ async function runDaily(env, now = new Date()) {
     ...(truncatedPairHosts.length
       ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`] : []),
     ...(rumTruncated.length ? [`rum rows truncated at ${RUM_ROW_LIMIT}: ${rumTruncated.join(", ")}`] : []),
+    // Informational, not a failure: which direct-only desktop segments the
+    // second browser rule set aside tonight (see isDirectOnlySegment), so a
+    // wrong call can be spotted in the runs table.
+    ...(segments?.length ? [`direct-only segments set aside: ${segmentSummary(segments)}`.slice(0, 300)] : []),
   ];
   await env.DB.prepare(`INSERT OR REPLACE INTO runs (run_at,date,ok,note) VALUES (?,?,?,?)`)
     .bind(now.toISOString(), date, ok ? 1 : 0, [...notes, ...info].join(" | ") || "ok").run();
 
-  // 4. ntfy push — classified against the trailing history that was just written,
-  //    so the daily phone alert reports the human audience rather than whatever a
-  //    crawler happened to do that night.
+  // 4. ntfy push — counted sessions, re-read from what was just written.
   const summary = await summarizeToday(env, date).catch(() => null);
   // The push carries the finding, not only the volumes. The signal engine runs
   // read-side over what was just written rather than being re-derived here: one
@@ -642,7 +722,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, rumTruncated, rumSkipped, r2Buckets, notes };
+    truncatedPairHosts, rumTruncated, rumSkipped, r2Buckets, browsers, segments: segments ?? [], notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------
@@ -844,36 +924,27 @@ async function ingestBingDaily(env, date, results) {
   return { date, sites: [...seen], batches, ok: notes.length === 0, notes };
 }
 
-// Re-read the trailing history and split today into human vs crawler traffic.
-// Same BASELINE_LOOKBACK_DAYS as loadDashboard's read (see the comment on that
-// constant in bots.js) — this used to be a hardcoded 30 days, an independent
-// copy of the same window that let forum.objectivismonline.com's flood corrupt
-// the nightly ntfy push's baseline too, not just the dashboard's.
+// Today's counted sessions per RUM host and the automated sessions set aside,
+// re-read from what was just written so the push and the page agree.
 async function summarizeToday(env, date) {
-  const [hist, histRefs] = await Promise.all([
-    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date >= date(?, ?)`)
-      .bind(date, `-${BASELINE_LOOKBACK_DAYS - 1} days`).all(),
-    env.DB.prepare(
-      `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
-       WHERE date >= date(?, ?) GROUP BY date,host,kind`
-    ).bind(date, `-${BASELINE_LOOKBACK_DAYS - 1} days`).all(),
+  const [traffic, filtered] = await Promise.all([
+    env.DB.prepare(`SELECT host,visits FROM daily_traffic WHERE date=?`).bind(date).all(),
+    env.DB.prepare(`SELECT host,automated_visits FROM daily_rum_filter WHERE date=?`).bind(date).all(),
   ]);
-  const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
-  let humanVisits = 0, botVisits = 0;
+  const rumHosts = new Set(SITES.filter((site) => site.trafficSource !== "zone").map((site) => site.host));
+  const marked = new Set((filtered.results ?? []).map((row) => row.host));
+  let humanVisits = 0;
   const perHost = new Map();
-  for (const { host } of SITES) {
-    const day = classified.get(host)?.get(date);
-    if (!day) continue;
-    // Same split as the dashboard: a flooded day still contributes its referred
-    // sessions, plus a ratio estimate of its direct bucket where this host has
-    // enough clean-day history — see splitDay in bots.js.
-    const part = splitDay(day, directRatioStats(classified, host));
-    botVisits += part.crawler;
-    humanVisits += part.human;
-    if (part.human) perHost.set(host, part.human);
+  for (const row of traffic.results ?? []) {
+    if (!rumHosts.has(row.host) || !marked.has(row.host)) continue;
+    const visits = Number(row.visits || 0);
+    humanVisits += visits;
+    if (visits) perHost.set(row.host, visits);
   }
-  const flooded = [...SITES].filter(({ host }) => classified.get(host)?.get(date)?.flood).map(({ host }) => host);
-  return { humanVisits, botVisits, perHost, flooded };
+  const automated = (filtered.results ?? []).map((row) => [row.host, Number(row.automated_visits || 0)])
+    .filter(([, visits]) => visits > 0).sort((x, y) => y[1] - x[1]);
+  const botVisits = automated.reduce((sum, [, visits]) => sum + visits, 0);
+  return { humanVisits, botVisits, perHost, automatedHosts: automated.map(([host]) => host) };
 }
 
 async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null, rumSkipped = false) {
@@ -884,7 +955,7 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
   const top = ranked.slice(0, 4).map(([h, v]) => `${h.replace(/^www\./, "")}: ${v}`).join("\n");
   const headline = summary ? `${summary.humanVisits} visitors (24h)` : `${totalVisits} visitors (24h)`;
   const crawlers = summary?.botVisits
-    ? `\n🤖 ${summary.botVisits} crawler sessions excluded (${summary.flooded.join(", ")})` : "";
+    ? `\n🤖 ${summary.botVisits} automated sessions excluded (${summary.automatedHosts.slice(0, 3).join(", ")})` : "";
   // Name the sites that lost search data. The raw note is a truncated Google
   // error body, which reads as noise; the host list is what says "go fix that
   // property in Search Console".
@@ -1008,8 +1079,8 @@ async function loadDashboard(env, options = {}) {
         rumDomains: selectedSites.filter((s) => measurementOf(s) === "rum").length,
         zoneDomains: selectedSites.filter((s) => measurementOf(s) === "zone").length,
         previousVisits: 0, delta: null, daysAvailable: 0, previousDaysAvailable: 0,
-        botVisits: 0, botViews: 0, previousBotVisits: 0, botShare: 0, floodedSiteDays: 0, floodedSites: 0,
-        partialVisits: 0, partialSites: 0, estimatedSites: 0, estimatedDirect: 0,
+        automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, automatedShare: 0,
+        browsers: [], countedSince: null,
         sourceMix: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 },
         internalMeasured: false,
         zone: { visits: 0, requests: 0, bytes: 0, sites: 0, hosts: [] },
@@ -1025,9 +1096,8 @@ async function loadDashboard(env, options = {}) {
         opportunities: 0, snippetOpportunities: 0, rankOpportunities: 0 },
       sites: selectedSites.map((s) => ({ host: s.host, domain: registrableDomain(s.host),
         visits: 0, views: 0, previousVisits: 0,
-        botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 0, anomaly: null,
-        partialVisits: 0, partialDays: 0, estimatedVisits: false, spread: 0, estimatedDirect: 0, ratioSampleDays: null,
-        previousPartialDays: 0,
+        automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0,
+        measuredDays: 0, previousMeasuredDays: 0,
         delta: null, referrers: [], keywords: [], pages: [], cfPages: [], searchSummary: null,
         bingSummary: null, bingKeywords: [], bingWindow: null,
         bytes: 0, zoneCountries: [], zoneStatuses: [], zoneSourced: measurementOf(s) === "zone",
@@ -1044,16 +1114,9 @@ async function loadDashboard(env, options = {}) {
   const start = addDays(date, -(periodDays - 1));
   const previousEnd = addDays(start, -1);
   const previousStart = addDays(previousEnd, -(periodDays - 1));
-  // Crawler detection needs enough trailing history to know what a normal day
-  // looks like, and it has to reach back over the comparison period too — a
-  // flooded "previous period" would otherwise poison every delta on the page.
+  // Trailing history for the sparklines and 14-day comparators; it reaches back
+  // over the comparison period too.
   const historyStart = [previousStart, addDays(date, -29)].sort()[0];
-  // The flood classifier's own baseline read reaches back further still — see
-  // BASELINE_LOOKBACK_DAYS in bots.js for why the 30-day floor above isn't
-  // enough once a flood outlasts it. Only the two queries that feed
-  // classifyTraffic (`hist`, `histRefs` below) use this; every other read keeps
-  // `historyStart` so its cost and its trailing-mean windows are unaffected.
-  const baselineStart = [historyStart, addDays(date, -(BASELINE_LOOKBACK_DAYS - 1))].sort()[0];
   // THE THREE SEARCH CONSOLE READS ARE DELIBERATELY NOT THE SAME WIDTH.
   //
   // `daily_search_summary` spans the history window, because the search tiles'
@@ -1100,9 +1163,8 @@ async function loadDashboard(env, options = {}) {
     `SELECT host,query,clicks,impressions,avg_click_position,avg_impression_position,bing_window
      FROM daily_bing_keywords WHERE date=? ORDER BY clicks DESC, impressions DESC`
   ).bind(date).all().catch(() => ({ results: [] }));
-  // Referrers and landing pages keep their date so flooded days can be dropped;
-  // otherwise the detail panels would still show the crawler's millions of
-  // direct hits under a headline that had already excluded them.
+  // Referrers and landing pages keep their date so legacy (pre-rule) RUM days
+  // can be dropped below, the same as the traffic rows they belong to.
   const cfPagesQuery = env.DB.prepare(
     `SELECT date,host,page,visits,views FROM daily_cf_pages WHERE date BETWEEN ? AND ?`
   ).bind(start, date).all().catch(() => ({ results: [] }));
@@ -1196,54 +1258,54 @@ async function loadDashboard(env, options = {}) {
     zoneBotsQuery,
     forumActivityQuery,
     dailySignalsQuery,
-    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(baselineStart, date).all(),
+    env.DB.prepare(`SELECT date,host,visits,views FROM daily_traffic WHERE date BETWEEN ? AND ? ORDER BY date ASC`).bind(historyStart, date).all(),
     env.DB.prepare(
       `SELECT date,host,kind,SUM(visits) AS visits FROM daily_referrers
        WHERE date BETWEEN ? AND ? GROUP BY date,host,kind`
-    ).bind(baselineStart, date).all(),
+    ).bind(historyStart, date).all(),
     env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first(),
     aiRefsQuery,
   ]);
-  const [zoneDims, r2Summaries, r2Ops, r2Objects, r2Dims] = await Promise.all(
-    [zoneDimsPromise, r2SummaryPromise, r2OpsPromise, r2ObjectsPromise, r2DimsPromise]);
-  const classified = classifyTraffic(hist.results ?? [], histRefs.results ?? []);
-  // Memoized per host: directRatioStats scans a host's whole clean-day history,
-  // and this function calls it once per site plus once per history row in the
-  // 14-day trend loop below — same input every time within one load.
-  const ratioStatsCache = new Map();
-  const ratioStatsFor = (host) => {
-    if (!ratioStatsCache.has(host)) ratioStatsCache.set(host, directRatioStats(classified, host));
-    return ratioStatsCache.get(host);
-  };
+  // The current-browser rule's per-night markers (see daily_rum_filter in
+  // ensureSchema) and the browser versions the latest night counted from.
+  const rumFilterPromise = env.DB.prepare(
+    `SELECT date,host,automated_visits,automated_views FROM daily_rum_filter WHERE date BETWEEN ? AND ?`
+  ).bind(historyStart, date).all().catch(() => ({ results: [] }));
+  const browsersPromise = env.DB.prepare(
+    `SELECT browser,newest,evidence FROM daily_browser_current
+     WHERE date=(SELECT MAX(date) FROM daily_browser_current WHERE date<=?) ORDER BY evidence DESC`
+  ).bind(date).all().catch(() => ({ results: [] }));
+  const countedSincePromise = env.DB.prepare(`SELECT MIN(date) AS d FROM daily_rum_filter`)
+    .first().catch(() => null);
+  const [zoneDims, r2Summaries, r2Ops, r2Objects, r2Dims, rumFilter, browserRows, countedSinceRow] = await Promise.all(
+    [zoneDimsPromise, r2SummaryPromise, r2OpsPromise, r2ObjectsPromise, r2DimsPromise,
+      rumFilterPromise, browsersPromise, countedSincePromise]);
+  // RUM rows count only from nights the current-browser rule wrote (a
+  // daily_rum_filter marker exists for that date and host). Rows before the
+  // rule shipped hold raw totals, crawlers included (165,832 "sessions" on
+  // wiki.freecapitalists.org on 2026-10-29), and are dropped here from every
+  // RUM read rather than shown or reasoned about. Zone hosts are untouched: the
+  // rule does not apply to them (see crawlerAccounting).
+  const rumHostSet = new Set(SITES.filter((site) => measurementOf(site) === "rum").map((site) => site.host));
+  const automatedByKey = new Map((rumFilter.results ?? []).map((row) => [`${row.date}|${row.host}`, row]));
+  const counted = (row) => !rumHostSet.has(row.host) || automatedByKey.has(`${row.date}|${row.host}`);
+  for (const rows of [tr, previousTr, refs, hist, histRefs, cfPages, aiRefs]) {
+    if (rows?.results) rows.results = rows.results.filter(counted);
+  }
+  const countedSince = countedSinceRow?.d ?? null;
 
   const byHost = (rows, h) => (rows.results ?? []).filter((r) => r.host === h);
   const availableDates = [...new Set((tr.results ?? []).map((row) => row.date))].sort();
   const previousAvailableDates = [...new Set((previousTr.results ?? []).map((row) => row.date))].sort();
-  // Split every measured day into human vs crawler (see splitDay). A flooded day
-  // still contributes its referred sessions, so a site whose only day in view was
-  // flooded reports a measured floor instead of an empty card; its direct bucket
-  // and its pageviews are the parts that stay unrecoverable.
-  const sumTraffic = (rows, days, ratioStats) => rows.reduce((acc, row) => {
-    const part = splitDay(days?.get(row.date), ratioStats);
-    acc.visits += part.human;
-    acc.views += part.views;
-    if (part.partial) {
-      acc.partialVisits += part.human;
-      acc.partialDays += 1;
-      acc.botVisits += part.crawler;
-      acc.botViews += part.crawlerViews;
-      acc.botDays += 1;
-      if (part.estimated) {
-        acc.estimatedDays += 1;
-        acc.spread += part.spread;
-        acc.estimatedDirect += part.estimatedDirect;
-      }
-    } else {
-      acc.cleanDays += 1;
-    }
+  const sumTraffic = (rows) => rows.reduce((acc, row) => {
+    const filtered = automatedByKey.get(`${row.date}|${row.host}`);
+    acc.visits += Number(row.visits || 0);
+    acc.views += Number(row.views || 0);
+    acc.automatedVisits += Number(filtered?.automated_visits || 0);
+    acc.automatedViews += Number(filtered?.automated_views || 0);
+    acc.days += 1;
     return acc;
-  }, { visits: 0, views: 0, partialVisits: 0, partialDays: 0,
-       botVisits: 0, botViews: 0, botDays: 0, cleanDays: 0, estimatedDays: 0, spread: 0, estimatedDirect: 0 });
+  }, { visits: 0, views: 0, automatedVisits: 0, automatedViews: 0, days: 0 });
   // `unattributed` is a residual, never a channel: it is the gap between sessions
   // the traffic table counted and referrer rows the referrer table stored. It was
   // called "other" and rendered as a fifth segment in the mix bar, which invited
@@ -1252,7 +1314,7 @@ async function loadDashboard(env, options = {}) {
   // bar. `internal` is a real channel: sessions arriving from one of the site's
   // own hostnames (see classifyReferrer). Those used to fall into this residual.
   const emptyMix = () => ({ direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 0 });
-  const summarizeSources = (rows, visits, estimatedDirect = 0) => {
+  const summarizeSources = (rows, visits) => {
     const result = emptyMix();
     for (const row of rows) {
       // "ai" (an AI chat/answer-engine referrer, see classifyReferrer) is folded
@@ -1262,17 +1324,11 @@ async function loadDashboard(env, options = {}) {
       const key = row.kind === "ref" || row.kind === "ai" ? "referral" : row.kind;
       if (key in result && key !== "unattributed") result[key] += Number(row.visits || 0);
     }
-    // A ratio-estimated flooded day's direct bucket has no referrer row to carry
-    // it — the raw direct row on that day is dropped, crawler and human mixed
-    // beyond separation — so without crediting it here it would show up as
-    // unattributed instead of what it actually is: an estimate of direct human
-    // traffic. See splitDay/estimatedDirect in bots.js.
-    result.direct += estimatedDirect;
     const attributed = result.direct + result.search + result.social + result.referral + result.internal;
     result.unattributed = Math.max(0, visits - attributed);
     return result;
   };
-  // Re-aggregate date-keyed rows once the flooded days are dropped.
+  // Re-aggregate date-keyed rows over the period.
   const mergeBy = (rows, keyOf, build) => {
     const merged = new Map();
     for (const row of rows) {
@@ -1285,11 +1341,8 @@ async function loadDashboard(env, options = {}) {
     return [...merged.values()].sort((a, b) => b.visits - a.visits);
   };
   let sites = selectedSites.map((s) => {
-    const floods = floodDates(classified, s.host);
-    const days = classified.get(s.host);
-    const ratioStats = ratioStatsFor(s.host);
-    const t = sumTraffic(byHost(tr, s.host), days, ratioStats);
-    const previous = sumTraffic(byHost(previousTr, s.host), days, ratioStats);
+    const t = sumTraffic(byHost(tr, s.host));
+    const previous = sumTraffic(byHost(previousTr, s.host));
     // Latest-snapshot views. The keyword and page reads are already narrowed to
     // `date` in SQL (see the read-width note); the filter stays as a cheap
     // belt-and-braces so a future widening of either read cannot silently turn
@@ -1307,15 +1360,9 @@ async function loadDashboard(env, options = {}) {
     const opportunities = attachPages(rankOpportunities(kwRows, s), queryPages);
     const pageOpportunities = rankPageOpportunities(opportunities);
     const cannibalized = findCannibalized(queryPages, s);
-    // Landing-page rows carry no referer dimension, so a flooded day's are the
-    // crawler's and stay excluded whole.
-    const cfPageRows = mergeBy(byHost(cfPages, s.host).filter((r) => !floods.has(r.date)),
+    const cfPageRows = mergeBy(byHost(cfPages, s.host),
       (r) => r.page, (r) => ({ page: r.page, visits: 0, views: 0 }));
-    // Referrers carry a referer dimension, so on a flooded day only the direct
-    // bucket is spoiled: the referred rows survive and keep the detail panel
-    // agreeing with the headline. Landing pages above have no such dimension,
-    // which is why they stay excluded whole.
-    const refRows = mergeBy(byHost(refs, s.host).filter((r) => !floods.has(r.date) || r.kind !== "direct"),
+    const refRows = mergeBy(byHost(refs, s.host),
       (r) => `${r.referrer}\u0000${r.kind}`, (r) => ({ referrer: r.referrer, kind: r.kind, visits: 0 }));
     const summaryRow = byHost(searchSummaries, s.host).find((r) => r.date === date) ?? null;
     // Bing Search — both reads are already filtered to `date=?` in SQL (see the
@@ -1324,8 +1371,7 @@ async function loadDashboard(env, options = {}) {
     // configured or no pull yet, same as searchSummary/keywords for GSC.
     const bingSummaryRow = byHost(bingSummaries, s.host)[0] ?? null;
     const bingKeywordRows = byHost(bingKeywords, s.host);
-    // Zone-sourced hosts only: bandwidth sums plainly over the period (bytes
-    // carries no crawler-flood signal to split against), country/status rows
+    // Zone-sourced hosts only: bandwidth sums plainly over the period; country/status rows
     // are the latest-day snapshot, same treatment as keywords/pages above.
     const bytes = byHost(tr, s.host).reduce((sum, row) => sum + Number(row.bytes || 0), 0);
     const zoneCountryRows = byHost(zoneCountries, s.host).slice(0, 10)
@@ -1335,25 +1381,16 @@ async function loadDashboard(env, options = {}) {
     const latestZoneStatusRows = byHost(zoneStatuses, s.host).filter((st) => st.date === date);
     const zoneStatusRows = latestZoneStatusRows.slice(0, 8)
       .map((st) => ({ status: st.status, requests: Number(st.requests || 0) }));
-    // Zone hosts get a crawler decomposition instead of a flood verdict: the
-    // flood classifier structurally cannot fire on them (no referrer rows means
-    // directShare is always 0), so without this their crawler volume would be
-    // counted as an audience by implication. Two independent lenses, both
+    // Zone hosts get a crawler decomposition instead of the browser rule, which
+    // needs a user agent the zone log does not carry; without this their crawler
+    // volume would be counted as an audience by implication. Two independent lenses, both
     // latest-day so they describe the same window, and deliberately never
     // combined into one figure — see bots.js.
     const zoneRoute = crawlerAccounting({ measurement: measurementOf(s) }) === "zone";
     const zoneBotRows = zoneRoute ? byHost(zoneBots, s.host) : [];
     const latestCfPageRows = zoneRoute ? byHost(cfPages, s.host).filter((r) => r.date === date) : [];
-    // Pageviews survive only from clean days, so the rate must divide by clean
-    // sessions too; using the full session count would understate every flooded
-    // site's pages/session.
-    const cleanVisits = t.visits - t.partialVisits;
-    const previousCleanVisits = previous.visits - previous.partialVisits;
-    const currentRate = cleanVisits ? t.views / cleanVisits : 0;
-    const previousRate = previousCleanVisits ? previous.views / previousCleanVisits : 0;
-    // The callout describes the most recent flooded day, which is the one the
-    // reader is looking at; older flooded days show up as gaps in the sparkline.
-    const latestFlood = [...floods].sort().at(-1);
+    const currentRate = t.visits ? t.views / t.visits : 0;
+    const previousRate = previous.visits ? previous.views / previous.visits : 0;
     return {
       host: s.host,
       // The registrable domain this host rolls up into — the grouping key the
@@ -1361,33 +1398,23 @@ async function loadDashboard(env, options = {}) {
       // so render.js and /api/json read the same key rather than re-deriving it.
       domain: registrableDomain(s.host),
       visits: t.visits, views: t.views,
-      botVisits: t.botVisits, botViews: t.botViews, botDays: t.botDays,
-      // Sessions recovered from flooded days: real, but a floor rather than a
-      // count, because the direct bucket those days is unusable.
-      partialVisits: t.partialVisits, partialDays: t.partialDays,
-      // Whether the visits/partialVisits figures above are a ratio estimate
-      // (with a margin) or the older floor-only reading — a host either has
-      // enough clean-day history to estimate every one of its flooded days or
-      // none, so this is never a mix within one site. See splitDay in bots.js.
-      estimatedVisits: t.estimatedDays > 0, spread: t.spread, estimatedDirect: t.estimatedDirect,
-      ratioSampleDays: ratioStats?.sampleDays ?? null,
-      // Carried so the `no-comparison` signal can name which side of the
-      // comparison was partial, rather than lumping a flooded previous period in
-      // with a site that simply has no history yet.
-      previousPartialDays: previous.partialDays,
+      // Sessions the current-browser rule set aside (see bots.js). Reported
+      // beside the count, never inside it. Zero for zone hosts.
+      automatedVisits: t.automatedVisits, automatedViews: t.automatedViews,
+      previousAutomatedVisits: previous.automatedVisits,
+      // Nights in the period with counted data. Fewer than the period means it
+      // reaches back before the rule shipped, or a night was refused as sampled.
+      measuredDays: t.days, previousMeasuredDays: previous.days,
       previousVisits: previous.visits,
-      previousBotVisits: previous.botVisits,
-      cleanDays: t.cleanDays,
-      // A floor compared against a full count is not a like-for-like delta, so
-      // either side being partial means no comparison rather than a fake drop.
-      delta: previous.visits && !t.partialDays && !previous.partialDays
+      // Like for like only: a period missing a night against a full one is not
+      // a change in traffic.
+      delta: previous.visits && previous.days === t.days
         ? (t.visits - previous.visits) / previous.visits : null,
       pagesPerSession: currentRate,
       previousPagesPerSession: previousRate,
       pagesPerSessionDelta: previous.visits ? currentRate - previousRate : null,
-      anomaly: latestFlood ? floodReason(days?.get(latestFlood), ratioStats) : null,
       referrers: refRows.slice(0, 8).map((r) => ({ referrer: r.referrer, kind: r.kind, visits: r.visits })),
-      sources: summarizeSources(refRows, t.visits, t.estimatedDirect),
+      sources: summarizeSources(refRows, t.visits),
       keywords: kwRows.slice(0, 12).map((k) => ({ query: k.query, clicks: k.clicks,
         impressions: k.impressions, ctr: k.impressions ? k.clicks / k.impressions : 0, position: k.position,
         ...pageForQuery(k.query, queryPages) })),
@@ -1433,11 +1460,7 @@ async function loadDashboard(env, options = {}) {
       // objects, so /api/json does not serialize them to `{}`.
       queryDenyPatterns: s.queryDenyPatterns ?? [],
       gscWindow: summaryRow?.gsc_window || kwRows[0]?.gsc_window || pageRows[0]?.gsc_window || null,
-      // The sparkline plots what was measured, flooded days included, but marks
-      // them — hiding them would turn a crawler event into a mysterious gap.
-      spark: byHost(hist, s.host).slice(-14).map((r) => ({
-        date: r.date, visits: Number(r.visits || 0), flood: floods.has(r.date),
-      })),
+      spark: byHost(hist, s.host).slice(-14).map((r) => ({ date: r.date, visits: Number(r.visits || 0) })),
     };
   });
 
@@ -1484,14 +1507,9 @@ async function loadDashboard(env, options = {}) {
   const dailyRum = new Map();
   for (const row of hist.results ?? []) {
     if (!rumHosts.has(row.host)) continue;
-    // The same split the cards use: a flooded day contributes its referred
-    // sessions (plus a ratio estimate of its direct bucket where available) and
-    // no pageviews, so the baseline is built from the same quantity it is
-    // compared against.
-    const part = splitDay(classified.get(row.host)?.get(row.date), ratioStatsFor(row.host));
     const rec = dailyRum.get(row.date) ?? { date: row.date, visits: 0, views: 0, search: 0 };
-    rec.visits += part.human;
-    rec.views += part.views;
+    rec.visits += Number(row.visits || 0);
+    rec.views += Number(row.views || 0);
     dailyRum.set(row.date, rec);
   }
   for (const row of histRefs.results ?? []) {
@@ -1504,8 +1522,7 @@ async function loadDashboard(env, options = {}) {
     ? rows.reduce((sum, row) => sum + pick(row), 0) / rows.length : 0);
 
   // AI answer-engine referrals (the "AI referrals" tile). RUM hosts only, like
-  // every other session figure. These are referred sessions, which splitDay
-  // keeps on a flooded day too, so no flood adjustment applies. A FLOOR, not a
+  // every other session figure. A FLOOR, not a
   // channel measurement: most AI surfaces send no Referer and AI Overviews /
   // Copilot-in-Bing arrive as google./bing. search (see AI_ANSWER_ENGINES), which
   // is why this stays a tile beside the mix bar and is never added to sourceMix.
@@ -1624,21 +1641,16 @@ async function loadDashboard(env, options = {}) {
     zoneDomains: zoneSites.length,
     active: sites.filter((s) => s.visits > 0).length,
     previousVisits: rumSites.reduce((a, s) => a + s.previousVisits, 0),
-    // Crawler traffic is reported, never hidden — it just does not get to sit in
-    // the same number as the human audience.
-    botVisits: rumSites.reduce((a, s) => a + s.botVisits, 0),
-    botViews: rumSites.reduce((a, s) => a + s.botViews, 0),
-    previousBotVisits: rumSites.reduce((a, s) => a + s.previousBotVisits, 0),
-    partialVisits: rumSites.reduce((a, s) => a + s.partialVisits, 0),
-    partialSites: rumSites.filter((s) => s.partialDays > 0).length,
-    // Sites whose partial days above are a ratio estimate rather than a bare
-    // floor — see the note on estimatedVisits in the per-site block.
-    estimatedSites: rumSites.filter((s) => s.estimatedVisits).length,
-    // The estimated (not measured) slice of partialVisits, so callers can say
-    // how much of "recovered sessions" is a real referred count vs an estimate.
-    estimatedDirect: rumSites.reduce((a, s) => a + (s.estimatedDirect || 0), 0),
-    floodedSiteDays: rumSites.reduce((a, s) => a + s.botDays, 0),
-    floodedSites: rumSites.filter((s) => s.botDays > 0).length,
+    // Automated traffic is reported, never hidden — it just does not get to sit
+    // in the same number as the counted audience.
+    automatedVisits: rumSites.reduce((a, s) => a + s.automatedVisits, 0),
+    automatedViews: rumSites.reduce((a, s) => a + s.automatedViews, 0),
+    previousAutomatedVisits: rumSites.reduce((a, s) => a + s.previousAutomatedVisits, 0),
+    // The browser versions the latest night counted from, and the first night
+    // the rule wrote; RUM history before it is not shown.
+    browsers: (browserRows.results ?? []).map((row) => ({ browser: row.browser,
+      newest: Number(row.newest), evidence: Number(row.evidence || 0) })),
+    countedSince,
     daysAvailable: availableDates.length,
     previousDaysAvailable: previousAvailableDates.length,
     gscClicks: searchSites.reduce((sum, site) => sum + site.searchSummary.clicks, 0),
@@ -1701,13 +1713,17 @@ async function loadDashboard(env, options = {}) {
         clicks: row.clicks, impressions: row.impressions })),
     },
   };
-  totals.delta = totals.previousVisits ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
+  // Like for like only, the same rule as each card: a previous period with fewer
+  // counted nights (before the browser rule, or a night refused as sampled) is
+  // not a baseline for a full one.
+  totals.delta = totals.previousVisits && totals.previousDaysAvailable === totals.daysAvailable
+    ? (totals.visits - totals.previousVisits) / totals.previousVisits : null;
   // RUM pageviews over RUM sessions. Meaningful only because both sides now come
   // from the same instrument.
   totals.pagesPerSession = totals.visits ? totals.views / totals.visits : 0;
   totals.searchShare = totals.visits ? totals.search / totals.visits : 0;
-  totals.botShare = totals.visits + totals.botVisits
-    ? totals.botVisits / (totals.visits + totals.botVisits) : 0;
+  totals.automatedShare = totals.visits + totals.automatedVisits
+    ? totals.automatedVisits / (totals.visits + totals.automatedVisits) : 0;
   totals.gscCtr = totals.gscImpressions ? totals.gscClicks / totals.gscImpressions : 0;
   // How much of the corpus the CTR comparator's sample actually covers. Reported
   // on the tile so a comparator drawn from 5% of impressions can be discounted
@@ -1739,9 +1755,8 @@ async function loadDashboard(env, options = {}) {
   // ai-referral-rise inputs (spec item 16): per-host AI-answer-engine referral
   // sums for the current period and its trailing baseline, both from rows
   // already read for other purposes — no new query. `refs` is already scoped
-  // to the current display period (start..date); `histRefs` is the wider
-  // baseline window already read for the flood classifier's baseline, grouped
-  // by kind, filtered here to "ai" instead of used for direct-share. Both
+  // to the current display period (start..date); `histRefs` is the history
+  // window grouped by kind, filtered here to "ai". Both
   // sides are RUM daily_referrers rows with the same kind filter, so the
   // "both sides of a comparator from the same population" rule holds by
   // construction.
@@ -1760,8 +1775,11 @@ async function loadDashboard(env, options = {}) {
   // The mean divides by every day in the baseline window, not just the days
   // that happen to have an "ai" row — a day with none is a real zero, and
   // excluding it would inflate the baseline and make a real rise harder to see.
+  // Counted nights only: a night before the browser rule has no rows at all,
+  // and treating it as a zero would deflate the baseline instead.
   const aiBaselineDates = [];
-  for (let d = baselineStart; d < start; d = addDays(d, 1)) aiBaselineDates.push(d);
+  const aiBaselineFrom = [historyStart, countedSince ?? date].sort()[1];
+  for (let d = aiBaselineFrom; d < start; d = addDays(d, 1)) aiBaselineDates.push(d);
   const aiBaselineByHost = new Map();
   for (const [host, perDate] of aiBaselineDaily) {
     const sum = aiBaselineDates.reduce((total, d) => total + (perDate.get(d) ?? 0), 0);
@@ -1772,7 +1790,6 @@ async function loadDashboard(env, options = {}) {
     sites, date, periodDays,
     zoneStatusRows: zoneStatuses.results ?? [],
     trafficRows: hist.results ?? [],
-    floodDatesByHost: new Map(sites.map((site) => [site.host, floodDates(classified, site.host)])),
     run, bingConfigured, bingHasRowsToday, forumsConfigured, forumHasRowsToday,
     aiCurrentByHost, aiBaselineByHost,
   });
@@ -1780,10 +1797,7 @@ async function loadDashboard(env, options = {}) {
   // Real recurrence (spec item 15), decorated onto computeSignals' output
   // rather than computed inside it — computeSignals stays a pure function of
   // today's rows, and this is a read over yesterday-and-before from what item
-  // 14 persists. `no-comparison` keeps its own existing method (a flooded day
-  // IS a day whose delta was suppressed, so "flooded N days running" and
-  // "this fired N days running" are the same statement for that one rule).
-  // Every other rule starts at recurrence 0 the day it's introduced or its
+  // 14 persists. Every rule starts at recurrence 0 the day it's introduced or its
   // `kind` string changes — there is nothing to backfill from, and inventing
   // a count would be exactly the kind of guess this signal engine rejects
   // everywhere else.
@@ -1805,7 +1819,6 @@ async function loadDashboard(env, options = {}) {
       return count;
     };
     for (const signal of signals) {
-      if (signal.kind === "no-comparison") continue;
       const key = `${signal.kind}|${signal.host ?? ""}`;
       const dateSet = recurrenceDates.get(key);
       signal.recurrence = dateSet ? consecutiveBefore(dateSet) : 0;
@@ -1843,7 +1856,7 @@ async function loadDashboard(env, options = {}) {
       postsCount: Number(latestRow?.posts_count || 0),
       topicsCount: Number(latestRow?.topics_count || 0),
       meanActiveToday,
-      spark: rows.slice(-14).map((r) => ({ date: r.date, visits: Number(r.active_today || 0), flood: false })),
+      spark: rows.slice(-14).map((r) => ({ date: r.date, visits: Number(r.active_today || 0) })),
       hasData: rows.length > 0,
     };
   });
@@ -1909,6 +1922,17 @@ export default {
       }
       const result = await runDaily(env);
       return Response.json(result);
+    }
+
+    // Rebuild one past night's RUM rows: /backfill-rum?key=<REFRESH_KEY>&date=YYYY-MM-DD.
+    // One night per call (two subrequests each); scripts/backfill-rum.mjs walks a range.
+    if (url.pathname === "/backfill-rum") {
+      if (!env.REFRESH_KEY || url.searchParams.get("key") !== env.REFRESH_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const date = url.searchParams.get("date") ?? "";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return new Response("date=YYYY-MM-DD required", { status: 400 });
+      return Response.json(await backfillRum(env, date));
     }
 
     // Manual Bing re-pull: /run-bing?key=<REFRESH_KEY> — a separate endpoint,

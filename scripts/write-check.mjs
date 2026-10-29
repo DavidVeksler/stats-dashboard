@@ -120,6 +120,8 @@ let failR2 = false;
 // numbers — see part 1a'. `rumRequests` counts the RUM requests a run makes.
 let rumInterval = 1;
 let rumRequests = 0;
+// The filter the last counted RUM request carried, for the second-rule checks.
+let lastCountedFilter = null;
 
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
@@ -178,12 +180,32 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.includes("api.cloudflare.com")) {
     const body = JSON.parse(init.body ?? "{}");
     if (body.query.includes("rumPageloadEventsAdaptiveGroups")) {
-      // The three aliased groupings pullTraffic asks for (totals / refs / pages).
+      // pullTraffic's two requests, each one alias per account (a0..aN); only
+      // the first account carries traffic. The census holds a current-browser
+      // row per host (counted) and a stale Chrome 120 crawler row (automated).
       const rum = SITES.filter((s) => s.trafficSource !== "zone");
       rumRequests += 1;
-      return json({ data: { viewer: { accounts: [{
-        totals: rum.map((s) => ({ count: 40, sum: { visits: 20 }, avg: { sampleInterval: rumInterval }, dimensions: { requestHost: s.host } })),
-        refs: rum.map((s) => ({ sum: { visits: 20 }, dimensions: { requestHost: s.host, refererHost: "www.google.com" } })),
+      const empty = Object.fromEntries(CF_ACCOUNTS.slice(1).map((_, i) => [`a${i + 1}`, [{}]]));
+      if (body.query.includes("census:")) {
+        // Plus one direct-only desktop segment on the first RUM host: a crawler
+        // on a current browser, which the second rule must set aside.
+        const crawlerSegment = { requestHost: rum[0].host, userAgentBrowser: "Chrome", browserVersion: "156", userAgentOS: "Linux" };
+        return json({ data: { viewer: { ...empty, a0: [{
+          censusDirect: [{ sum: { visits: 300 }, dimensions: crawlerSegment }],
+          census: [{ count: 300, sum: { visits: 300 }, avg: { sampleInterval: rumInterval }, dimensions: crawlerSegment },
+            ...rum.flatMap((s) => [
+            { count: 40, sum: { visits: 20 }, avg: { sampleInterval: rumInterval },
+              dimensions: { requestHost: s.host, userAgentBrowser: "Chrome", browserVersion: "156" } },
+            { count: 500, sum: { visits: 500 }, avg: { sampleInterval: rumInterval },
+              dimensions: { requestHost: s.host, userAgentBrowser: "Chrome", browserVersion: "120" } },
+          ])],
+          evidence: [{ sum: { visits: 300 }, dimensions: { userAgentBrowser: "Chrome", browserVersion: "156" } }],
+        }] } } });
+      }
+      lastCountedFilter = body.variables?.filter ?? null;
+      return json({ data: { viewer: { ...empty, a0: [{
+        refs: rum.map((s) => ({ count: 40, sum: { visits: 20 }, avg: { sampleInterval: rumInterval },
+          dimensions: { requestHost: s.host, refererHost: "www.google.com" } })),
         pages: rum.map((s) => ({ count: 40, sum: { visits: 20 }, dimensions: { requestHost: s.host, requestPath: "/" } })),
       }] } } });
     }
@@ -321,7 +343,7 @@ const runBing = async (env) => {
   const zoneSites = SITES.filter((s) => s.trafficSource === "zone");
   const r2Sites = SITES.filter((s) => s.r2Bucket);
   check("Cloudflare costs one request per account, zone host and bucket",
-    fetchLog.filter((h) => h === "api.cloudflare.com").length, CF_ACCOUNTS.length + zoneSites.length + r2Sites.length);
+    fetchLog.filter((h) => h === "api.cloudflare.com").length, 2 + zoneSites.length + r2Sites.length);
 
   // The R2 bucket's night: one summary row, and its breakdown tables.
   for (const site of r2Sites) {
@@ -451,6 +473,11 @@ const runBing = async (env) => {
       const stmt = { sql, binds: [], seq: seqS += 1 };
       stmt.bind = (...args) => { stmt.binds = args; return stmt; };
       stmt.all = async () => {
+        // A counted-night marker, without which loadDashboard drops the host's
+        // RUM rows as pre-browser-rule history.
+        if (sql.includes("FROM daily_rum_filter")) {
+          return { results: [{ date: SIGNAL_DATE, host: SIGNAL_HOST, automated_visits: 0, automated_views: 0 }] };
+        }
         if (sql.includes("FROM daily_cf_pages")) {
           return { results: MALFORMED_PAGES.map((page) => ({
             date: SIGNAL_DATE, host: SIGNAL_HOST, page, visits: 1, views: 1 })) };
@@ -529,6 +556,37 @@ const runBing = async (env) => {
     flat.some((s) => s.sql.startsWith("INSERT INTO daily_zone_dims ")), true);
 }
 
+// ---- 1a. The current-browser rule: counted vs automated --------------------
+// The census stub gives every RUM host 20 sessions on Chrome 156 (the newest
+// referred version) and 500 on Chrome 120. Only the first may reach daily_traffic;
+// the second is written to daily_rum_filter beside it, never inside it.
+{
+  const { flat } = await run({ GSC_SA_KEY });
+  const rumHost = SITES.find((s) => s.trafficSource !== "zone").host;
+  const trafficRow = flat.find((s) => s.sql.startsWith("INSERT INTO daily_traffic") && s.binds[1] === rumHost);
+  const filterRow = flat.find((s) => s.sql.includes("INTO daily_rum_filter") && s.binds[1] === rumHost);
+  check("a RUM host's daily_traffic row holds current-browser sessions only", trafficRow?.binds[2], 20);
+  check("...and its stale-browser and direct-only sessions go to daily_rum_filter", filterRow?.binds[2], 500 + 300);
+  const otherHost = SITES.filter((s) => s.trafficSource !== "zone")[1].host;
+  check("...a host with no direct-only segment sets aside only its stale browsers",
+    flat.find((s) => s.sql.includes("INTO daily_rum_filter") && s.binds[1] === otherHost)?.binds[2], 500);
+  check("the counted query excludes the direct-only segment server-side",
+    JSON.stringify(lastCountedFilter?.AND ?? []).includes('{"userAgentOS_neq":"Linux"}'), true);
+  check("...and is limited to the current browser versions",
+    JSON.stringify(lastCountedFilter?.AND ?? []).includes('"browserVersion_in":["156"]'), true);
+  check("every RUM host gets a daily_rum_filter marker",
+    flat.filter((s) => s.sql.includes("INTO daily_rum_filter")).length,
+    SITES.filter((s) => s.trafficSource !== "zone").length);
+  check("no zone host gets one",
+    flat.some((s) => s.sql.includes("INTO daily_rum_filter")
+      && SITES.find((site) => site.host === s.binds[1])?.trafficSource === "zone"), false);
+  check("the newest browser version is recorded for the night",
+    flat.some((s) => s.sql.includes("INTO daily_browser_current") && s.binds[1] === "Chrome" && s.binds[2] === 156), true);
+  check("...after that night's delete",
+    flat.findIndex((s) => s.sql.startsWith("DELETE FROM daily_browser_current"))
+      < flat.findIndex((s) => s.sql.includes("INTO daily_browser_current")), true);
+}
+
 // ---- 1a'. A sampled RUM answer is retried, then refused, never stored ------
 // 2026-10-17 stored forum.objectivismonline.com at exactly 18,000 visits and eleven
 // of seventeen sites at zero: Cloudflare's adaptive RUM dataset had answered with a
@@ -542,7 +600,7 @@ const runBing = async (env) => {
     rumInterval = 1;
     rumRequests = 0;
     const clean = await run({ GSC_SA_KEY });
-    check("a healthy RUM answer is not retried: one request per account", rumRequests, CF_ACCOUNTS.length);
+    check("a healthy RUM answer is not retried: census + counted, all accounts aliased", rumRequests, 2);
     check("...and the run is not marked skipped", clean.result.rumSkipped, false);
 
     rumInterval = 1000;
@@ -550,7 +608,7 @@ const runBing = async (env) => {
     const { result, flat } = await run({ GSC_SA_KEY, NTFY_TOPIC: "check" });
     rumInterval = 1;
     check("a sampled RUM answer is retried from a bounded budget",
-      rumRequests, CF_ACCOUNTS.length + RUM_SAMPLING_RETRIES);
+      rumRequests, 1 + RUM_SAMPLING_RETRIES);
     check("...and reported skipped", result.rumSkipped, true);
     check("...as a note, so the run is not ok", result.notes.some((n) => n.startsWith("rum sampled")), true);
     check("...writing no RUM traffic row",

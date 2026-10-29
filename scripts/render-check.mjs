@@ -3,7 +3,7 @@ import { renderDashboard } from "../src/render.js";
 import { registrableDomain } from "../src/config.js";
 // Imported, never retyped: the footer prose that explains these rules is
 // asserted against the constants themselves, so the two cannot drift.
-import { FLOOD_MIN_VISITS, FLOOD_MULTIPLE, FLAT_PAGES_PER_SESSION, DIRECT_SHARE } from "../src/bots.js";
+import { BROWSER_LAG, BROWSER_LEAD, NEWEST_MIN_SHARE, EVIDENCE_DAYS, SEGMENT_MIN_VISITS, SEGMENT_DIRECT_SHARE } from "../src/bots.js";
 import {
   SNIPPET_MAX_POSITION, RANK_MAX_POSITION, TARGET_POSITION, SNIPPET_CTR_RATIO,
   OPPORTUNITY_MIN_IMPRESSIONS, MIN_ACTIONABLE_CLICKS, POSITION_MIN_IMPRESSIONS,
@@ -29,10 +29,10 @@ const fixture = {
   // and must stay out of it.
   signals: [
     {
-      severity: 1, kind: "likely-bot-subflood", host: "wiki.example",
+      severity: 1, kind: "likely-bot-spike", host: "wiki.example",
       headline: "wiki.example is up 180%, and it looks like a crawler rather than growth",
       evidence: "151 sessions (was 54), 90% direct, 1.0 pages/session, 89% of entrances on /wiki/Main_Page.",
-      action: "Treat as crawler traffic, not growth, and consider lowering the flood floor for this host.",
+      action: "Treat as crawler traffic, not growth: it is sending a current browser version, so the browser rule counts it.",
       href: "#site-wiki-example", recurrence: null,
     },
     {
@@ -57,11 +57,11 @@ const fixture = {
       href: "#site-example-com", recurrence: null,
     },
     {
-      severity: 3, kind: "no-comparison", host: "flooded.example",
-      headline: "flooded.example has no like-for-like comparison",
-      evidence: "17 sessions is a floor: this period contains a crawler-flooded day whose direct bucket is not separable.",
-      action: "Read the figure as a floor, and wait for a clean day before judging the trend.",
-      href: "#site-flooded-example", recurrence: 2,
+      severity: 3, kind: "traffic-rise", host: "partial.example",
+      headline: "partial.example sessions rose 40%",
+      evidence: "30 sessions, up 9 from 21.",
+      action: "Check which referrer drove it before counting it as growth.",
+      href: "#site-partial-example", recurrence: 2,
     },
   ],
   // Headline totals are RUM-only: the zone site's 1,059 zone visits and 19,506
@@ -70,8 +70,10 @@ const fixture = {
   // artifact of dividing HTTP requests by RUM sessions.
   totals: { visits: 1300, views: 1770, pagesPerSession: 1770 / 1300, search: 260,
     domains: 6, rumDomains: 4, zoneDomains: 2, active: 4, previousVisits: 1000, delta: .3, searchShare: .2, daysAvailable: 7, previousDaysAvailable: 7,
-    botVisits: 42000, botViews: 42350, previousBotVisits: 0, botShare: .97, floodedSiteDays: 3, floodedSites: 1,
-    partialVisits: 120, partialSites: 1, estimatedSites: 1, estimatedDirect: 13,
+    automatedVisits: 43659, automatedViews: 44178, previousAutomatedVisits: 3428, automatedShare: 43659 / (43659 + 1300),
+    browsers: [{ browser: "Chrome", newest: 156, evidence: 1350 }, { browser: "ChromeMobile", newest: 156, evidence: 540 },
+      { browser: "ChromeMobile", newest: 444, evidence: 40 }],
+    countedSince: "2026-07-10",
     // The residual is `unattributed` and is rendered outside the bar; `internal`
     // is a real channel that used to fall into it.
     sourceMix: { direct: 700, search: 260, social: 80, referral: 60, internal: 120, unattributed: 80 },
@@ -102,9 +104,7 @@ const fixture = {
   sites: [
     {
       host: "example.com", visits: 1100, views: 1500, previousVisits: 800, delta: .375,
-      botVisits: 42000, botViews: 42350, botDays: 3, previousBotVisits: 0, cleanDays: 4,
-      partialVisits: 120, partialDays: 3,
-      anomaly: "99% direct, 1.0 pages/session, 165x a normal day",
+      automatedVisits: 42000, automatedViews: 42350, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 1.36, previousPagesPerSession: 1.2, pagesPerSessionDelta: .16,
       searchSummary: { clicks: 40, impressions: 1900, ctr: .0211, position: 7.5 },
       gscWindow: "2026-07-12–2026-07-14",
@@ -172,27 +172,24 @@ const fixture = {
       ],
       spark: Array.from({ length: 14 }, (_, index) => ({
         date: `2026-07-${String(index + 3).padStart(2, "0")}`,
-        visits: index >= 11 ? 14000 : 90 + index * 4,
-        flood: index >= 11,
+        visits: 90 + index * 4,
       })),
     },
     {
       host: "davidveksler.freecapitalists.org", visits: 200, views: 270, previousVisits: 200, delta: 0,
-      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
-      partialVisits: 0, partialDays: 0,
+      automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 1.35, previousPagesPerSession: 1.3, pagesPerSessionDelta: .05,
       searchSummary: { clicks: 6, impressions: 300, ctr: .02, position: 9.7 },
       gscWindow: null, referrers: [], keywords: [], pages: [], cfPages: [],
       sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 200 },
       spark: [{ date: "2026-07-15", visits: 25 }, { date: "2026-07-16", visits: 30 }],
     },
-    // The sub-flood shape: 151 sessions from 54, flat, almost all direct, almost
-    // all on one URL. Under FLOOD_MIN_VISITS, so the flood classifier is right
-    // not to fire; the card looks like growth and the signal says otherwise.
+    // A crawler on a current browser: 151 sessions from 54, flat, almost all
+    // direct, almost all on one URL. The browser rule counts it; the card looks
+    // like growth and the signal says otherwise.
     {
       host: "wiki.example", visits: 151, views: 151, previousVisits: 54, delta: 97 / 54,
-      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
-      partialVisits: 0, partialDays: 0, previousPartialDays: 0,
+      automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 1, previousPagesPerSession: 1.4, pagesPerSessionDelta: -.4,
       searchSummary: null, gscWindow: null,
       referrers: [{ referrer: "(direct)", kind: "direct", visits: 136 }],
@@ -208,33 +205,25 @@ const fixture = {
     // (6 sessions to 7) that taught the eye to ignore the badge entirely.
     {
       host: "davidveksler.com", visits: 40, views: 82, previousVisits: 27, delta: 13 / 27,
-      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
-      partialVisits: 0, partialDays: 0, previousPartialDays: 0,
+      automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 2.05, previousPagesPerSession: 2, pagesPerSessionDelta: .05,
       searchSummary: null, gscWindow: null,
       referrers: [], keywords: [], pages: [], cfPages: [],
       sources: { direct: 0, search: 0, social: 0, referral: 0, internal: 0, unattributed: 40 },
       spark: [{ date: "2026-07-15", visits: 27 }, { date: "2026-07-16", visits: 40 }],
     },
-    // The freecapitalists.org case: every day in view was flooded, so there is no
-    // clean day at all. The card must still show the referred sessions it did
-    // measure rather than going blank — and this host has enough clean-day
-    // history (see ratioSampleDays) that the direct bucket is a ratio estimate
-    // (~30, ±5) rather than the older bare floor (17 referred only).
+    // A site whose counting started inside the period: one counted night of
+    // seven. The card must say so rather than compare a night with a week.
     {
-      host: "flooded.example", visits: 30, views: 0, previousVisits: 0, delta: null,
-      botVisits: 1659, botViews: 1828, botDays: 1, previousBotVisits: 3428, cleanDays: 0,
-      partialVisits: 30, partialDays: 1, estimatedVisits: true, spread: 5, estimatedDirect: 13, ratioSampleDays: 6,
-      anomaly: "99% direct, 1.1 pages/session, 65x a normal day — direct bucket estimated from 6 clean days",
-      pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
+      host: "partial.example", visits: 30, views: 42, previousVisits: 21, delta: null,
+      automatedVisits: 1659, automatedViews: 1828, previousAutomatedVisits: 3428, measuredDays: 1, previousMeasuredDays: 0,
+      pagesPerSession: 1.4, previousPagesPerSession: 0, pagesPerSessionDelta: null,
       searchSummary: { clicks: 3, impressions: 100, ctr: .03, position: 39.8 },
       gscWindow: "2026-07-12–2026-07-14",
-      referrers: [{ referrer: "www.google.com", kind: "search", visits: 17 }],
-      // estimatedDirect (13) is credited into direct here, same as
-      // summarizeSources does in index.js — see the comment on that param.
+      referrers: [{ referrer: "www.google.com", kind: "search", visits: 17 }, { referrer: "(direct)", kind: "direct", visits: 13 }],
       sources: { direct: 13, search: 17, social: 0, referral: 0, internal: 0, unattributed: 0 },
       keywords: [], pages: [], cfPages: [],
-      spark: [{ date: "2026-07-15", visits: 24, flood: false }, { date: "2026-07-16", visits: 1689, flood: true }],
+      spark: [{ date: "2026-07-15", visits: 24 }, { date: "2026-07-16", visits: 30 }],
     },
     // A zone-log host: a file index with no HTML page to fire the RUM beacon, so
     // its numbers are HTTP request counts. It must render below its own heading,
@@ -243,15 +232,14 @@ const fixture = {
       host: "library.example", measurement: "zone", zoneSourced: true,
       visits: 1059, views: 19506, bytes: 76658000000,
       previousVisits: 940, delta: .127,
-      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
-      partialVisits: 0, partialDays: 0,
+      automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
       searchSummary: null, gscWindow: null,
       referrers: [], keywords: [], pages: [],
       cfPages: [{ page: "/robots.txt", visits: 684, views: 612 }, { page: "/books/mises.pdf", visits: 141, views: 120 }],
       zoneCountries: [{ country: "US", visits: 620 }, { country: "DE", visits: 190 }],
       zoneStatuses: [{ status: 200, requests: 15200 }, { status: 404, requests: 1745 }],
-      // Crawler accounting in place of a flood verdict, which cannot fire here.
+      // Crawler accounting in place of the browser rule, which cannot run here.
       // Two lenses that overlap, so the card renders both and adds neither.
       zoneBots: {
         categories: [
@@ -299,7 +287,7 @@ const fixture = {
           storagePerGbMonth: 0.015, freeStorageGb: 10, freeClassA: 1000000, freeClassB: 10000000 },
       },
       sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
-      spark: [{ date: "2026-07-15", visits: 940, flood: false }, { date: "2026-07-16", visits: 1059, flood: false }],
+      spark: [{ date: "2026-07-15", visits: 940 }, { date: "2026-07-16", visits: 1059 }],
     },
     // A second zone host on a pre-migration deployment: daily_zone_bots does not
     // exist yet, so the verified lens has nothing in it. The card must still
@@ -308,8 +296,7 @@ const fixture = {
       host: "files.example", measurement: "zone", zoneSourced: true,
       visits: 88, views: 940, bytes: 2_400_000_000,
       previousVisits: 0, delta: null,
-      botVisits: 0, botViews: 0, botDays: 0, previousBotVisits: 0, cleanDays: 7, anomaly: null,
-      partialVisits: 0, partialDays: 0,
+      automatedVisits: 0, automatedViews: 0, previousAutomatedVisits: 0, measuredDays: 7, previousMeasuredDays: 7,
       pagesPerSession: 0, previousPagesPerSession: 0, pagesPerSessionDelta: null,
       searchSummary: null, gscWindow: null,
       referrers: [], keywords: [], pages: [],
@@ -322,7 +309,7 @@ const fixture = {
       // An R2 bucket configured but not pulled yet.
       r2: { bucket: "files-bucket", measured: false },
       sources: { direct: 0, search: 0, social: 0, referral: 0, other: 0 },
-      spark: [{ date: "2026-07-15", visits: 80, flood: false }, { date: "2026-07-16", visits: 88, flood: false }],
+      spark: [{ date: "2026-07-15", visits: 80 }, { date: "2026-07-16", visits: 88 }],
     },
   ],
   forums: [
@@ -331,7 +318,7 @@ const fixture = {
       usersCount: 59639, activeToday: 3, active7d: 3, active30d: 3,
       newToday: 0, new7d: 0, new30d: 0, postsToday: 0, postsCount: 398996, topicsCount: 26291,
       meanActiveToday: 2.4,
-      spark: [{ date: "2026-07-15", visits: 2, flood: false }, { date: "2026-07-16", visits: 3, flood: false }],
+      spark: [{ date: "2026-07-15", visits: 2 }, { date: "2026-07-16", visits: 3 }],
       hasData: true,
     },
     // Newly added forum with no snapshot yet — the card must say so rather than
@@ -367,7 +354,7 @@ if (!html.includes("Top search queries (Bing)")) {
 }
 
 const required = [
-  "Human sessions", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
+  "Sessions</div>", "Search opportunities", "Top landing pages (all traffic)", "Top landing pages (Google Search)", "data-query=\"domain\"",
   "high impression opportunity", "Last successful pull",
   // "Today's actions": the top three severity-1/2 signals, each with headline,
   // evidence, an imperative action, and a link.
@@ -419,23 +406,15 @@ const required = [
   "4 RUM + 2 zone · 4 with traffic",
   "min-height:44px", "Use \" + target + \" color theme",
   "if (detail.classList.contains(\"detail\") && matchMedia(\"(max-width: 560px)\").matches) detail.removeAttribute(\"open\")",
-  // Crawler traffic must stay visible and named rather than silently dropped.
-  "42,000 crawler sessions excluded", "3 flooded site-days", "example.com (42,000)",
-  "spark-flood", "crawler flood, direct traffic excluded", "Human vs crawler",
-  // The dashboard-wide aside: the "still count" figure excludes the estimated
-  // share (107 = totals.partialVisits 120 minus totals.estimatedDirect 13), and
-  // a separate sentence names how many sites got a ratio estimate and how much.
-  "referred sessions still count (107 of them here)", "13 more sessions, with its own margin",
-  // A fully flooded site keeps the sessions it could still measure, and with
-  // enough clean-day history the direct bucket is a ratio estimate (not a bare
-  // floor) instead of rendering a blank card.
-  "&sim;&nbsp;30", `<span class="spread"`, "&plusmn;5",
-  "The figure above is the 17 referred sessions that survived the flooded day.",
-  "Its direct bucket on those days adds an estimated 13 more",
-  "ratio over 6 clean days", `total above is "~" a figure, plus or minus about 5`,
-  "pageviews not separable on flooded days",
-  // ...and the mixed case, where clean days and recovered days both contribute.
-  "Human figures above cover the 4 clean days, plus 120 referred sessions that survived the flooded days.",
+  // Automated traffic must stay visible and named rather than silently dropped.
+  "43,659 automated sessions not counted", "(97.1% of what\n    Cloudflare recorded)", "example.com (42,000)",
+  "out-of-date browser versions", "Nothing is blocked.",
+  "current browsers, 43,659 automated not counted",
+  // Per card: what the rule set aside, and a period that reaches back before it.
+  "+ 42,000 automated sessions not counted", "+ 1,659 automated sessions not counted · 1 of 7 days counted",
+  // The footer explains the rule from its own constants and names last night's versions.
+  "Sessions count current browsers only.", "(last night: Chrome 156, ChromeMobile 156, ChromeMobile 444)",
+  "Counted this way from 2026-07-10",
   // Measurement classes are separated: the headline is RUM-only and the zone
   // host's request counts are reported beside it, in their own units.
   "Zone-log measurement", `class="card card--zone`, "4 RUM sites",
@@ -756,12 +735,12 @@ if (actionsAt < 0 || actionsAt > html.indexOf(`class="totals"`)) {
 }
 const actionsBlockHtml = html.slice(actionsAt, html.indexOf("</section>", actionsAt));
 // At most three, and only severity 1 and 2. Severity 3 is context for the card,
-// not an instruction — a "no like-for-like comparison" note must not displace a
+// not an instruction — a context note must not displace a
 // real finding from a three-slot list.
 if ((actionsBlockHtml.match(/<li class="action /g) || []).length !== 3) {
   throw new Error("Today's actions must render exactly the top three severity-1/2 signals");
 }
-if (actionsBlockHtml.includes("no like-for-like comparison")) {
+if (actionsBlockHtml.includes("partial.example sessions rose 40%")) {
   throw new Error("A severity-3 signal must not appear in Today's actions");
 }
 if (actionsBlockHtml.includes("example.com has 1 query ranking well but not clicked")) {
@@ -862,8 +841,8 @@ if (html.indexOf("Zone-log measurement") > zoneCardAt) {
 }
 // ...and nothing inside a zone card may call a request count a human session.
 const zoneBlock = html.slice(zoneCardAt, html.indexOf("</main>", zoneCardAt));
-if (zoneBlock.includes("human sessions")) {
-  throw new Error("A zone-sourced card must never label its numbers as human sessions");
+if (/class="lbl">(?:human )?sessions/.test(zoneBlock)) {
+  throw new Error("A zone-sourced card must never label its numbers as sessions");
 }
 // ...nor invent one under any other name. The verified-bot floor covers 12.8% of
 // this fixture's requests; the remaining 87.2% is readers and unlabelled crawlers
@@ -910,22 +889,29 @@ if (preMigrationCard.includes("R2 operations by type")) {
   throw new Error("An unpulled R2 bucket must not render an empty operations table");
 }
 
-// Footer prose is interpolated from the classifier's own constants. Computed
+// Footer prose is interpolated from the browser rule's own constants. Computed
 // here from the same imports, never typed, so changing a threshold in bots.js
 // fails this check until the prose follows.
-const floodProse = `≥${(DIRECT_SHARE * 100).toFixed(0)}% direct, ≤${FLAT_PAGES_PER_SESSION} pages/session, ` +
-  `at least ${FLOOD_MIN_VISITS.toLocaleString("en-US")} sessions, and at least ${FLOOD_MULTIPLE}× a normal day`;
-if (!html.includes(floodProse)) {
-  throw new Error(`Footer flood thresholds do not match src/bots.js: expected "${floodProse}"`);
+const ruleProse = `no more than ${BROWSER_LAG} behind (or ${BROWSER_LEAD} ahead of) the newest version real visitors use, ` +
+  `where "newest" is the highest version holding at least ${(NEWEST_MIN_SHARE * 100).toFixed(0)}% of that browser's ` +
+  `referred sessions over the last ${EVIDENCE_DAYS} days`;
+const segmentProse = `sending at least ${SEGMENT_MIN_VISITS.toLocaleString("en-US")} sessions in a night, ` +
+  `${(SEGMENT_DIRECT_SHARE * 100).toFixed(0)}% or more of them with no referrer`;
+if (!html.includes(segmentProse)) {
+  throw new Error(`Footer direct-only-segment prose does not match src/bots.js: expected "${segmentProse}"`);
 }
-// The sentence the splitDay rework made false.
-if (html.includes("excluded whole — from sessions, referrers, and landing pages alike")) {
-  throw new Error("Footer still claims flooded days are excluded whole; referred sessions survive");
+if (!html.includes(ruleProse)) {
+  throw new Error(`Footer browser-rule prose does not match src/bots.js: expected "${ruleProse}"`);
 }
-// A site with no crawler activity must not sprout an empty crawler callout:
-// two of the three fixture sites have bot traffic.
+// None of the old flood vocabulary may survive on the page.
+for (const stale of ["flooded", "crawler flood", "&sim;&nbsp;", `class="spread"`, "Human vs crawler", "spark-flood",
+  "not separable", "ratio estimate"]) {
+  if (html.includes(stale)) throw new Error(`Old flood-era wording is still on the page: ${stale}`);
+}
+// A site with nothing set aside must not sprout an empty callout: exactly the
+// two fixture sites with automated traffic carry one.
 if (html.split(`class="crawler-row"`).length - 1 !== 2) {
-  throw new Error("Crawler callout should render for exactly the two flooded fixture sites");
+  throw new Error("The automated-traffic line should render for exactly the two fixture sites that have some");
 }
 
 if (process.argv.includes("--write")) {
