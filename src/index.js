@@ -342,8 +342,10 @@ async function backfillRum(env, date) {
     .bind(date).first().catch(() => null);
   const until = run?.run_at ?? `${date}T13:00:00.000Z`;
   const since = new Date(new Date(until).getTime() - 24 * 3600 * 1000).toISOString();
-  const { hosts, truncated, degraded, browsers, segments } = await pullTraffic(env, since, until);
-  if (degraded.length) return { date, written: false, window: [since, until], degraded };
+  const { hosts, truncated, sampled, degraded, browsers, segments } = await pullTraffic(env, since, until);
+  // Unlike the nightly run, a repair never writes a sampled answer: it exists to
+  // replace a bad night with an exact one, and a sampled re-read is no better.
+  if (degraded.length || sampled.length) return { date, written: false, window: [since, until], degraded: [...sampled, ...degraded] };
   const batches = await batchInChunks(env.DB, rumWriteStatements(env, date, hosts, browsers));
   const counted = [...hosts.values()].reduce((sum, rec) => sum + rec.visits, 0);
   const automated = [...hosts.values()].reduce((sum, rec) => sum + rec.automatedVisits, 0);
@@ -361,18 +363,19 @@ async function runDaily(env, now = new Date()) {
   // 1. Traffic + referrers (Cloudflare Web Analytics)
   // `rumTruncated` names any grouping that filled its row cap. Informational
   // (see `info` below), not a failure: the per-host totals are exact either way.
-  const { hosts: traffic, truncated: rumTruncated, degraded: rumDegraded, browsers, segments } = await pullTraffic(env, since, until);
+  const { hosts: traffic, truncated: rumTruncated, sampled: rumSampled, degraded: rumDegraded, browsers, segments } = await pullTraffic(env, since, until);
   // Cloudflare answered with a sampled RUM result (counts in multiples of the
   // sample interval, small hosts rounding to zero) and it stayed sampled through
-  // the retry budget. Nothing from it is trustworthy, so no RUM host gets a row:
-  // writing none leaves any existing rows for the date untouched, where writing
-  // the sampled figures is how 2026-10-17 stored 18,000 and eleven zeros. Counts as
-  // a note, so the run is ok=0 and the stale-pipeline signal and push fire; zone,
-  // R2, forum and Search Console data are independent and still written.
+  // the retry budget. That does NOT block the run: the rows are written as
+  // returned and the night is flagged in the runs note (informational, so ok stays
+  // 1 and nothing alarms) and in the push. The 17:00 retry cron then re-pulls, and
+  // `npm run backfill:rum` repairs a night by hand; both overwrite the sampled rows.
+  // Only `degraded` (no evidence to date the current browsers from, so nothing
+  // could be classified) skips the RUM rows, as a note so the run is ok=0.
   const rumSkipped = rumDegraded.length > 0;
   if (rumSkipped) {
     traffic.clear();
-    notes.push(`rum sampled by Cloudflare, traffic rows not written: ${rumDegraded.join("; ")}`.slice(0, 200));
+    notes.push(`rum pull unusable, traffic rows not written: ${rumDegraded.join("; ")}`.slice(0, 200));
   }
 
   // 1b. Zone-log traffic for hosts with no RUM beacon (trafficSource: "zone").
@@ -677,6 +680,7 @@ async function runDaily(env, now = new Date()) {
   const info = [
     ...(truncatedPairHosts.length
       ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`] : []),
+    ...(rumSampled.length ? [`rum sampled by Cloudflare, rows written as returned: ${rumSampled.join("; ")}`.slice(0, 200)] : []),
     ...(rumTruncated.length ? [`rum rows truncated at ${RUM_ROW_LIMIT}: ${rumTruncated.join(", ")}`] : []),
     // Informational, not a failure: which direct-only desktop segments the
     // second browser rule set aside tonight (see isDirectOnlySegment), so a
@@ -696,7 +700,7 @@ async function runDaily(env, now = new Date()) {
   // byte-for-byte what it was before.
   const dashboard = await loadDashboard(env).catch(() => null);
   const topSignal = (dashboard?.signals ?? []).find((signal) => signal.severity === 1) ?? null;
-  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal, rumSkipped);
+  await sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts, topSignal, rumSkipped, rumSampled.length > 0);
 
   // 5. Persist every computed signal, not just the top one picked out above
   // (spec item 14) — the record item 15's recurrence reads, and what a
@@ -722,7 +726,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, rumTruncated, rumSkipped, r2Buckets, browsers, segments: segments ?? [], notes };
+    truncatedPairHosts, rumTruncated, rumSkipped, rumSampled, r2Buckets, browsers, segments: segments ?? [], notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------
@@ -947,7 +951,7 @@ async function summarizeToday(env, date) {
   return { humanVisits, botVisits, perHost, automatedHosts: automated.map(([host]) => host) };
 }
 
-async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null, rumSkipped = false) {
+async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFailedHosts = new Set(), topSignal = null, rumSkipped = false, rumSampled = false) {
   if (!env.NTFY_TOPIC) return;
   const ranked = summary
     ? [...summary.perHost.entries()].sort((a, b) => b[1] - a[1])
@@ -966,9 +970,11 @@ async function sendNtfy(env, traffic, totalVisits, gscOk, notes, summary, gscFai
   // Only severity 1 ("act today") is added. Nothing else changes about the push,
   // so a quiet day still reads exactly as it did before the signal engine existed.
   const finding = topSignal ? `\n\n❗ ${topSignal.headline}\n→ ${topSignal.action}` : "";
-  // A sampled RUM answer writes nothing, so the headline above is last night's
-  // history, not this window: say so rather than let it read as a quiet day.
-  const rumWarn = rumSkipped ? "\n⚠ Cloudflare sampled the RUM data; traffic not updated (retry: npm run refresh)" : "";
+  // A skipped RUM pull writes nothing, so the headline above is last night's
+  // history, not this window; a sampled one is written but coarse. Say so either
+  // way rather than let it read as a quiet day.
+  const rumWarn = rumSkipped ? "\n⚠ RUM pull unusable; traffic not updated (retry: npm run refresh)"
+    : rumSampled ? "\n⚠ Cloudflare sampled the RUM data; counts are coarse until the 17:00 retry (or npm run backfill:rum)" : "";
   const body = `${headline}\n${top}${crawlers}${gscWarn}${rumWarn}${finding}`;
   try {
     await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
@@ -1011,18 +1017,19 @@ async function runDailyGuarded(env) {
 // sampled-RUM answers are transient, but the in-run retries only span about 50
 // seconds, so a sampled 13:00 run used to leave the page without traffic until
 // someone ran `npm run refresh`. This re-runs the pull only when the latest `runs`
-// row is a recent RUM-sampling failure; any other state (a healthy run, a thrown
+// row carries a recent `rum sampled` note; any other state (a healthy run, a thrown
 // run, a manual /run that already healed it) is a quiet no-op, because repeating a
 // pull that did not fail for this reason would only spend subrequests and re-push.
-// The runs row is keyed on time, so a retry that is still sampled just adds another
-// ok=0 row and the next day's 13:00 run starts clean.
+// A sampled night is written (ok=1, with a `rum sampled` note), so the note, not
+// ok, is what marks it. The runs row is keyed on time, so a retry that is still
+// sampled just adds another noted row and the next day's 13:00 run starts clean.
 export const RETRY_CRON = "0 17 * * *";
 const RETRY_MAX_AGE_MS = 12 * 3600 * 1000;
 
 async function runRetryIfSampled(env, now = new Date()) {
   const row = await env.DB.prepare(`SELECT run_at,ok,note FROM runs ORDER BY run_at DESC LIMIT 1`).first();
   const age = row ? now.getTime() - new Date(row.run_at).getTime() : Infinity;
-  const sampled = row && Number(row.ok) === 0 && /rum sampled/.test(row.note ?? "") && age <= RETRY_MAX_AGE_MS;
+  const sampled = row && /rum sampled/.test(row.note ?? "") && age <= RETRY_MAX_AGE_MS;
   if (!sampled) return { retried: false };
   return { retried: true, result: await runDailyGuarded(env) };
 }

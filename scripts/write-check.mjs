@@ -587,12 +587,13 @@ const runBing = async (env) => {
       < flat.findIndex((s) => s.sql.includes("INTO daily_browser_current")), true);
 }
 
-// ---- 1a'. A sampled RUM answer is retried, then refused, never stored ------
+// ---- 1a'. A sampled RUM answer is retried, then written and flagged --------
 // 2026-10-17 stored forum.objectivismonline.com at exactly 18,000 visits and eleven
 // of seventeen sites at zero: Cloudflare's adaptive RUM dataset had answered with a
-// coarse sample, and the pull wrote it as though it were exact. The guard reads
-// `avg { sampleInterval }`, retries from a small shared budget, and if the answer is
-// still sampled writes NO RUM host (leaving any existing rows for the date alone).
+// coarse sample. The guard reads `avg { sampleInterval }` and retries from a small
+// shared budget; if the answer is still sampled the run is NOT blocked: the rows are
+// written as returned, the night is flagged in the runs note (ok stays 1), and the
+// 17:00 retry cron / backfill:rum replace it later.
 {
   const realTimeout = globalThis.setTimeout;
   globalThis.setTimeout = (fn) => realTimeout(fn, 0);
@@ -607,23 +608,21 @@ const runBing = async (env) => {
     rumRequests = 0;
     const { result, flat } = await run({ GSC_SA_KEY, NTFY_TOPIC: "check" });
     rumInterval = 1;
-    check("a sampled RUM answer is retried from a bounded budget",
-      rumRequests, 1 + RUM_SAMPLING_RETRIES);
-    check("...and reported skipped", result.rumSkipped, true);
-    check("...as a note, so the run is not ok", result.notes.some((n) => n.startsWith("rum sampled")), true);
-    check("...writing no RUM traffic row",
+    check("a sampled RUM answer is retried from ONE bounded budget shared by census and counted",
+      rumRequests, 2 + RUM_SAMPLING_RETRIES);
+    check("...and not reported skipped", result.rumSkipped, false);
+    check("...but reported sampled", result.rumSampled.length > 0, true);
+    check("...as no failing note, so the run stays ok", result.notes.length, 0);
+    check("...still writing the RUM traffic rows",
       flat.filter((s) => s.sql.startsWith("INSERT INTO daily_traffic")
-        && SITES.find((site) => site.host === s.binds[1])?.trafficSource !== "zone").length, 0);
-    check("...deleting no RUM referrer or page rows",
-      flat.filter((s) => /DELETE FROM daily_(referrers|cf_pages) /.test(s.sql)
-        && SITES.find((site) => site.host === s.binds[1])?.trafficSource !== "zone").length, 0);
-    check("...while zone hosts are still written",
+        && SITES.find((site) => site.host === s.binds[1])?.trafficSource !== "zone").length > 0, true);
+    check("...and zone hosts are written too",
       flat.some((s) => s.sql.startsWith("INSERT INTO daily_traffic")
         && SITES.find((site) => site.host === s.binds[1])?.trafficSource === "zone"), true);
     check("...and Search Console data is still written",
       flat.some((s) => s.sql.startsWith("INSERT INTO daily_query_pages")), true);
-    check("...and the stored run row is ok=0",
-      ran.some((s) => s.sql.includes("INTO runs") && s.binds[2] === 0 && /rum sampled/.test(s.binds[3])), true);
+    check("...and the stored run row is ok=1 with the sampling noted",
+      ran.some((s) => s.sql.includes("INTO runs") && s.binds[2] === 1 && /rum sampled/.test(s.binds[3])), true);
   } finally {
     rumInterval = 1;
     globalThis.setTimeout = realTimeout;
@@ -633,7 +632,7 @@ const runBing = async (env) => {
 // ---- 1a''. The retry cron re-runs only after a RUM-sampling failure --------
 // The in-run retries span ~50 s, so a sampled 13:00 run used to stay broken until a
 // manual refresh. The 17:00 cron pulls again, but only when the newest runs row is a
-// recent ok=0 "rum sampled" one; every other state must be a no-op.
+// recent "rum sampled" one; every other state must be a no-op.
 {
   const { readFileSync } = await import("node:fs");
   const { RETRY_CRON } = await import("../src/index.js");
@@ -642,8 +641,8 @@ const runBing = async (env) => {
   check("...beside the nightly one", wrangler.includes('"0 13 * * *"'), true);
 
   const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
-  const sampled = (h) => ({ run_at: hoursAgo(h), ok: 0,
-    note: "rum sampled by Cloudflare, traffic rows not written: 556c237b: sample interval 100.0" });
+  const sampled = (h) => ({ run_at: hoursAgo(h), ok: 1,
+    note: "rum sampled by Cloudflare, rows written as returned: 556c237b: sample interval 100.0" });
   const fire = async (cron, row) => {
     seq = 0; batches = []; ran = []; fetchLog = [];
     latestRun = row;

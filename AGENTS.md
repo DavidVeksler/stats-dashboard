@@ -21,7 +21,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | What counts as a search "opportunity", and which of the two kinds it is | `src/opportunities.js` — one classifier, imported by both `index.js` and `render.js` |
 | Expected CTR by position, and where the benchmark came from | `src/opportunities.js` (`CTR_ANCHORS`, sourced and dated in the comment above it) |
 | How many search queries are stored per site, and why that number | `src/gsc.js` (`KEYWORD_ROW_LIMIT`) |
-| RUM numbers that are round (1,000s) or zero, sampling guard, repairing bad nights | the `A sampled RUM answer is retried, then refused` gotcha below, `src/cloudflare.js` (`rumSamplingProblem`), `GET /backfill-rum` + `npm run backfill:rum` |
+| RUM numbers that are round (1,000s) or zero, sampling guard, repairing bad nights | the `A sampled RUM answer is retried, then written and flagged` gotcha below, `src/cloudflare.js` (`rumSamplingProblem`), `GET /backfill-rum` + `npm run backfill:rum` |
 | Why a night's writes are chunked, and the ordering rule that makes it safe | `src/index.js` (`D1_MAX_BATCH_STATEMENTS`, `batchInChunks`), asserted by `scripts/write-check.mjs` |
 | Declining to pursue a query on a given site | `src/config.js` (`queryDenyPatterns`, shipped unset) |
 | R2 bucket stats (storage, ops by billing class, cost estimate, objects read from the bucket), edge cache status | `src/r2.js` + `r2Bucket`/`r2Account` on a `SITES` row; checked by `scripts/r2-check.mjs` |
@@ -302,7 +302,7 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   attempts, 1.5s then 4s backoff) and never a real query error; `runDailyGuarded` writes an `ok=0` runs row
   (which feeds `/health` and the severity-1 `stale-pipeline` signal) and pushes a high-priority ntfy on any
   throw. Do not add a raw `fetch(GQL…)`; `scripts/gql-check.mjs` covers the retry rules.
-- **A sampled RUM answer is retried, then refused, never stored.** `rumPageloadEventsAdaptiveGroups` is
+- **A sampled RUM answer is retried, then written and flagged; it never blocks the run (changed 2026-11-02 at David's instruction).** `rumPageloadEventsAdaptiveGroups` is
   adaptive: Cloudflare can answer with a coarse sample, and every count is then a multiple of the sample
   interval. (Inferred, not captured: the Worker's raw response on a bad night was never logged, so the first guarded
   bad night's `runs` note is the confirmation.) The 2026-10-17 run stored `forum.objectivismonline.com` at exactly 18,000 visits, three hosts at
@@ -313,20 +313,23 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `avg { sampleInterval }` on the census (and the counted request's `refs`), judges each account with `rumSamplingProblem` (pageview-weighted interval
   over `RUM_MAX_SAMPLE_INTERVAL` 1.5, or no rows from the primary account), retries from ONE shared budget of
   `RUM_SAMPLING_RETRIES` (3, backed off 5/15/30 s, shared across both RUM requests),
-  and on exhaustion returns `degraded`. `runDaily` then writes **no** RUM host (existing rows for the date are left
-  alone), notes it (`ok=0`, so `/health` and `stale-pipeline` fire), adds a line to the ntfy push and returns
-  `rumSkipped`; zone, R2, forum and Search Console data are still written. A stored RUM count that is a multiple of
-  100 or 1,000, or a RUM host at zero beside a live site, is this failure until proven otherwise. Do not "fix" it by
-  rounding, scaling by the interval, or loosening the threshold. Repair bad nights with `npm run backfill:rum -- --dates …`
+  and on exhaustion returns the reasons as `sampled` and **carries on** with the sampled answer (the retries were
+  once a gate that returned `degraded` and wrote no RUM host; they no longer are). `runDaily` writes the rows as
+  returned, adds an informational `rum sampled by Cloudflare, rows written as returned` line to the `runs` note
+  (`ok` stays 1, so `/health` and `stale-pipeline` do not fire), a line to the ntfy push, and returns `rumSampled`.
+  `degraded` now means only "the browser rules could not run" (no referred sessions to date the current browsers
+  from): that still writes no RUM host and is an `ok=0` note. A stored RUM count that is a multiple of 100 or
+  1,000, or a RUM host at zero beside a live site, is a sampled night until proven otherwise (grep `runs.note` for
+  `rum sampled`). Do not "fix" it by rounding, scaling by the interval, or loosening the threshold. Repair bad nights with `npm run backfill:rum -- --dates …`
   (`scripts/backfill-rum.mjs` → `GET /backfill-rum?key=…&date=…`, `backfillRum` in `src/index.js`): the Worker
   re-reads that night's window (its `runs.run_at`, else 13:00Z), applies the same guard and the same browser
   rules, and rewrites the night's RUM rows through its own D1 binding with the same `rumWriteStatements`
-  runDaily uses. A night still sampled on re-read is reported and left alone. `write-check.mjs` (part 1a') and
+  runDaily uses. Unlike the nightly run, a repair still **refuses** a sampled re-read (reported, rows left alone): its job is to replace a sampled night with an exact one. `write-check.mjs` (part 1a') and
   `gql-check.mjs` cover the guard. The in-run retries only span ~50 s, so a **second cron, `0 17 * * *`
   (`RETRY_CRON`, `runRetryIfSampled` in `src/index.js`)** re-runs `runDailyGuarded` four hours later, and only
-  when the newest `runs` row is `ok=0` with a `rum sampled` note from the last 12 hours; a healthy run, a thrown
+  when the newest `runs` row carries a `rum sampled` note from the last 12 hours; a healthy run, a thrown
   run or an older failure makes it a silent no-op (part 1a'' of `write-check.mjs`). Keep the string in
-  `wrangler.jsonc` identical to `RETRY_CRON`. A retry that is still sampled just adds another `ok=0` row; the
+  `wrangler.jsonc` identical to `RETRY_CRON`. A retry that is still sampled just adds another noted row; the
   next 13:00 run starts clean. Nothing here changes the backfill advice for nights that stay sampled for days.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and

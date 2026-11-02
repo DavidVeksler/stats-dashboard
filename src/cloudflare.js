@@ -133,8 +133,10 @@ export async function gqlPost(env, payload, label) {
 // window afterwards returned the exact figures at interval ~1. Earlier bad runs:
 // 2026-09-21, 09-30, 10-06 and 10-12. The pull used to accept whatever came back.
 // `avg { sampleInterval }` says how coarse the answer is, so a sampled answer is
-// retried and, if it stays sampled, refused (pullTraffic reports it; runDaily
-// writes no RUM rows rather than wrong ones). A healthy answer reads 1.00-1.05.
+// retried and, if it stays sampled, REPORTED rather than refused (pullTraffic
+// returns it as `sampled`; runDaily still writes the rows and flags the night in
+// the runs note). A healthy answer reads 1.00-1.05. Sampling never blocks a pull:
+// the 17:00 retry cron and `backfill:rum` are what replace a sampled night.
 export const RUM_MAX_SAMPLE_INTERVAL = 1.5;
 // Retries are spent from ONE budget per pullTraffic call, not per account: runDaily
 // sits at 46-47 of the 50-subrequest ceiling, so a degraded night may add at most
@@ -168,19 +170,19 @@ async function rumRequest(env, query, variables, label, judge, budget, backoffMs
   for (let attempt = 0; ; attempt++) {
     const body = await gqlPost(env, { query, variables }, label);
     const accounts = CF_ACCOUNTS.map((_, i) => body.data?.viewer?.[`a${i}`]?.[0] ?? {});
-    const degraded = [];
+    const sampled = [];
     accounts.forEach((acct, i) => {
       const problem = rumSamplingProblem(judge(acct), i === 0);
-      if (problem) degraded.push(`${CF_ACCOUNTS[i].slice(0, 8)}: ${problem}`);
+      if (problem) sampled.push(`${CF_ACCOUNTS[i].slice(0, 8)}: ${problem}`);
     });
-    if (!degraded.length || budget.left <= 0) return { accounts, degraded };
+    if (!sampled.length || budget.left <= 0) return { accounts, sampled };
     budget.left -= 1;
     await new Promise((r) => setTimeout(r, backoffMs[Math.min(attempt, backoffMs.length - 1)]));
   }
 }
 
 // Pull the last-24h RUM rows from every account and merge by requestHost.
-// Returns { hosts, truncated, degraded, browsers, segments } where hosts is
+// Returns { hosts, truncated, sampled, degraded, browsers, segments } where hosts is
 // Map<host, { views, visits, automatedVisits, automatedViews,
 //             referrers: Map<refHost, visits>, pages: Map<path, { views, visits }> }>.
 // visits/views/referrers/pages are COUNTED sessions only (current browsers, see
@@ -188,13 +190,15 @@ async function rumRequest(env, query, variables, label, judge, budget, backoffMs
 // newest version per family the rule used, and `segments` the direct-only
 // desktop segments set aside, both for the runs note and the page.
 // truncated lists "account/grouping" for every grouping that hit RUM_ROW_LIMIT,
-// and degraded lists "account: reason" for every account still sampled after
-// the retry budget (see the sampling guard above), or a reason the rule could
-// not run at all. When degraded is non-empty `hosts` holds nothing worth
-// writing and the caller must not store it.
+// `sampled` lists "account: reason" for every account still sampled after the
+// retry budget (see the sampling guard above); `hosts` is still filled from that
+// answer and the caller decides what to do with it. `degraded` is only a reason
+// the browser rules could not run at all (no evidence to date the current
+// browsers from); then `hosts` holds nothing worth writing.
 export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLING_RETRIES, backoffMs = RUM_SAMPLING_BACKOFF_MS } = {}) {
   const hosts = new Map();
   const truncated = [];
+  const sampled = [];
   const budget = { left: retries };
   const filter = rumFilter(startISO, endISO);
   const evidenceStart = new Date(new Date(endISO).getTime() - EVIDENCE_DAYS * 86400e3).toISOString();
@@ -214,7 +218,7 @@ export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLIN
   // 1. Census + evidence.
   const census = await rumRequest(env, CENSUS_QUERY(CF_ACCOUNTS), { filter, direct: { ...filter, refererHost: "" }, evidence }, "RUM census",
     (acct) => acct.census ?? [], budget, backoffMs);
-  if (census.degraded.length) return { hosts, truncated, degraded: census.degraded, browsers: [], segments: [] };
+  sampled.push(...census.sampled);
   noteTruncation(census.accounts, ["census", "censusDirect", "evidence"]);
   const current = currentBrowsers(census.accounts.flatMap((acct) => (acct.evidence ?? []).map((g) => ({
     browser: g.dimensions.userAgentBrowser, version: g.dimensions.browserVersion, visits: g.sum.visits }))));
@@ -223,7 +227,7 @@ export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLIN
     .sort((a, b) => b.evidence - a.evidence);
   // Fail closed: with no evidence there is no newest version, nothing would
   // count, and writing every site at zero is the 2026-10-17 failure in a new shape.
-  if (!current.size) return { hosts, truncated, degraded: ["no referred sessions to date the current browsers from"], browsers, segments: [] };
+  if (!current.size) return { hosts, truncated, sampled, degraded: ["no referred sessions to date the current browsers from"], browsers, segments: [] };
 
   const censusRows = [];
   const segments = [];
@@ -253,13 +257,13 @@ export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLIN
   }
   segments.sort((a, b) => b.visits - a.visits);
   const clauses = countedBrowserClauses(current, censusRows);
-  if (!clauses.length) return { hosts, truncated, degraded: [], browsers, segments };
+  if (!clauses.length) return { hosts, truncated, sampled, degraded: [], browsers, segments };
 
   // 2. Referrers and landing pages, counted sessions only.
   const counted = await rumRequest(env, COUNTED_QUERY(CF_ACCOUNTS),
     { filter: { ...filter, AND: [...(filter.AND ?? []), { OR: clauses }, ...segmentExclusions(segments)] } }, "RUM counted",
     (acct) => acct.refs ?? [], budget, backoffMs);
-  if (counted.degraded.length) return { hosts, truncated, degraded: counted.degraded, browsers, segments };
+  sampled.push(...counted.sampled);
   noteTruncation(counted.accounts, ["refs", "pages"]);
   for (const acct of counted.accounts) {
     // A session ("visit") is only counted on its first pageview, so navigation
@@ -289,7 +293,7 @@ export async function pullTraffic(env, startISO, endISO, { retries = RUM_SAMPLIN
     }
   }
 
-  return { hosts, truncated, degraded: [], browsers, segments };
+  return { hosts, truncated, sampled, degraded: [], browsers, segments };
 }
 
 // httpRequestsAdaptiveGroups, one dimension per grouping. Kept to a single

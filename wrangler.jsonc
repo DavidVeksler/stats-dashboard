@@ -32,8 +32,8 @@
   // runBingDaily in src/index.js.
   //
   // The 17:00 UTC cron is a conditional retry (RETRY_CRON in src/index.js): it
-  // re-runs the pull only when the latest run was ok=0 from Cloudflare sampling
-  // the RUM data, and does nothing otherwise. Keep the two strings identical.
+  // re-runs the pull only when the latest run noted Cloudflare sampling the
+  // RUM data (it was still written, coarse), and does nothing otherwise. Keep the two strings identical.
   "triggers": {
     "crons": ["0 13 * * *", "0 17 * * *"]
   },
