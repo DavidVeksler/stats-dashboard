@@ -115,6 +115,18 @@ export const SITES = [
     // scope setting in Bing Webmaster Tools, not a code change, is what would
     // make this property mean the apex.
   },
+  // No dedicated Search Console property (list_sites 2026-11-02), so this reads
+  // the davidveksler.com domain property filtered to the subdomain, the same
+  // shape davidveksler.freecapitalists.org uses. The apex row's filter excludes
+  // subdomains, so nothing is counted twice. Switch to a dedicated
+  // sc-domain:titan.davidveksler.com property if one is created. No `bing`
+  // field: Bing's davidveksler.com apex property is domain-wide and unfilterable
+  // (see that row), and no titan property is verified.
+  {
+    host: "titan.davidveksler.com",
+    gsc: "sc-domain:davidveksler.com",
+    gscPageFilter: "^https?://titan\\.davidveksler\\.com/",
+  },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
   // The domain property spans every *.freecapitalists.org subdomain, several of
