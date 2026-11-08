@@ -85,11 +85,14 @@ export const SITES = [
   // Dedicated sc-domain: property, confirmed via list_sites 2026-10-14 (created
   // that day, so expect an empty search panel until Search Console backfills it;
   // do not swap to the davidveksler.com parent + gscPageFilter to fill the gap
-  // unless the new property stays empty for days). No `bing` field: Bing's
-  // davidveksler.com apex property is domain-wide and unfilterable (see that row).
+  // unless the new property stays empty for days). Bing: its own URL-prefix
+  // property, verified (getUserSites 2026-11-07); a live pull that day returned
+  // no rows (nothing indexed yet) and no overlap with another property's
+  // queries. The apex davidveksler.com property stays unwired (see that row).
   {
     host: "concordia.davidveksler.com",
     gsc: "sc-domain:concordia.davidveksler.com",
+    bing: "https://concordia.davidveksler.com/",
   },
   {
     host: "coloradofirearmswatch.org",
@@ -115,17 +118,18 @@ export const SITES = [
     // scope setting in Bing Webmaster Tools, not a code change, is what would
     // make this property mean the apex.
   },
-  // No dedicated Search Console property (list_sites 2026-11-02), so this reads
-  // the davidveksler.com domain property filtered to the subdomain, the same
-  // shape davidveksler.freecapitalists.org uses. The apex row's filter excludes
-  // subdomains, so nothing is counted twice. Switch to a dedicated
-  // sc-domain:titan.davidveksler.com property if one is created. No `bing`
-  // field: Bing's davidveksler.com apex property is domain-wide and unfilterable
-  // (see that row), and no titan property is verified.
+  // Dedicated sc-domain: property, confirmed via list_sites 2026-11-07 (it had
+  // none on 2026-11-02, when this row read the davidveksler.com parent filtered
+  // to the subdomain; the apex row's filter excludes subdomains, so nothing was
+  // counted twice). A new property starts empty until Search Console backfills
+  // it. Bing: its own URL-prefix property, verified (getUserSites 2026-11-07);
+  // a live pull that day returned no rows and no overlap with another
+  // property's queries. The apex davidveksler.com property stays unwired (see
+  // that row).
   {
     host: "titan.davidveksler.com",
-    gsc: "sc-domain:davidveksler.com",
-    gscPageFilter: "^https?://titan\\.davidveksler\\.com/",
+    gsc: "sc-domain:titan.davidveksler.com",
+    bing: "https://titan.davidveksler.com/",
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
