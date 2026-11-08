@@ -377,6 +377,14 @@ async function runDaily(env, now = new Date()) {
     traffic.clear();
     notes.push(`rum pull unusable, traffic rows not written: ${rumDegraded.join("; ")}`.slice(0, 200));
   }
+  // The primary account returned NO rows at all after the retry budget (2026-11-08:
+  // every RUM host stored as zero, the page showed 6 sessions against ~594). That is
+  // an outage of the read, not a coarse answer, and writing it replaces a real night
+  // with zeros. Write no RUM rows and no daily_traffic row for the date (the page's
+  // "latest" date is MAX(daily_traffic.date), so it keeps showing the last good night),
+  // and keep the `rum sampled` note so the 17:00 retry cron still fires. ok stays 1.
+  const rumEmpty = !rumSkipped && rumSampled.some((r) => /no rows returned/.test(r));
+  if (rumEmpty) traffic.clear();
 
   // 1b. Zone-log traffic for hosts with no RUM beacon (trafficSource: "zone").
   // Merged into the same `traffic` map so the rest of this function doesn't
@@ -394,15 +402,15 @@ async function runDaily(env, now = new Date()) {
     }
   }
 
-  const stmts = rumSkipped ? [] : rumWriteStatements(env, date, traffic, browsers);
+  const stmts = rumSkipped || rumEmpty ? [] : rumWriteStatements(env, date, traffic, browsers);
   for (const { host } of SITES.filter((site) => site.trafficSource === "zone")) {
     const rec = traffic.get(host) ?? { views: 0, visits: 0, referrers: new Map(), pages: new Map() };
     const zx = zoneExtra.get(host);
     stmts.push(
-      env.DB.prepare(
+      ...(rumEmpty ? [] : [env.DB.prepare(
         `INSERT INTO daily_traffic (date,host,visits,views,bytes) VALUES (?,?,?,?,?)
          ON CONFLICT(date,host) DO UPDATE SET visits=excluded.visits, views=excluded.views, bytes=excluded.bytes`
-      ).bind(date, host, rec.visits, rec.views, zx?.bytes ?? 0),
+      ).bind(date, host, rec.visits, rec.views, zx?.bytes ?? 0)]),
       env.DB.prepare(`DELETE FROM daily_referrers WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_cf_pages WHERE date=? AND host=?`).bind(date, host),
       env.DB.prepare(`DELETE FROM daily_zone_countries WHERE date=? AND host=?`).bind(date, host),
@@ -680,7 +688,7 @@ async function runDaily(env, now = new Date()) {
   const info = [
     ...(truncatedPairHosts.length
       ? [`gsc pairs truncated at ${QUERY_PAGE_ROW_LIMIT} (fell back to a query pull): ${truncatedPairHosts.join(", ")}`] : []),
-    ...(rumSampled.length ? [`rum sampled by Cloudflare, rows written as returned: ${rumSampled.join("; ")}`.slice(0, 200)] : []),
+    ...(rumSampled.length ? [`rum sampled by Cloudflare, rows ${rumEmpty ? "NOT written (empty answer, last good night kept)" : "written as returned"}: ${rumSampled.join("; ")}`.slice(0, 200)] : []),
     ...(rumTruncated.length ? [`rum rows truncated at ${RUM_ROW_LIMIT}: ${rumTruncated.join(", ")}`] : []),
     // Informational, not a failure: which direct-only desktop segments the
     // second browser rule set aside tonight (see isDirectOnlySegment), so a
@@ -726,7 +734,7 @@ async function runDaily(env, now = new Date()) {
   return { date, totalVisits, humanVisits: summary?.humanVisits ?? null,
     botVisits: summary?.botVisits ?? null, gscOk, gscFailedHosts: [...gscFailedHosts],
     topSignal: topSignal ? { kind: topSignal.kind, host: topSignal.host, headline: topSignal.headline } : null,
-    truncatedPairHosts, rumTruncated, rumSkipped, rumSampled, r2Buckets, browsers, segments: segments ?? [], notes };
+    truncatedPairHosts, rumTruncated, rumSkipped, rumEmpty, rumSampled, r2Buckets, browsers, segments: segments ?? [], notes };
 }
 
 // ---- Nightly pull: Bing Search -> D1 --------------------------------------

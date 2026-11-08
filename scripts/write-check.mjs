@@ -119,6 +119,7 @@ let failR2 = false;
 // around a `run()` to simulate the sampled answers behind the 2026-10-17 round
 // numbers — see part 1a'. `rumRequests` counts the RUM requests a run makes.
 let rumInterval = 1;
+let rumEmptyCensus = false; // the 2026-11-08 shape: evidence present, census rows empty
 let rumRequests = 0;
 // The filter the last counted RUM request carried, for the second-rule checks.
 let lastCountedFilter = null;
@@ -192,7 +193,7 @@ globalThis.fetch = async (input, init = {}) => {
         const crawlerSegment = { requestHost: rum[0].host, userAgentBrowser: "Chrome", browserVersion: "156", userAgentOS: "Linux" };
         return json({ data: { viewer: { ...empty, a0: [{
           censusDirect: [{ sum: { visits: 300 }, dimensions: crawlerSegment }],
-          census: [{ count: 300, sum: { visits: 300 }, avg: { sampleInterval: rumInterval }, dimensions: crawlerSegment },
+          census: rumEmptyCensus ? [] : [{ count: 300, sum: { visits: 300 }, avg: { sampleInterval: rumInterval }, dimensions: crawlerSegment },
             ...rum.flatMap((s) => [
             { count: 40, sum: { visits: 20 }, avg: { sampleInterval: rumInterval },
               dimensions: { requestHost: s.host, userAgentBrowser: "Chrome", browserVersion: "156" } },
@@ -625,6 +626,35 @@ const runBing = async (env) => {
       ran.some((s) => s.sql.includes("INTO runs") && s.binds[2] === 1 && /rum sampled/.test(s.binds[3])), true);
   } finally {
     rumInterval = 1;
+    globalThis.setTimeout = realTimeout;
+  }
+}
+
+// ---- 1a'-empty. An EMPTY RUM answer is not written -------------------------
+// 2026-11-08: the primary account returned no census rows after the retry budget, the
+// run wrote every RUM host as zero and the page showed 6 sessions against ~594. An empty
+// answer must write no RUM rows and no daily_traffic row for the date (so the page's
+// MAX(daily_traffic.date) keeps pointing at the last good night), stay ok=1, and keep
+// the `rum sampled` note so the 17:00 retry cron fires.
+{
+  const realTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn) => realTimeout(fn, 0);
+  try {
+    rumEmptyCensus = true;
+    const { result, flat } = await run({ GSC_SA_KEY });
+    rumEmptyCensus = false;
+    check("an empty RUM answer is reported empty", result.rumEmpty, true);
+    check("...writes no daily_traffic row for any host, RUM or zone",
+      flat.some((s) => s.sql.startsWith("INSERT INTO daily_traffic")), false);
+    check("...writes no daily_rum_filter marker", flat.some((s) => s.sql.includes("INTO daily_rum_filter")), false);
+    check("...leaves the run ok", result.notes.length, 0);
+    check("...and the stored note says rum sampled / NOT written so the 17:00 retry fires",
+      ran.some((s) => s.sql.includes("INTO runs") && s.binds[2] === 1
+        && /rum sampled/.test(s.binds[3]) && /NOT written/.test(s.binds[3])), true);
+    check("...Search Console data is still written",
+      flat.some((s) => s.sql.startsWith("INSERT INTO daily_query_pages")), true);
+  } finally {
+    rumEmptyCensus = false;
     globalThis.setTimeout = realTimeout;
   }
 }

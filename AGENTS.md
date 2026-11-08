@@ -317,6 +317,12 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   once a gate that returned `degraded` and wrote no RUM host; they no longer are). `runDaily` writes the rows as
   returned, adds an informational `rum sampled by Cloudflare, rows written as returned` line to the `runs` note
   (`ok` stays 1, so `/health` and `stale-pipeline` do not fire), a line to the ntfy push, and returns `rumSampled`.
+  **Exception (2026-11-08): an EMPTY answer is not written.** If the reasons include `no rows returned` (the primary
+  account's census came back with no rows at all, the 13:00Z run on 2026-11-08 stored every RUM host as zero and the page
+  showed 6 sessions against ~594), `runDaily` sets `rumEmpty`: no RUM rows, and no `daily_traffic` row for the date (the
+  page reads `MAX(daily_traffic.date)`, so it keeps showing the last good night), `ok` stays 1, the note reads `rum sampled
+  ... rows NOT written` so the 17:00 retry cron still fires. Covered by part 1a'-empty of `write-check.mjs`. Repair by hand
+  with `npm run backfill:rum -- --dates <today>`.
   `degraded` now means only "the browser rules could not run" (no referred sessions to date the current browsers
   from): that still writes no RUM host and is an `ok=0` note. A stored RUM count that is a multiple of 100 or
   1,000, or a RUM host at zero beside a live site, is a sampled night until proven otherwise (grep `runs.note` for
