@@ -131,6 +131,18 @@ export const SITES = [
     gsc: "sc-domain:titan.davidveksler.com",
     bing: "https://titan.davidveksler.com/",
   },
+  // No dedicated Search Console property (list_sites 2026-11-11), so this reads
+  // the davidveksler.com domain property filtered to the subdomain, the same
+  // shape titan.davidveksler.com had before its own property existed. The apex
+  // row's filter excludes subdomains, so nothing is counted twice. Switch to a
+  // dedicated sc-domain:eventide.davidveksler.com property if one is created.
+  // No `bing` field: Bing's davidveksler.com apex property is domain-wide and
+  // unfilterable (see that row), and no eventide property is verified.
+  {
+    host: "eventide.davidveksler.com",
+    gsc: "sc-domain:davidveksler.com",
+    gscPageFilter: "^https?://eventide\\.davidveksler\\.com/",
+  },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
   // The domain property spans every *.freecapitalists.org subdomain, several of
