@@ -241,18 +241,9 @@ export const SITES = [
   { host: "quotes.freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
     gscPageFilter: "^https?://quotes\\.freecapitalists\\.org/",
     bing: "https://quotes.freecapitalists.org/" },
-  // theobjectivestandard.com: GSC verifies only the 2020. host, Bing verifies
-  // only the apex, so each tool gets its own row. If Bing's apex property turns
-  // out to be domain-wide (as davidveksler.com's was), its figures include the
-  // 2020. host; compare top queries after the first pull.
-  { host: "2020.theobjectivestandard.com", gsc: "https://2020.theobjectivestandard.com/" },
-  { host: "theobjectivestandard.com", bing: "https://theobjectivestandard.com/" },
-  // GSC-verified only (Bing lists http://mises.org/ as unverified, so there is
-  // nothing to pull there). http:// exactly as list_sites returns it.
-  { host: "mises.org", gsc: "http://mises.org/" },
-  // Bing-verified only; neither has a Search Console property.
-  { host: "fee.org", bing: "https://fee.org/" },
-  { host: "liberty.me", bing: "https://liberty.me/" },
+  // Deliberately NOT tracked (David, 2026-11-13): 2020.theobjectivestandard.com,
+  // theobjectivestandard.com, mises.org, fee.org, liberty.me. They are verified in
+  // Search Console and/or Bing but are not wanted on the dashboard.
 ];
 
 // Discourse forums tracked for user login/activity stats — a separate pull
