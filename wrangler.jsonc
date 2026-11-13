@@ -56,6 +56,14 @@
   "workers_dev": true,
   "preview_urls": false,
 
+  // Subrequests per invocation. The account is on Workers Paid (workers_paid
+  // subscription and /workers/standard confirmed via the API 2026-11-12), so the
+  // free-plan ceiling of 50 no longer applies. runDaily needs 2 per Search
+  // Console property plus ~8 fixed, 56 with 24 properties, and the old ceiling
+  // was the reason no site could be added. Keep SUBREQUEST_LIMIT in
+  // scripts/write-check.mjs equal to this.
+  "limits": { "subrequests": 200 },
+
   "observability": { "enabled": true },
 
   "vars": {

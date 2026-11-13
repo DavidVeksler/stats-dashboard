@@ -136,12 +136,16 @@ export const SITES = [
   // shape titan.davidveksler.com had before its own property existed. The apex
   // row's filter excludes subdomains, so nothing is counted twice. Switch to a
   // dedicated sc-domain:eventide.davidveksler.com property if one is created.
-  // No `bing` field: Bing's davidveksler.com apex property is domain-wide and
-  // unfilterable (see that row), and no eventide property is verified.
+  // 2026-11-12: a dedicated sc-domain:eventide.davidveksler.com property now
+  // exists but returned zero rows for 2026-10-15..11-10, so this row stays on the
+  // parent + filter until the dedicated property answers with data (switching
+  // early would blank the card). Bing: its own URL-prefix property is now
+  // verified (getUserSites 2026-11-12); the apex property stays unwired.
   {
     host: "eventide.davidveksler.com",
     gsc: "sc-domain:davidveksler.com",
     gscPageFilter: "^https?://eventide\\.davidveksler\\.com/",
+    bing: "https://eventide.davidveksler.com/",
   },
   { host: "walletrecovery.info", gsc: "sc-domain:walletrecovery.info",
     bing: "https://walletrecovery.info/" }, // confirmed live via getUserSites 2026-08-26
@@ -227,6 +231,28 @@ export const SITES = [
     bing: "https://library.freecapitalists.org/" },
   { host: "vellum.capital", gsc: "sc-domain:vellum.capital",
     bing: "https://vellum.capital/" }, // confirmed live via getUserSites 2026-08-27
+  // Added 2026-11-12 from a full GSC (list_sites) + Bing (getUserSites) re-sync,
+  // at David's request to track every verified property. Both tools verify it.
+  { host: "thebitcoinconsultancy.com", gsc: "sc-domain:thebitcoinconsultancy.com",
+    bing: "https://thebitcoinconsultancy.com/" },
+  // No dedicated GSC property: read from the freecapitalists.org domain property
+  // filtered to this subdomain (the apex row's filter already excludes it).
+  // Bing verifies it as its own URL-prefix property.
+  { host: "quotes.freecapitalists.org", gsc: "sc-domain:freecapitalists.org",
+    gscPageFilter: "^https?://quotes\\.freecapitalists\\.org/",
+    bing: "https://quotes.freecapitalists.org/" },
+  // theobjectivestandard.com: GSC verifies only the 2020. host, Bing verifies
+  // only the apex, so each tool gets its own row. If Bing's apex property turns
+  // out to be domain-wide (as davidveksler.com's was), its figures include the
+  // 2020. host; compare top queries after the first pull.
+  { host: "2020.theobjectivestandard.com", gsc: "https://2020.theobjectivestandard.com/" },
+  { host: "theobjectivestandard.com", bing: "https://theobjectivestandard.com/" },
+  // GSC-verified only (Bing lists http://mises.org/ as unverified, so there is
+  // nothing to pull there). http:// exactly as list_sites returns it.
+  { host: "mises.org", gsc: "http://mises.org/" },
+  // Bing-verified only; neither has a Search Console property.
+  { host: "fee.org", bing: "https://fee.org/" },
+  { host: "liberty.me", bing: "https://liberty.me/" },
 ];
 
 // Discourse forums tracked for user login/activity stats — a separate pull

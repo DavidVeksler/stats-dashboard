@@ -480,8 +480,8 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   `KEYWORD_ROW_LIMIT`; otherwise it derives the identical shape from the already-pulled keyword rows via
   `summarizeKeywordRows` (`src/gsc.js`) — exact, not an approximation, because an untruncated pull already
   is the whole per-query corpus for the window. Every site currently stores well under the limit, so this
-  removes ~1 GSC call per site per night. **Re-counted 2026-11-11 with 20 `gsc` properties: 2 RUM + 1 zone + 1 R2
-  + 1 token + 40 GSC + 2 forums + 1 ntfy is 48 of 50** (`node scripts/write-check.mjs --verbose`) — so no new per-site fetch fits in `runDaily`
+  removes ~1 GSC call per site per night. **Update 2026-11-12: the ceiling is no longer 50.** The account is on Workers Paid (`workers_paid` subscription, `/workers/standard` true), and `wrangler.jsonc` now sets `limits.subrequests: 200`; `SUBREQUEST_LIMIT` in `scripts/write-check.mjs` must equal it. With 24 `gsc` properties `runDaily` is 56 fetches (`node scripts/write-check.mjs --verbose`), and it costs 2 more per Search Console site added. The paragraph below describes the old 50 ceiling and is kept for the reasoning. **Re-counted 2026-11-11 with 20 `gsc` properties: 2 RUM + 1 zone + 1 R2
+  + 1 token + 40 GSC + 2 forums + 1 ntfy was 48 of 50** — then no new per-site fetch fit in `runDaily`
   at all; anything new either changes what an existing call asks for or runs as its own invocation (spec
   items 17 and 18 are shaped by exactly this). If the estate grows enough that this stops being enough
   headroom (more sites, more zone hosts, a forum's keyword pull starts truncating), the next lever is the

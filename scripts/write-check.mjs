@@ -102,6 +102,10 @@ const pairRows = (siteUrl, n) => {
 // asserted, not estimated (see the budget note at the top of spec item 17).
 let fetchLog = [];
 
+// Mirrors `limits.subrequests` in wrangler.jsonc (Workers Paid; the free-plan
+// ceiling was 50). Change both together.
+const SUBREQUEST_LIMIT = 200;
+
 // Simulates one host's query-dimension request failing transiently (a timeout,
 // a 5xx) — set to { siteUrl, dimension } around a `run()` call, see part 1b
 // below. Anything else about the pull is untouched, which is the point: a
@@ -327,15 +331,15 @@ const runBing = async (env) => {
   check("derived clicks total the pairs' clicks", sumOf(kwInserts, 3), sumOf(qpInserts, 4));
   check("...and impressions likewise", sumOf(kwInserts, 4), sumOf(qpInserts, 5));
 
-  // THE BUDGET. Cloudflare allows 50 subrequests per Worker invocation, and with
-  // 17 Search Console properties runDaily sits in the high 40s — see the note
+  // THE BUDGET. wrangler.jsonc sets the per-invocation subrequest limit (it was the free
+  // plan's 50, when runDaily sat in the high 40s with 17 Search Console properties) — see the note
   // above spec item 17. Any new per-site fetch in runDaily lands here first.
-  check("runDaily stays inside one invocation's subrequest budget (<= 50 fetches)",
-    fetchLog.length <= 50, true);
+  check(`runDaily stays inside one invocation's subrequest budget (<= ${SUBREQUEST_LIMIT} fetches)`,
+    fetchLog.length <= SUBREQUEST_LIMIT, true);
   if (process.argv.includes("--verbose")) {
     const byHost = new Map();
     for (const h of fetchLog) byHost.set(h, (byHost.get(h) ?? 0) + 1);
-    console.log(`runDaily fetches ${fetchLog.length}/50: ${[...byHost].map(([h, n]) => `${h} ${n}`).join(" · ")}`);
+    console.log(`runDaily fetches ${fetchLog.length}/${SUBREQUEST_LIMIT}: ${[...byHost].map(([h, n]) => `${h} ${n}`).join(" · ")}`);
   }
 
   // Cloudflare's share of it: one RUM request per account, ONE aliased zone
@@ -798,12 +802,12 @@ const runBing = async (env) => {
   check("the Bing run completed", Array.isArray(result.notes) && result.notes.length === 0, true);
   check("it pulled every SITES entry with a `bing` property", result.sites.length, BING_SITES.length);
   // The budget figure is per URL, because that is what spends subrequests: at 2
-  // calls each, this invocation costs 2 x properties against its own 50.
+  // calls each, this invocation costs 2 x properties against its own limit.
   check("...and reports the property count, not the site count", result.properties, BING_URLS.length);
   check("...which is larger, because one site carries two Bing properties",
     BING_URLS.length > BING_SITES.length, true);
   check("the Bing pull stays inside one invocation's subrequest budget",
-    BING_URLS.length * 2 <= 50, true);
+    BING_URLS.length * 2 <= SUBREQUEST_LIMIT, true);
 
   check("...and wrote a summary row per Bing site",
     flat.filter((s) => s.sql.startsWith("INSERT INTO daily_bing_summary")).length, BING_SITES.length);
