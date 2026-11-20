@@ -335,7 +335,11 @@ accounts** (`CF_ACCOUNTS`) to query. Each site maps a CF `host` (the Web Analyti
   (`RETRY_CRON`, `runRetryIfSampled` in `src/index.js`)** re-runs `runDailyGuarded` four hours later, and only
   when the newest `runs` row carries a `rum sampled` note from the last 12 hours; a healthy run, a thrown
   run or an older failure makes it a silent no-op (part 1a'' of `write-check.mjs`). Keep the string in
-  `wrangler.jsonc` identical to `RETRY_CRON`. A retry that is still sampled just adds another noted row; the
+  `wrangler.jsonc` identical to `RETRY_CRON`. **Automatic repair (2026-11-20):** the same
+  17:00 cron then calls `repairSampledNights` (`src/index.js`): any night in the last 6 days whose `runs` note says
+  `rum sampled` and that is not in `rum_repairs` is re-read through `backfillRum` (max 3 per run, today skipped). A night
+  is marked repaired only when the re-read was exact and written; one still sampled is tried again next day until it ages
+  out. Tested in part 1a'' of `write-check.mjs`. `npm run backfill:rum` remains the manual path. A retry that is still sampled just adds another noted row; the
   next 13:00 run starts clean. Nothing here changes the backfill advice for nights that stay sampled for days.
 - **"visitors" = sessions, not uniques.** RUM `visits` is only counted on a session's first
   pageview, so navigation within one hostname (`refererHost === requestHost`) carries `visits: 0` and

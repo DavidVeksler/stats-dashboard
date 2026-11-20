@@ -256,7 +256,7 @@ const db = {
     stmt.bind = (...args) => { stmt.binds = args; return stmt; };
     // Reads: loadDashboard runs at the end of runDaily to pick the ntfy finding,
     // and an empty database is a valid answer for it.
-    stmt.all = async () => ({ results: [] });
+    stmt.all = async () => ({ results: sql.includes("rum_repairs") ? repairRows : [] });
     // `latestRun` stands in for the newest runs row; null (no row) everywhere else.
     stmt.first = async () => (sql.includes("FROM runs") ? latestRun : null);
     stmt.run = async () => { ran.push(stmt); return { success: true }; };
@@ -268,6 +268,8 @@ const db = {
   },
 };
 let latestRun = null;
+// Dates the repair query returns (sampled nights not yet in rum_repairs).
+let repairRows = [];
 
 const run = async (env) => {
   seq = 0;
@@ -697,6 +699,26 @@ const runBing = async (env) => {
   check("no runs row at all is a no-op", await fire(RETRY_CRON, null), false);
   check("the nightly cron still runs unconditionally",
     await fire("0 13 * * *", { run_at: hoursAgo(4), ok: 1, note: "" }), true);
+
+  // The same cron then repairs earlier sampled nights from an exact re-read.
+  const healthy = { run_at: hoursAgo(4), ok: 1, note: "" };
+  repairRows = [{ date: "2026-11-18" }];
+  check("a sampled earlier night is re-read and rewritten by the 17:00 cron",
+    await fire(RETRY_CRON, healthy), true);
+  check("...and marked repaired", ran.some((s) => s.sql.includes("INTO rum_repairs") && s.binds[0] === "2026-11-18"), true);
+  check("...but the 13:00 cron does not repair", await fire("0 13 * * *", healthy) && !ran.some((s) => s.sql.includes("INTO rum_repairs")), true);
+  rumInterval = 100;
+  const realTimeoutR = globalThis.setTimeout;
+  globalThis.setTimeout = (fn) => realTimeoutR(fn, 0);
+  try {
+    await fire(RETRY_CRON, healthy);
+    check("a night still sampled on re-read is not written and not marked repaired",
+      !batches.some((b) => b.some((st) => st.sql.includes("daily_traffic"))) && !ran.some((s) => s.sql.includes("INTO rum_repairs")), true);
+  } finally {
+    rumInterval = 1;
+    globalThis.setTimeout = realTimeoutR;
+    repairRows = [];
+  }
 }
 
 // ---- 1b. A transient per-host GSC failure must not erase existing data ----

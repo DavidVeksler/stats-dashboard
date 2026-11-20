@@ -269,6 +269,12 @@ CREATE TABLE IF NOT EXISTS daily_bing_keywords (
   PRIMARY KEY (date, host, query)
 );
 
+-- Nights whose sampled RUM rows were replaced by an exact re-read (repairSampledNights).
+CREATE TABLE IF NOT EXISTS rum_repairs (
+  date        TEXT PRIMARY KEY,
+  repaired_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   run_at TEXT PRIMARY KEY,
   date   TEXT,

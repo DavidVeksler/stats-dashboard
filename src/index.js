@@ -71,6 +71,10 @@ function addDays(dateStr, n) {
 // token lacks permission for the D1 management/import API.
 async function ensureSchema(env) {
   await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS rum_repairs (
+      date TEXT PRIMARY KEY,
+      repaired_at TEXT NOT NULL
+    )`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS daily_pages (
       date TEXT NOT NULL,
       host TEXT NOT NULL,
@@ -1042,6 +1046,55 @@ async function runRetryIfSampled(env, now = new Date()) {
   return { retried: true, result: await runDailyGuarded(env) };
 }
 
+// Automatic repair of sampled nights. Cloudflare's RUM answer is sampled when it is
+// read at pull time but is usually exact when the same window is re-read hours or
+// days later (until it coarsens past roughly a week), so a night flagged `rum sampled`
+// is re-read by `backfillRum`, which refuses any answer that is still sampled. A night
+// leaves the queue only when a repair wrote it (`rum_repairs`), so one that is still
+// sampled is retried at the next 17:00 run until it ages out of the lookback. The
+// current date is skipped: the retry above has just pulled it. At most
+// REPAIR_MAX_NIGHTS per run keeps the subrequests bounded (2 to 5 per night).
+const REPAIR_LOOKBACK_DAYS = 6;
+const REPAIR_MAX_NIGHTS = 3;
+
+async function repairSampledNights(env, now = new Date()) {
+  // A cheap single statement, not ensureSchema: on a night with nothing to repair
+  // (the usual one) this cron must not run the whole schema batch.
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS rum_repairs (date TEXT PRIMARY KEY, repaired_at TEXT NOT NULL)`).run();
+  const today = utcDate(now);
+  const { results } = await env.DB.prepare(
+    `SELECT DISTINCT date FROM runs
+       WHERE note LIKE '%rum sampled%' AND date >= ? AND date < ?
+         AND date NOT IN (SELECT date FROM rum_repairs)
+       ORDER BY date DESC LIMIT ?`
+  ).bind(addDays(today, -REPAIR_LOOKBACK_DAYS), today, REPAIR_MAX_NIGHTS).all();
+  const out = [];
+  for (const { date } of results ?? []) {
+    try {
+      const r = await backfillRum(env, date);
+      if (r.written) {
+        await env.DB.prepare(`INSERT OR REPLACE INTO rum_repairs (date, repaired_at) VALUES (?,?)`)
+          .bind(date, now.toISOString()).run();
+      }
+      out.push({ date, written: r.written, counted: r.counted, degraded: r.degraded });
+    } catch (e) {
+      out.push({ date, written: false, error: String(e?.message ?? e).slice(0, 200) });
+    }
+  }
+  return out;
+}
+
+// The 17:00 cron: the same-day retry, then the repair of earlier sampled nights. A
+// failed retry has already left its own ok=0 row and push (runDailyGuarded), so it
+// must not stop the repair from running.
+async function runRetryCron(env) {
+  let retry;
+  try { retry = await runRetryIfSampled(env); } catch (e) { retry = { retried: true, error: String(e?.message ?? e) }; }
+  const repaired = await repairSampledNights(env);
+  if (repaired.length) console.log("rum repair", JSON.stringify(repaired));
+  return { retry, repaired };
+}
+
 // ---- Read from D1 and render ---------------------------------------------
 // Cards are laid out domain-first: every host of a registrable domain sits in
 // one run, the runs are ordered by the domain's own popularity, and hosts are
@@ -1899,7 +1952,7 @@ export default {
   // replacement — it fetches from outside Cloudflare and POSTs the results to
   // /ingest-bing.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(event.cron === RETRY_CRON ? runRetryIfSampled(env) : runDailyGuarded(env));
+    ctx.waitUntil(event.cron === RETRY_CRON ? runRetryCron(env) : runDailyGuarded(env));
   },
 
   async fetch(request, env) {
